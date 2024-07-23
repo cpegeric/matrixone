@@ -18,7 +18,9 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+	//"fmt"
 
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
@@ -200,6 +202,7 @@ func buildLoad(stmt *tree.Load, ctx CompilerContext, isPrepareStmt bool) (*Plan,
 }
 
 func checkFileExist(param *tree.ExternParam, ctx CompilerContext) (string, error) {
+
 	if param.Local {
 		return "", nil
 	}
@@ -207,18 +210,21 @@ func checkFileExist(param *tree.ExternParam, ctx CompilerContext) (string, error
 		return "", nil
 	}
 	param.Ctx = ctx.GetContext()
+
 	if param.ScanType == tree.S3 {
 		if err := InitS3Param(param); err != nil {
 			return "", err
 		}
 	} else {
-		if err := InitInfileParam(param); err != nil {
+		if err := InitInfileOrStageParam(param, ctx); err != nil {
 			return "", err
 		}
 	}
 	if len(param.Filepath) == 0 {
 		return "", nil
 	}
+	logutil.Infof("PATH %s", param.Filepath)
+
 	if err := StatFile(param); err != nil {
 		if moerror, ok := err.(*moerr.Error); ok {
 			if moerror.ErrorCode() == moerr.ErrFileNotFound {

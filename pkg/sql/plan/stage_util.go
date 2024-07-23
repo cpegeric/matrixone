@@ -382,7 +382,7 @@ func InitStageS3Param(param *tree.ExternParam, s StageDef) error {
 		return fmt.Errorf("protocol is not S3")
 	}
 
-	if len(segments) != 2 || len(segments) != 3 {
+	if len(segments) != 2 && len(segments) != 3 {
 		return fmt.Errorf("Invalid s3:// URL")
 	}
 
