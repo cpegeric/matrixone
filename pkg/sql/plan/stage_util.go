@@ -21,10 +21,11 @@ import (
 	"path"
 	"strings"
 
-	//"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	//moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	//"github.com/matrixorigin/matrixone/pkg/vm/process"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	//"github.com/matrixorigin/matrixone/pkg/util/executor"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
@@ -124,15 +125,11 @@ func (s *StageDef) expandSubStage(stagemap map[StageKey]StageDef, defaultdb stri
 	return *s, nil
 }
 
-func getS3ServiceFromProvider(provider string) (string, error) {
-	provider = strings.ToLower(provider)
-	switch provider {
-	case "amazon":
-		return "s3", nil
-	case "minio":
-		return "minio", nil
-	default:
-		return "", fmt.Errorf("provider %s not supported", provider)
+func (s *StageDef) JoinPath(subpath string) {
+	if strings.HasSuffix(s.Url, "/") {
+		s.Url = s.Url + subpath
+	} else {
+		s.Url = s.Url + "/" + subpath
 	}
 }
 
@@ -208,6 +205,18 @@ func (s *StageDef) ToPath(subpath string) (mopath string, query string, err erro
 	return "", "", nil
 }
 
+func getS3ServiceFromProvider(provider string) (string, error) {
+	provider = strings.ToLower(provider)
+	switch provider {
+	case "amazon":
+		return "s3", nil
+	case "minio":
+		return "minio", nil
+	default:
+		return "", fmt.Errorf("provider %s not supported", provider)
+	}
+}
+
 func StageLoadCatalog(ctx CompilerContext) (stagemap map[StageKey]StageDef, err error) {
 	getAllStagesSql := fmt.Sprintf("select stage_id, stage_name, url, stage_credentials, stage_status, 'dbname' from `%s`.`%s`;", "mo_catalog", "mo_stages")
 	res, err := runSql(ctx, getAllStagesSql)
@@ -251,45 +260,220 @@ func StageLoadCatalog(ctx CompilerContext) (stagemap map[StageKey]StageDef, err 
 
 func UrlToPath(url string, stagemap map[StageKey]StageDef, ctx CompilerContext) (path string, query string, err error) {
 
+	if !strings.HasPrefix(url, STAGE_PROTOCOL) {
+		return url, "", nil
+	}
+
 	curdb := ctx.GetProcess().GetSessionInfo().Database
 	logutil.Infof("Current database = %s, URL = %s", curdb, url)
 
-	if strings.HasPrefix(url, STAGE_PROTOCOL) {
-		dbname := ""
-		stagename := ""
-		subpath := ""
+	dbname := ""
+	stagename := ""
+	subpath := ""
 
-		segments := strings.SplitN(url[len(STAGE_PROTOCOL):], "/", 3)
-		if len(segments) == 2 {
-			dbname = segments[0]
-			stagename = segments[1]
-		} else if len(segments) == 3 {
-			dbname = segments[0]
-			stagename = segments[1]
-			subpath = segments[2]
-		} else {
-			return "", "", fmt.Errorf("Invalid stage URL format.  e.g. stage://dbname/stagename/path")
-		}
-
-		if len(dbname) == 0 {
-			dbname = curdb
-		}
-		logutil.Infof("UrlToPath dbname %s, stagename %s, subpath %s", dbname, stagename, subpath)
-		key := StageKey{dbname, stagename}
-		s, ok := stagemap[key]
-		if !ok {
-			return "", "", fmt.Errorf("stage %s not found", stagename)
-		}
-
-		exs, err := s.expandSubStage(stagemap, curdb)
-		if err != nil {
-			return "", "", err
-		}
-
-		logutil.Infof("ExanpdSubStage Url=%s", exs.Url)
-
-		return exs.ToPath(subpath)
+	segments := strings.SplitN(url[len(STAGE_PROTOCOL):], "/", 3)
+	if len(segments) == 2 {
+		dbname = segments[0]
+		stagename = segments[1]
+	} else if len(segments) == 3 {
+		dbname = segments[0]
+		stagename = segments[1]
+		subpath = segments[2]
+	} else {
+		return "", "", fmt.Errorf("Invalid stage URL format.  e.g. stage://dbname/stagename/path")
 	}
 
-	return url, "", nil
+	if len(dbname) == 0 {
+		dbname = curdb
+	}
+	logutil.Infof("UrlToPath dbname %s, stagename %s, subpath %s", dbname, stagename, subpath)
+	key := StageKey{dbname, stagename}
+	s, ok := stagemap[key]
+	if !ok {
+		return "", "", fmt.Errorf("stage %s not found", stagename)
+	}
+
+	exs, err := s.expandSubStage(stagemap, curdb)
+	if err != nil {
+		return "", "", err
+	}
+
+	logutil.Infof("ExanpdSubStage Url=%s", exs.Url)
+
+	return exs.ToPath(subpath)
+}
+
+func urlToStageDef(url string, stagemap map[StageKey]StageDef, ctx CompilerContext) (s StageDef, err error) {
+
+	if !strings.HasPrefix(url, STAGE_PROTOCOL) {
+		return StageDef{}, fmt.Errorf("URL is not stage URL")
+	}
+
+	curdb := ctx.GetProcess().GetSessionInfo().Database
+	logutil.Infof("Current database = %s, URL = %s", curdb, url)
+	dbname := ""
+	stagename := ""
+	subpath := ""
+
+	segments := strings.SplitN(url[len(STAGE_PROTOCOL):], "/", 3)
+	if len(segments) == 2 {
+		dbname = segments[0]
+		stagename = segments[1]
+	} else if len(segments) == 3 {
+		dbname = segments[0]
+		stagename = segments[1]
+		subpath = segments[2]
+	} else {
+		return StageDef{}, fmt.Errorf("Invalid stage URL format.  e.g. stage://dbname/stagename/path")
+	}
+
+	if len(dbname) == 0 {
+		dbname = curdb
+	}
+	logutil.Infof("UrlToPath dbname %s, stagename %s, subpath %s", dbname, stagename, subpath)
+	key := StageKey{dbname, stagename}
+	s, ok := stagemap[key]
+	if !ok {
+		return StageDef{}, fmt.Errorf("stage %s not found", stagename)
+	}
+
+	exs, err := s.expandSubStage(stagemap, curdb)
+	if err != nil {
+		return StageDef{}, err
+	}
+
+	logutil.Infof("ExanpdSubStage Url=%s", exs.Url)
+
+	exs.JoinPath(subpath)
+
+	logutil.Infof("JoinPath Url=%s", exs.Url)
+
+	return exs, nil
+}
+
+func GetFilePathFromParam(param *tree.ExternParam) string {
+	fpath := param.Filepath
+	for i := 0; i < len(param.Option); i += 2 {
+		name := strings.ToLower(param.Option[i])
+		if name == "filepath" {
+			fpath = param.Option[i+1]
+			break
+		}
+	}
+
+	return fpath
+}
+
+func IsStageURL(url string) bool {
+	return strings.HasPrefix(url, STAGE_PROTOCOL)
+}
+
+func InitStageS3Param(param *tree.ExternParam, s StageDef) error {
+
+	param.ScanType = tree.S3
+	param.S3Param = &tree.S3Parameter{}
+
+	protocol, segments, err := s.SplitURL()
+	if err != nil {
+		return err
+	}
+
+	if protocol != S3_PROTOCOL {
+		return fmt.Errorf("protocol is not S3")
+	}
+
+	if len(segments) != 2 || len(segments) != 3 {
+		return fmt.Errorf("Invalid s3:// URL")
+	}
+
+	endpoint := segments[0]
+	bucket := segments[1]
+	prefix := ""
+	if len(segments) == 3 {
+		prefix = segments[2]
+	}
+
+	param.S3Param.Endpoint = endpoint
+	param.S3Param.Region = "region"
+	param.S3Param.APIKey = "aws_key_id"
+	param.S3Param.APISecret = "aws_secret_key"
+	param.S3Param.Bucket = bucket
+	param.S3Param.Provider = "minio"
+
+	param.Filepath = prefix
+	param.CompressType = "compression"
+
+	for i := 0; i < len(param.Option); i += 2 {
+		switch strings.ToLower(param.Option[i]) {
+		case "format":
+			format := strings.ToLower(param.Option[i+1])
+			if format != tree.CSV && format != tree.JSONLINE {
+				return moerr.NewBadConfig(param.Ctx, "the format '%s' is not supported", format)
+			}
+			param.Format = format
+		case "jsondata":
+			jsondata := strings.ToLower(param.Option[i+1])
+			if jsondata != tree.OBJECT && jsondata != tree.ARRAY {
+				return moerr.NewBadConfig(param.Ctx, "the jsondata '%s' is not supported", jsondata)
+			}
+			param.JsonData = jsondata
+			param.Format = tree.JSONLINE
+
+		default:
+			return moerr.NewBadConfig(param.Ctx, "the keyword '%s' is not support", strings.ToLower(param.Option[i]))
+		}
+	}
+
+	if param.Format == tree.JSONLINE && len(param.JsonData) == 0 {
+		return moerr.NewBadConfig(param.Ctx, "the jsondata must be specified")
+	}
+	if len(param.Format) == 0 {
+		param.Format = tree.CSV
+	}
+
+	return nil
+
+}
+
+func InitInfileOrStageParam(param *tree.ExternParam, ctx CompilerContext) error {
+
+	url := GetFilePathFromParam(param)
+	if !IsStageURL(url) {
+		return InitInfileParam(param)
+	}
+
+	stagemap, err := StageLoadCatalog(ctx)
+	if err != nil {
+		return err
+	}
+
+	s, err := urlToStageDef(url, stagemap, ctx)
+	if err != nil {
+		return err
+	}
+
+	protocol, segments, err := s.SplitURL()
+	if err != nil {
+		return err
+	}
+
+	if protocol == S3_PROTOCOL {
+		return InitStageS3Param(param, s)
+	} else if protocol == FILE_PROTOCOL {
+		if len(segments) != 1 {
+			return fmt.Errorf("invalid file:// URL")
+		}
+
+		err := InitInfileParam(param)
+		if err != nil {
+			return err
+		}
+
+		param.Filepath = segments[0]
+
+	} else {
+		return fmt.Errorf("invalid URL: protocol %s not supported", protocol)
+	}
+
+	return nil
 }
