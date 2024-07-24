@@ -19,6 +19,7 @@ import (
 	"encoding/csv"
 	"fmt"
 	//"path"
+	"net/url"
 	"strings"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -31,9 +32,9 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 )
 
-const STAGE_PROTOCOL = "stage://"
-const S3_PROTOCOL = "s3://"
-const FILE_PROTOCOL = "file://"
+const STAGE_PROTOCOL = "stage"
+const S3_PROTOCOL = "s3"
+const FILE_PROTOCOL = "file"
 
 type StageKey struct {
 	Db   string
@@ -44,86 +45,16 @@ type StageDef struct {
 	Id          uint32
 	Name        string
 	Db          string
-	Url         string
+	Url         *url.URL
 	Credentials string
 	Disabled    bool
 }
 
-func (s *StageDef) SplitURL() (protocol string, segments []string, query string, err error) {
-	protocol = ""
-	err = nil
-	segments = nil
-	query = ""
-	if strings.HasPrefix(s.Url, STAGE_PROTOCOL) {
-		// e.g. stage://dbname/stagename/path[?q=v]
-		idx := strings.LastIndex(s.Url, "?")
-		if idx == -1 {
-			query = ""
-			segments = strings.SplitN(s.Url[len(STAGE_PROTOCOL):], "/", 3)
-		} else {
-			query = s.Url[idx+1:]
-			segments = strings.SplitN(s.Url[len(STAGE_PROTOCOL):idx], "/", 3)
-		}
-		if len(segments) < 3 {
-			err = fmt.Errorf("stage: invalid stage:// Url %s", s)
-		}
-		protocol = STAGE_PROTOCOL
-
-	} else if strings.HasPrefix(s.Url, S3_PROTOCOL) {
-		// e.g. s3://endpoint/bucket/path
-		idx := strings.LastIndex(s.Url, "?")
-		if idx == -1 {
-			segments = strings.SplitN(s.Url[len(S3_PROTOCOL):], "/", 3)
-		} else {
-			query = s.Url[idx+1:]
-			segments = strings.SplitN(s.Url[len(S3_PROTOCOL):idx], "/", 3)
-		}
-		if len(segments) < 3 {
-			err = fmt.Errorf("stage: invalid s3:// Url %s", s)
-		}
-		protocol = S3_PROTOCOL
-
-	} else if strings.HasPrefix(s.Url, FILE_PROTOCOL) {
-		// e.g. file://path/to/somewhere
-		idx := strings.LastIndex(s.Url, "?")
-		if idx == -1 {
-			p := s.Url[len(FILE_PROTOCOL):]
-			segments = []string{p}
-		} else {
-			query = s.Url[idx+1:]
-			p := s.Url[len(FILE_PROTOCOL):idx]
-			segments = []string{p}
-		}
-
-		protocol = FILE_PROTOCOL
-
-	} else {
-		err = fmt.Errorf("invalid protcol error")
-	}
-
-	return
-}
-
 func (s *StageDef) expandSubStage(stagemap map[StageKey]StageDef, defaultdb string) (StageDef, error) {
-	if strings.HasPrefix(s.Url, STAGE_PROTOCOL) {
-		// expand URL
-		_, segments, query, err := s.SplitURL()
+	if s.Url.Scheme == STAGE_PROTOCOL {
+		dbname, stagename, prefix, query, err := parseStageUrl(s.Url)
 		if err != nil {
 			return StageDef{}, err
-		}
-
-		dbname := ""
-		stagename := ""
-		prefix := ""
-		if len(segments) == 2 {
-			dbname = segments[0]
-			stagename = segments[1]
-		} else if len(segments) == 3 {
-			dbname = segments[0]
-			stagename = segments[1]
-			prefix = segments[2]
-		} else {
-			return StageDef{}, fmt.Errorf("Invalid stage URL format")
 		}
 
 		if len(dbname) == 0 {
@@ -136,28 +67,12 @@ func (s *StageDef) expandSubStage(stagemap map[StageKey]StageDef, defaultdb stri
 			return StageDef{}, fmt.Errorf("stage not found. stage://%s/%s", dbname, stagename)
 		}
 
-		if strings.HasSuffix(res.Url, "/") {
-			res.Url = res.Url + prefix
-		} else {
-			res.Url = res.Url + "/" + prefix
-		}
-
-		if len(query) > 0 {
-			res.Url = res.Url + "?" + query
-		}
-
+		res.Url = res.Url.JoinPath(prefix)
+		res.Url.RawQuery = query
 		return res.expandSubStage(stagemap, defaultdb)
 	}
 
 	return *s, nil
-}
-
-func (s *StageDef) JoinPath(subpath string) {
-	if strings.HasSuffix(s.Url, "/") {
-		s.Url = s.Url + subpath
-	} else {
-		s.Url = s.Url + "/" + subpath
-	}
 }
 
 // get stages and expand the path. stage may be a file or s3
@@ -167,25 +82,17 @@ func (s *StageDef) JoinPath(subpath string) {
 // subpath is in the format like path or path with query like path?q1=v1&q2=v2...
 func (s *StageDef) ToPath() (mopath string, query string, err error) {
 
-	if strings.HasPrefix(s.Url, S3_PROTOCOL) {
-		protocol, segments, query, err := s.SplitURL()
-		if err != nil {
-			return "", "", err
-		}
-		logutil.Infof("proto = %s, segments = %s", protocol, segments)
-
-		endpoint := segments[0]
-		bucket := segments[1]
-		prefix := ""
-		if len(segments) == 3 {
-			prefix = segments[2]
-		}
+	if s.Url.Scheme == S3_PROTOCOL {
+		bucket := s.Url.Host
+		prefix := s.Url.Path
+		query := s.Url.RawQuery
 
 		// TODO: Decode credentials
 		aws_key_id := "aws_key_id"
 		aws_secret_key := "aws_secret_key"
 		aws_region := "aws_region"
 		provider := "amazon"
+		endpoint := "endpoint"
 
 		service, err := getS3ServiceFromProvider(provider)
 		if err != nil {
@@ -201,22 +108,10 @@ func (s *StageDef) ToPath() (mopath string, query string, err error) {
 		}
 		w.Flush()
 		return fileservice.JoinPath(buf.String(), prefix), query, nil
-	} else if strings.HasPrefix(s.Url, FILE_PROTOCOL) {
-		prefix := s.Url[len(FILE_PROTOCOL):]
-		p := ""
-		query := ""
-		idx := strings.LastIndex(prefix, "?")
-		if idx == -1 {
-			p = prefix
-		} else {
-			p = prefix[:idx]
-			query = prefix[idx+1:]
-		}
-
-		logutil.Infof("ToPath: prefix = %s, query = %s", p, query)
-		return p, query, nil
+	} else if s.Url.Scheme == FILE_PROTOCOL {
+		logutil.Infof("ToPath: prefix = %s, query = %s", s.Url.Path, s.Url.RawQuery)
+		return s.Url.Path, s.Url.RawQuery, nil
 	}
-
 	return "", "", nil
 }
 
@@ -253,7 +148,10 @@ func StageLoadCatalog(ctx CompilerContext) (stagemap map[StageKey]StageDef, err 
 				for i := 0; i < batch.Vecs[0].Length(); i++ {
 					stage_id := vector.GetFixedAt[uint32](batch.Vecs[id_idx], i)
 					stage_name := string(batch.Vecs[name_idx].GetBytesAt(i))
-					stage_url := string(batch.Vecs[url_idx].GetBytesAt(i))
+					stage_url, err := url.Parse(string(batch.Vecs[url_idx].GetBytesAt(i)))
+					if err != nil {
+						return nil, err
+					}
 					stage_cred := string(batch.Vecs[cred_idx].GetBytesAt(i))
 					stage_status := string(batch.Vecs[status_idx].GetBytesAt(i))
 					dbname := string(batch.Vecs[db_idx].GetBytesAt(i))
@@ -273,9 +171,9 @@ func StageLoadCatalog(ctx CompilerContext) (stagemap map[StageKey]StageDef, err 
 	return stagemap, nil
 }
 
-func UrlToPath(url string, stagemap map[StageKey]StageDef, ctx CompilerContext) (path string, query string, err error) {
+func UrlToPath(furl string, stagemap map[StageKey]StageDef, ctx CompilerContext) (path string, query string, err error) {
 
-	s, err := urlToStageDef(url, stagemap, ctx)
+	s, err := urlToStageDef(furl, stagemap, ctx)
 	if err != nil {
 		return "", "", err
 	}
@@ -283,29 +181,53 @@ func UrlToPath(url string, stagemap map[StageKey]StageDef, ctx CompilerContext) 
 	return s.ToPath()
 }
 
-func urlToStageDef(url string, stagemap map[StageKey]StageDef, ctx CompilerContext) (s StageDef, err error) {
+func parseStageUrl(u *url.URL) (dbname, stagename, prefix, query string, err error) {
+	if u.Scheme != STAGE_PROTOCOL {
+		return "", "", "", "", fmt.Errorf("URL protocol is not stage://")
+	}
 
-	if !strings.HasPrefix(url, STAGE_PROTOCOL) {
+	dbname = u.Host
+	pp := strings.SplitN(u.Path[1:], "/", 2)
+	if len(pp) == 0 {
+		return "", "", "", "", fmt.Errorf("Parse stage URL error: Invalid stage URL")
+	}
+
+	stagename = pp[0]
+	prefix = ""
+	if len(pp) == 2 {
+		prefix = pp[1]
+	}
+
+	query = u.RawQuery
+
+	return
+}
+
+func parseS3Url(u *url.URL) (bucket, fpath, query string) {
+	bucket = u.Host
+	fpath = u.Path
+	query = u.RawQuery
+	return
+}
+
+func urlToStageDef(furl string, stagemap map[StageKey]StageDef, ctx CompilerContext) (s StageDef, err error) {
+
+	aurl, err := url.Parse(furl)
+	if err != nil {
+		return StageDef{}, err
+	}
+
+	if aurl.Scheme != STAGE_PROTOCOL {
 		return StageDef{}, fmt.Errorf("URL is not stage URL")
 	}
 
-	curdb := ctx.GetProcess().GetSessionInfo().Database
-	logutil.Infof("Current database = %s, URL = %s", curdb, url)
-	dbname := ""
-	stagename := ""
-	subpath := ""
-
-	segments := strings.SplitN(url[len(STAGE_PROTOCOL):], "/", 3)
-	if len(segments) == 2 {
-		dbname = segments[0]
-		stagename = segments[1]
-	} else if len(segments) == 3 {
-		dbname = segments[0]
-		stagename = segments[1]
-		subpath = segments[2]
-	} else {
-		return StageDef{}, fmt.Errorf("Invalid stage URL format.  e.g. stage://dbname/stagename/path")
+	dbname, stagename, subpath, query, err := parseStageUrl(aurl)
+	if err != nil {
+		return StageDef{}, fmt.Errorf("Parse Error: Invalid stage URL")
 	}
+
+	curdb := ctx.GetProcess().GetSessionInfo().Database
+	logutil.Infof("Current database = %s, URL = %s", curdb, aurl)
 
 	if len(dbname) == 0 {
 		dbname = curdb
@@ -324,7 +246,8 @@ func urlToStageDef(url string, stagemap map[StageKey]StageDef, ctx CompilerConte
 
 	logutil.Infof("ExanpdSubStage Url=%s", exs.Url)
 
-	exs.JoinPath(subpath)
+	exs.Url = exs.Url.JoinPath(subpath)
+	exs.Url.RawQuery = query
 
 	logutil.Infof("JoinPath Url=%s", exs.Url)
 
@@ -344,40 +267,22 @@ func GetFilePathFromParam(param *tree.ExternParam) string {
 	return fpath
 }
 
-func IsStageURL(url string) bool {
-	return strings.HasPrefix(url, STAGE_PROTOCOL)
-}
-
 func InitStageS3Param(param *tree.ExternParam, s StageDef) error {
 
 	param.ScanType = tree.S3
 	param.S3Param = &tree.S3Parameter{}
 
-	protocol, segments, query, err := s.SplitURL()
-	if err != nil {
-		return err
-	}
-
-	if len(query) > 0 {
+	if len(s.Url.RawQuery) > 0 {
 		return fmt.Errorf("s3:// URL don't support in ExternParam.S3Param")
 	}
 
-	if protocol != S3_PROTOCOL {
+	if s.Url.Scheme != S3_PROTOCOL {
 		return fmt.Errorf("protocol is not S3")
 	}
 
-	if len(segments) != 2 && len(segments) != 3 {
-		return fmt.Errorf("Invalid s3:// URL")
-	}
+	bucket, prefix, _ := parseS3Url(s.Url)
 
-	endpoint := segments[0]
-	bucket := segments[1]
-	prefix := ""
-	if len(segments) == 3 {
-		prefix = segments[2]
-	}
-
-	param.S3Param.Endpoint = endpoint
+	param.S3Param.Endpoint = "endpoint"
 	param.S3Param.Region = "region"
 	param.S3Param.APIKey = "aws_key_id"
 	param.S3Param.APISecret = "aws_secret_key"
@@ -421,8 +326,9 @@ func InitStageS3Param(param *tree.ExternParam, s StageDef) error {
 
 func InitInfileOrStageParam(param *tree.ExternParam, ctx CompilerContext) error {
 
-	url := GetFilePathFromParam(param)
-	if !IsStageURL(url) {
+	fpath := GetFilePathFromParam(param)
+
+	if !strings.HasPrefix(fpath, "stage://") {
 		return InitInfileParam(param)
 	}
 
@@ -431,36 +337,28 @@ func InitInfileOrStageParam(param *tree.ExternParam, ctx CompilerContext) error 
 		return err
 	}
 
-	s, err := urlToStageDef(url, stagemap, ctx)
+	s, err := urlToStageDef(fpath, stagemap, ctx)
 	if err != nil {
 		return err
 	}
 
-	protocol, segments, query, err := s.SplitURL()
-	if err != nil {
-		return err
-	}
-
-	if len(query) > 0 {
+	if len(s.Url.RawQuery) > 0 {
 		return fmt.Errorf("Invalid URL: query not supported in ExternParam")
 	}
 
-	if protocol == S3_PROTOCOL {
+	if s.Url.Scheme == S3_PROTOCOL {
 		return InitStageS3Param(param, s)
-	} else if protocol == FILE_PROTOCOL {
-		if len(segments) != 1 {
-			return fmt.Errorf("invalid file:// URL")
-		}
+	} else if s.Url.Scheme == FILE_PROTOCOL {
 
 		err := InitInfileParam(param)
 		if err != nil {
 			return err
 		}
 
-		param.Filepath = segments[0]
+		param.Filepath = s.Url.Path
 
 	} else {
-		return fmt.Errorf("invalid URL: protocol %s not supported", protocol)
+		return fmt.Errorf("invalid URL: protocol %s not supported", s.Url.Scheme)
 	}
 
 	return nil
