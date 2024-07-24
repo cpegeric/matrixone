@@ -83,9 +83,7 @@ func (s *StageDef) expandSubStage(stagemap map[StageKey]StageDef, defaultdb stri
 func (s *StageDef) ToPath() (mopath string, query string, err error) {
 
 	if s.Url.Scheme == S3_PROTOCOL {
-		bucket := s.Url.Host
-		prefix := s.Url.Path
-		query := s.Url.RawQuery
+		bucket, prefix, query := parseS3Url(s.Url)
 
 		// TODO: Decode credentials
 		aws_key_id := "aws_key_id"
