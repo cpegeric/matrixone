@@ -328,7 +328,7 @@ func InitInfileOrStageParam(param *tree.ExternParam, ctx CompilerContext) error 
 
 	fpath := GetFilePathFromParam(param)
 
-	if !strings.HasPrefix(fpath, "stage://") {
+	if !strings.HasPrefix(fpath, STAGE_PROTOCOL + "://") {
 		return InitInfileParam(param)
 	}
 
