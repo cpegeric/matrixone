@@ -185,15 +185,24 @@ func parseStageUrl(u *url.URL) (dbname, stagename, prefix, query string, err err
 	}
 
 	dbname = u.Host
+
+	if len(u.Path) == 0 {
+		return "", "", "", "", fmt.Errorf("Invalid stage URL: path is empty string")
+	}
+
 	pp := strings.SplitN(u.Path[1:], "/", 2)
 	if len(pp) == 0 {
-		return "", "", "", "", fmt.Errorf("Parse stage URL error: Invalid stage URL")
+		return "", "", "", "", fmt.Errorf("Invalid stage URL: path not found")
 	}
 
 	stagename = pp[0]
 	prefix = ""
 	if len(pp) == 2 {
 		prefix = pp[1]
+	}
+
+	if len(stagename) == 0 {
+		return "", "", "", "", fmt.Errorf("Invalid stage URL: stage name not found")
 	}
 
 	query = u.RawQuery
@@ -271,7 +280,7 @@ func InitStageS3Param(param *tree.ExternParam, s StageDef) error {
 	param.S3Param = &tree.S3Parameter{}
 
 	if len(s.Url.RawQuery) > 0 {
-		return fmt.Errorf("s3:// URL don't support in ExternParam.S3Param")
+		return fmt.Errorf("s3:// Query don't support in ExternParam.S3Param")
 	}
 
 	if s.Url.Scheme != S3_PROTOCOL {
