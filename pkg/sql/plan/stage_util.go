@@ -24,7 +24,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	//moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
-	//"github.com/matrixorigin/matrixone/pkg/vm/process"
+	"github.com/matrixorigin/matrixone/pkg/vm/process"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	//"github.com/matrixorigin/matrixone/pkg/util/executor"
@@ -125,9 +125,9 @@ func getS3ServiceFromProvider(provider string) (string, error) {
 	}
 }
 
-func StageLoadCatalog(ctx CompilerContext) (stagemap map[StageKey]StageDef, err error) {
+func StageLoadCatalog(proc *process.Process) (stagemap map[StageKey]StageDef, err error) {
 	getAllStagesSql := fmt.Sprintf("select stage_id, stage_name, url, stage_credentials, stage_status, 'dbname' from `%s`.`%s`;", "mo_catalog", "mo_stages")
-	res, err := runSql(ctx, getAllStagesSql)
+	res, err := runSql(proc, getAllStagesSql)
 	if err != nil {
 		return nil, err
 	}
@@ -169,9 +169,9 @@ func StageLoadCatalog(ctx CompilerContext) (stagemap map[StageKey]StageDef, err 
 	return stagemap, nil
 }
 
-func UrlToPath(furl string, stagemap map[StageKey]StageDef, ctx CompilerContext) (path string, query string, err error) {
+func UrlToPath(furl string, stagemap map[StageKey]StageDef, proc *process.Process) (path string, query string, err error) {
 
-	s, err := urlToStageDef(furl, stagemap, ctx)
+	s, err := urlToStageDef(furl, stagemap, proc)
 	if err != nil {
 		return "", "", err
 	}
@@ -217,7 +217,7 @@ func parseS3Url(u *url.URL) (bucket, fpath, query string) {
 	return
 }
 
-func urlToStageDef(furl string, stagemap map[StageKey]StageDef, ctx CompilerContext) (s StageDef, err error) {
+func urlToStageDef(furl string, stagemap map[StageKey]StageDef, proc *process.Process) (s StageDef, err error) {
 
 	aurl, err := url.Parse(furl)
 	if err != nil {
@@ -233,7 +233,7 @@ func urlToStageDef(furl string, stagemap map[StageKey]StageDef, ctx CompilerCont
 		return StageDef{}, fmt.Errorf("Parse Error: Invalid stage URL")
 	}
 
-	curdb := ctx.GetProcess().GetSessionInfo().Database
+	curdb := proc.GetSessionInfo().Database
 	logutil.Infof("Current database = %s, URL = %s", curdb, aurl)
 
 	if len(dbname) == 0 {
@@ -331,7 +331,7 @@ func InitStageS3Param(param *tree.ExternParam, s StageDef) error {
 
 }
 
-func InitInfileOrStageParam(param *tree.ExternParam, ctx CompilerContext) error {
+func InitInfileOrStageParam(param *tree.ExternParam, proc *process.Process) error {
 
 	fpath := GetFilePathFromParam(param)
 
@@ -339,12 +339,12 @@ func InitInfileOrStageParam(param *tree.ExternParam, ctx CompilerContext) error 
 		return InitInfileParam(param)
 	}
 
-	stagemap, err := StageLoadCatalog(ctx)
+	stagemap, err := StageLoadCatalog(proc)
 	if err != nil {
 		return err
 	}
 
-	s, err := urlToStageDef(fpath, stagemap, ctx)
+	s, err := urlToStageDef(fpath, stagemap, proc)
 	if err != nil {
 		return err
 	}
