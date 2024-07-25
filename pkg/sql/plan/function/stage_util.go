@@ -37,40 +37,29 @@ const STAGE_PROTOCOL = "stage"
 const S3_PROTOCOL = "s3"
 const FILE_PROTOCOL = "file"
 
-type StageKey struct {
-	Db   string
-	Name string
-}
-
 type StageDef struct {
 	Id          uint32
 	Name        string
-	Db          string
 	Url         *url.URL
 	Credentials string
 	Disabled    bool
 }
 
-func (s *StageDef) expandSubStage(stagemap map[StageKey]StageDef, defaultdb string) (StageDef, error) {
+func (s *StageDef) expandSubStage(stagemap map[string]StageDef) (StageDef, error) {
 	if s.Url.Scheme == STAGE_PROTOCOL {
-		dbname, stagename, prefix, query, err := ParseStageUrl(s.Url)
+		stagename, prefix, query, err := ParseStageUrl(s.Url)
 		if err != nil {
 			return StageDef{}, err
 		}
 
-		if len(dbname) == 0 {
-			dbname = defaultdb
-		}
-
-		key := StageKey{dbname, stagename}
-		res, ok := stagemap[key]
+		res, ok := stagemap[stagename]
 		if !ok {
-			return StageDef{}, fmt.Errorf("stage not found. stage://%s/%s", dbname, stagename)
+			return StageDef{}, fmt.Errorf("stage not found. stage://%s", stagename)
 		}
 
 		res.Url = res.Url.JoinPath(prefix)
 		res.Url.RawQuery = query
-		return res.expandSubStage(stagemap, defaultdb)
+		return res.expandSubStage(stagemap)
 	}
 
 	return *s, nil
@@ -84,7 +73,10 @@ func (s *StageDef) expandSubStage(stagemap map[StageKey]StageDef, defaultdb stri
 func (s *StageDef) ToPath() (mopath string, query string, err error) {
 
 	if s.Url.Scheme == S3_PROTOCOL {
-		bucket, prefix, query := ParseS3Url(s.Url)
+		bucket, prefix, query, err := ParseS3Url(s.Url)
+		if err != nil {
+			return "", "", err
+		}
 
 		// TODO: Decode credentials
 		aws_key_id := "aws_key_id"
@@ -143,21 +135,20 @@ func runSql(proc *process.Process, sql string) (executor.Result, error) {
         return exec.Exec(proc.Ctx, sql, opts)
 }
 
-func StageLoadCatalog(proc *process.Process) (stagemap map[StageKey]StageDef, err error) {
-	getAllStagesSql := fmt.Sprintf("select stage_id, stage_name, url, stage_credentials, stage_status, 'dbname' from `%s`.`%s`;", "mo_catalog", "mo_stages")
+func StageLoadCatalog(proc *process.Process) (stagemap map[string]StageDef, err error) {
+	getAllStagesSql := fmt.Sprintf("select stage_id, stage_name, url, stage_credentials, stage_status from `%s`.`%s`;", "mo_catalog", "mo_stages")
 	res, err := runSql(proc, getAllStagesSql)
 	if err != nil {
 		return nil, err
 	}
 	defer res.Close()
 
-	stagemap = make(map[StageKey]StageDef)
+	stagemap = make(map[string]StageDef)
 	const id_idx = 0
 	const name_idx = 1
 	const url_idx = 2
 	const cred_idx = 3
 	const status_idx = 4
-	const db_idx = 5
 	if res.Batches != nil {
 		for _, batch := range res.Batches {
 			if batch != nil && batch.Vecs[0] != nil && batch.Vecs[0].Length() > 0 {
@@ -170,14 +161,13 @@ func StageLoadCatalog(proc *process.Process) (stagemap map[StageKey]StageDef, er
 					}
 					stage_cred := string(batch.Vecs[cred_idx].GetBytesAt(i))
 					stage_status := string(batch.Vecs[status_idx].GetBytesAt(i))
-					dbname := string(batch.Vecs[db_idx].GetBytesAt(i))
 					disabled := false
 					if stage_status == "disabled" {
 						disabled = true
 					}
 
-					key := StageKey{dbname, stage_name}
-					stagemap[key] = StageDef{stage_id, stage_name, dbname, stage_url, stage_cred, disabled}
+					key := stage_name
+					stagemap[key] = StageDef{stage_id, stage_name, stage_url, stage_cred, disabled}
 					logutil.Infof("CATALOG: ID %d,  stage %s url %s cred %s", stage_id, stage_name, stage_url, stage_cred)
 				}
 			}
@@ -187,7 +177,7 @@ func StageLoadCatalog(proc *process.Process) (stagemap map[StageKey]StageDef, er
 	return stagemap, nil
 }
 
-func UrlToPath(furl string, stagemap map[StageKey]StageDef, proc *process.Process) (path string, query string, err error) {
+func UrlToPath(furl string, stagemap map[string]StageDef, proc *process.Process) (path string, query string, err error) {
 
 	s, err := UrlToStageDef(furl, stagemap, proc)
 	if err != nil {
@@ -197,45 +187,37 @@ func UrlToPath(furl string, stagemap map[StageKey]StageDef, proc *process.Proces
 	return s.ToPath()
 }
 
-func ParseStageUrl(u *url.URL) (dbname, stagename, prefix, query string, err error) {
+func ParseStageUrl(u *url.URL) (stagename, prefix, query string, err error) {
 	if u.Scheme != STAGE_PROTOCOL {
-		return "", "", "", "", fmt.Errorf("URL protocol is not stage://")
+		return "", "", "", fmt.Errorf("URL protocol is not stage://")
 	}
 
-	dbname = u.Host
-
-	if len(u.Path) == 0 {
-		return "", "", "", "", fmt.Errorf("Invalid stage URL: path is empty string")
-	}
-
-	pp := strings.SplitN(u.Path[1:], "/", 2)
-	if len(pp) == 0 {
-		return "", "", "", "", fmt.Errorf("Invalid stage URL: path not found")
-	}
-
-	stagename = pp[0]
-	prefix = ""
-	if len(pp) == 2 {
-		prefix = pp[1]
-	}
-
+	stagename = u.Host
 	if len(stagename) == 0 {
-		return "", "", "", "", fmt.Errorf("Invalid stage URL: stage name not found")
+		return "", "", "", fmt.Errorf("Invalid stage URL: stage name is empty string")
 	}
 
+	prefix = u.Path
 	query = u.RawQuery
 
 	return
 }
 
-func ParseS3Url(u *url.URL) (bucket, fpath, query string) {
+func ParseS3Url(u *url.URL) (bucket, fpath, query string, err error) {
 	bucket = u.Host
 	fpath = u.Path
 	query = u.RawQuery
+	err = nil
+
+	if len(bucket) == 0 {
+		err = fmt.Errorf("Invalid s3 URL: bucket is empty string")
+		return "", "", "", err
+	}
+
 	return
 }
 
-func UrlToStageDef(furl string, stagemap map[StageKey]StageDef, proc *process.Process) (s StageDef, err error) {
+func UrlToStageDef(furl string, stagemap map[string]StageDef, proc *process.Process) (s StageDef, err error) {
 
 	aurl, err := url.Parse(furl)
 	if err != nil {
@@ -246,25 +228,20 @@ func UrlToStageDef(furl string, stagemap map[StageKey]StageDef, proc *process.Pr
 		return StageDef{}, fmt.Errorf("URL is not stage URL")
 	}
 
-	dbname, stagename, subpath, query, err := ParseStageUrl(aurl)
+	stagename, subpath, query, err := ParseStageUrl(aurl)
 	if err != nil {
-		return StageDef{}, fmt.Errorf("Parse Error: Invalid stage URL")
+		return StageDef{}, err
 	}
 
-	curdb := proc.GetSessionInfo().Database
-	logutil.Infof("Current database = %s, URL = %s", curdb, aurl)
+	logutil.Infof("URL = %s", aurl)
+	logutil.Infof("UrlToPath stagename %s, subpath %s", stagename, subpath)
 
-	if len(dbname) == 0 {
-		dbname = curdb
-	}
-	logutil.Infof("UrlToPath dbname %s, stagename %s, subpath %s", dbname, stagename, subpath)
-	key := StageKey{dbname, stagename}
-	s, ok := stagemap[key]
+	s, ok := stagemap[stagename]
 	if !ok {
 		return StageDef{}, fmt.Errorf("stage %s not found", stagename)
 	}
 
-	exs, err := s.expandSubStage(stagemap, curdb)
+	exs, err := s.expandSubStage(stagemap)
 	if err != nil {
 		return StageDef{}, err
 	}
