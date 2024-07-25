@@ -177,9 +177,9 @@ func StageLoadCatalog(proc *process.Process) (stagemap map[string]StageDef, err 
 	return stagemap, nil
 }
 
-func UrlToPath(furl string, stagemap map[string]StageDef, proc *process.Process) (path string, query string, err error) {
+func UrlToPath(furl string, stagemap map[string]StageDef) (path string, query string, err error) {
 
-	s, err := UrlToStageDef(furl, stagemap, proc)
+	s, err := UrlToStageDef(furl, stagemap)
 	if err != nil {
 		return "", "", err
 	}
@@ -217,7 +217,7 @@ func ParseS3Url(u *url.URL) (bucket, fpath, query string, err error) {
 	return
 }
 
-func UrlToStageDef(furl string, stagemap map[string]StageDef, proc *process.Process) (s StageDef, err error) {
+func UrlToStageDef(furl string, stagemap map[string]StageDef) (s StageDef, err error) {
 
 	aurl, err := url.Parse(furl)
 	if err != nil {
