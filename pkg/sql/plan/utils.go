@@ -1491,7 +1491,10 @@ func InitStageS3Param(param *tree.ExternParam, s function.StageDef) error {
 		return fmt.Errorf("protocol is not S3")
 	}
 
-	bucket, prefix, _ := function.ParseS3Url(s.Url)
+	bucket, prefix, _, err := function.ParseS3Url(s.Url)
+	if err != nil {
+		return err
+	}
 
 	param.S3Param.Endpoint = "endpoint"
 	param.S3Param.Region = "region"
