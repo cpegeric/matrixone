@@ -37,6 +37,19 @@ const STAGE_PROTOCOL = "stage"
 const S3_PROTOCOL = "s3"
 const FILE_PROTOCOL = "file"
 
+const PARAMKEY_AWS_KEY_ID = "aws_key_id"
+const PARAMKEY_AWS_SECRET_KEY = "aws_secret_key"
+const PARAMKEY_AWS_REGION = "aws_region"
+const PARAMKEY_ENDPOINT = "endpoint"
+const PARAMKEY_COMPRESSION = "compression"
+const PARAMKEY_PROVIDER = "provider"
+
+const S3_PROVIDER_AMAZON = "amazon"
+const S3_PROVIDER_MINIO = "minio"
+
+const S3_SERVICE = "s3"
+const MINIO_SERVICE = "minio"
+
 type StageDef struct {
 	Id          uint32
 	Name        string
@@ -44,6 +57,27 @@ type StageDef struct {
 	Credentials string
 	Disabled    bool
 }
+
+func (s *StageDef) GetCredentials(key string, defval string) (string, bool) {
+	k := strings.ToLower(key)
+	switch k {
+	case PARAMKEY_AWS_KEY_ID:
+		return "KEY123", true
+	case PARAMKEY_AWS_SECRET_KEY:
+		return "SECRET123", true
+	case PARAMKEY_AWS_REGION:
+		return "local", true
+	case PARAMKEY_COMPRESSION:
+		return "", true
+	case PARAMKEY_PROVIDER:
+		return "minio", true
+	case PARAMKEY_ENDPOINT:
+		return "127.0.0.1", true
+	default:
+		return defval, false
+	}
+}
+
 
 func (s *StageDef) expandSubStage(stagemap map[string]StageDef) (StageDef, error) {
 	if s.Url.Scheme == STAGE_PROTOCOL {
@@ -79,11 +113,11 @@ func (s *StageDef) ToPath() (mopath string, query string, err error) {
 		}
 
 		// TODO: Decode credentials
-		aws_key_id := "aws_key_id"
-		aws_secret_key := "aws_secret_key"
-		aws_region := "aws_region"
-		provider := "amazon"
-		endpoint := "endpoint"
+		aws_key_id := "KEY123aws_key_id"
+		aws_secret_key := "SECRET123"
+		aws_region := "local"
+		provider := "minio"
+		endpoint := "127.0.0.1:9000"
 
 		service, err := getS3ServiceFromProvider(provider)
 		if err != nil {
@@ -109,10 +143,10 @@ func (s *StageDef) ToPath() (mopath string, query string, err error) {
 func getS3ServiceFromProvider(provider string) (string, error) {
 	provider = strings.ToLower(provider)
 	switch provider {
-	case "amazon":
-		return "s3", nil
-	case "minio":
-		return "minio", nil
+	case S3_PROVIDER_AMAZON:
+		return S3_SERVICE, nil
+	case S3_PROVIDER_MINIO:
+		return MINIO_SERVICE, nil
 	default:
 		return "", fmt.Errorf("provider %s not supported", provider)
 	}
