@@ -1484,11 +1484,11 @@ func InitStageS3Param(param *tree.ExternParam, s function.StageDef) error {
 	param.S3Param = &tree.S3Parameter{}
 
 	if len(s.Url.RawQuery) > 0 {
-		return fmt.Errorf("s3:// Query don't support in ExternParam.S3Param")
+		return moerr.NewBadConfig(param.Ctx, "S3 URL Query does not support in ExternParam")
 	}
 
 	if s.Url.Scheme != function.S3_PROTOCOL {
-		return fmt.Errorf("protocol is not S3")
+		return moerr.NewBadConfig(param.Ctx, "URL protocol is not S3")
 	}
 
 	bucket, prefix, _, err := function.ParseS3Url(s.Url)
@@ -1577,7 +1577,7 @@ func InitInfileOrStageParam(param *tree.ExternParam, proc *process.Process) erro
 	}
 
 	if len(s.Url.RawQuery) > 0 {
-		return fmt.Errorf("Invalid URL: query not supported in ExternParam")
+		return moerr.NewBadConfig(param.Ctx, "Invalid URL: query not supported in ExternParam")
 	}
 
 	if s.Url.Scheme == function.S3_PROTOCOL {
@@ -1592,7 +1592,7 @@ func InitInfileOrStageParam(param *tree.ExternParam, proc *process.Process) erro
 		param.Filepath = s.Url.Path
 
 	} else {
-		return fmt.Errorf("invalid URL: protocol %s not supported", s.Url.Scheme)
+		return moerr.NewBadConfig(param.Ctx, "invalid URL: protocol %s not supported", s.Url.Scheme)
 	}
 
 	return nil

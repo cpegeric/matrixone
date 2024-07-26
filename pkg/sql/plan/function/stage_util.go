@@ -15,22 +15,19 @@
 package function
 
 import (
-	//"context"
+	"context"
 	"encoding/csv"
 	"fmt"
-	//"path"
 	"net/url"
 	"strings"
 
-	//"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
-	"github.com/matrixorigin/matrixone/pkg/vm/process"
-	"github.com/matrixorigin/matrixone/pkg/logutil"
-	//"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
-	//"github.com/matrixorigin/matrixone/pkg/util/executor"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
-        "github.com/matrixorigin/matrixone/pkg/util/executor"
+	//"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
+	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
 const STAGE_PROTOCOL = "stage"
@@ -78,7 +75,6 @@ func (s *StageDef) GetCredentials(key string, defval string) (string, bool) {
 	}
 }
 
-
 func (s *StageDef) expandSubStage(stagemap map[string]StageDef) (StageDef, error) {
 	if s.Url.Scheme == STAGE_PROTOCOL {
 		stagename, prefix, query, err := ParseStageUrl(s.Url)
@@ -88,7 +84,7 @@ func (s *StageDef) expandSubStage(stagemap map[string]StageDef) (StageDef, error
 
 		res, ok := stagemap[stagename]
 		if !ok {
-			return StageDef{}, fmt.Errorf("stage not found. stage://%s", stagename)
+			return StageDef{}, moerr.NewBadConfig(context.TODO(), "stage not found. stage://%s", stagename)
 		}
 
 		res.Url = res.Url.JoinPath(prefix)
@@ -134,7 +130,7 @@ func (s *StageDef) ToPath() (mopath string, query string, err error) {
 		w.Flush()
 		return fileservice.JoinPath(buf.String(), prefix), query, nil
 	} else if s.Url.Scheme == FILE_PROTOCOL {
-		logutil.Infof("ToPath: prefix = %s, query = %s", s.Url.Path, s.Url.RawQuery)
+		//logutil.Infof("ToPath: prefix = %s, query = %s", s.Url.Path, s.Url.RawQuery)
 		return s.Url.Path, s.Url.RawQuery, nil
 	}
 	return "", "", nil
@@ -148,25 +144,25 @@ func getS3ServiceFromProvider(provider string) (string, error) {
 	case S3_PROVIDER_MINIO:
 		return MINIO_SERVICE, nil
 	default:
-		return "", fmt.Errorf("provider %s not supported", provider)
+		return "", moerr.NewBadConfig(context.TODO(), "provider %s not supported", provider)
 	}
 }
 
 func runSql(proc *process.Process, sql string) (executor.Result, error) {
-        v, ok := moruntime.ProcessLevelRuntime().GetGlobalVariables(moruntime.InternalSQLExecutor)
-        if !ok {
-                panic("missing lock service")
-        }
-        exec := v.(executor.SQLExecutor)
-        opts := executor.Options{}.
-                // All runSql and runSqlWithResult is a part of input sql, can not incr statement.
-                // All these sub-sql's need to be rolled back and retried en masse when they conflict in pessimistic mode
-                WithDisableIncrStatement().
-                WithTxn(proc.GetTxnOperator()).
-                WithDatabase(proc.GetSessionInfo().Database).
-                WithTimeZone(proc.GetSessionInfo().TimeZone).
-                WithAccountID(proc.GetSessionInfo().AccountId)
-        return exec.Exec(proc.Ctx, sql, opts)
+	v, ok := moruntime.ProcessLevelRuntime().GetGlobalVariables(moruntime.InternalSQLExecutor)
+	if !ok {
+		panic("missing lock service")
+	}
+	exec := v.(executor.SQLExecutor)
+	opts := executor.Options{}.
+		// All runSql and runSqlWithResult is a part of input sql, can not incr statement.
+		// All these sub-sql's need to be rolled back and retried en masse when they conflict in pessimistic mode
+		WithDisableIncrStatement().
+		WithTxn(proc.GetTxnOperator()).
+		WithDatabase(proc.GetSessionInfo().Database).
+		WithTimeZone(proc.GetSessionInfo().TimeZone).
+		WithAccountID(proc.GetSessionInfo().AccountId)
+	return exec.Exec(proc.Ctx, sql, opts)
 }
 
 func StageLoadCatalog(proc *process.Process) (stagemap map[string]StageDef, err error) {
@@ -202,7 +198,7 @@ func StageLoadCatalog(proc *process.Process) (stagemap map[string]StageDef, err 
 
 					key := stage_name
 					stagemap[key] = StageDef{stage_id, stage_name, stage_url, stage_cred, disabled}
-					logutil.Infof("CATALOG: ID %d,  stage %s url %s cred %s", stage_id, stage_name, stage_url, stage_cred)
+					//logutil.Infof("CATALOG: ID %d,  stage %s url %s cred %s", stage_id, stage_name, stage_url, stage_cred)
 				}
 			}
 		}
@@ -223,12 +219,12 @@ func UrlToPath(furl string, stagemap map[string]StageDef) (path string, query st
 
 func ParseStageUrl(u *url.URL) (stagename, prefix, query string, err error) {
 	if u.Scheme != STAGE_PROTOCOL {
-		return "", "", "", fmt.Errorf("URL protocol is not stage://")
+		return "", "", "", moerr.NewBadConfig(context.TODO(), "ParseStageUrl: URL protocol is not stage://")
 	}
 
 	stagename = u.Host
 	if len(stagename) == 0 {
-		return "", "", "", fmt.Errorf("Invalid stage URL: stage name is empty string")
+		return "", "", "", moerr.NewBadConfig(context.TODO(), "Invalid stage URL: stage name is empty string")
 	}
 
 	prefix = u.Path
@@ -244,7 +240,7 @@ func ParseS3Url(u *url.URL) (bucket, fpath, query string, err error) {
 	err = nil
 
 	if len(bucket) == 0 {
-		err = fmt.Errorf("Invalid s3 URL: bucket is empty string")
+		err = moerr.NewBadConfig(context.TODO(), "Invalid s3 URL: bucket is empty string")
 		return "", "", "", err
 	}
 
@@ -259,7 +255,7 @@ func UrlToStageDef(furl string, stagemap map[string]StageDef) (s StageDef, err e
 	}
 
 	if aurl.Scheme != STAGE_PROTOCOL {
-		return StageDef{}, fmt.Errorf("URL is not stage URL")
+		return StageDef{}, moerr.NewBadConfig(context.TODO(), "URL is not stage URL")
 	}
 
 	stagename, subpath, query, err := ParseStageUrl(aurl)
@@ -267,12 +263,9 @@ func UrlToStageDef(furl string, stagemap map[string]StageDef) (s StageDef, err e
 		return StageDef{}, err
 	}
 
-	logutil.Infof("URL = %s", aurl)
-	logutil.Infof("UrlToPath stagename %s, subpath %s", stagename, subpath)
-
 	s, ok := stagemap[stagename]
 	if !ok {
-		return StageDef{}, fmt.Errorf("stage %s not found", stagename)
+		return StageDef{}, moerr.NewBadConfig(context.TODO(), "stage %s not found in mo_stages table", stagename)
 	}
 
 	exs, err := s.expandSubStage(stagemap)
@@ -280,13 +273,8 @@ func UrlToStageDef(furl string, stagemap map[string]StageDef) (s StageDef, err e
 		return StageDef{}, err
 	}
 
-	logutil.Infof("ExanpdSubStage Url=%s", exs.Url)
-
 	exs.Url = exs.Url.JoinPath(subpath)
 	exs.Url.RawQuery = query
 
-	logutil.Infof("JoinPath Url=%s", exs.Url)
-
 	return exs, nil
 }
-
