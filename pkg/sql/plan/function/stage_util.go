@@ -75,21 +75,21 @@ func (s *StageDef) GetCredentials(key string, defval string) (string, bool) {
 	}
 }
 
-func (s *StageDef) expandSubStage(stagemap map[string]StageDef) (StageDef, error) {
+func (s *StageDef) expandSubStage(proc *process.Process) (StageDef, error) {
 	if s.Url.Scheme == STAGE_PROTOCOL {
 		stagename, prefix, query, err := ParseStageUrl(s.Url)
 		if err != nil {
 			return StageDef{}, err
 		}
 
-		res, ok := stagemap[stagename]
-		if !ok {
-			return StageDef{}, moerr.NewBadConfig(context.TODO(), "stage not found. stage://%s", stagename)
+		res, err := StageLoadCatalog(proc, stagename)
+		if err != nil {
+			return StageDef{}, err
 		}
 
 		res.Url = res.Url.JoinPath(prefix)
 		res.Url.RawQuery = query
-		return res.expandSubStage(stagemap)
+		return res.expandSubStage(proc)
 	}
 
 	return *s, nil
@@ -165,15 +165,14 @@ func runSql(proc *process.Process, sql string) (executor.Result, error) {
 	return exec.Exec(proc.Ctx, sql, opts)
 }
 
-func StageLoadCatalog(proc *process.Process) (stagemap map[string]StageDef, err error) {
-	getAllStagesSql := fmt.Sprintf("select stage_id, stage_name, url, stage_credentials, stage_status from `%s`.`%s`;", "mo_catalog", "mo_stages")
+func StageLoadCatalog(proc *process.Process, stagename string) (s StageDef, err error) {
+	getAllStagesSql := fmt.Sprintf("select stage_id, stage_name, url, stage_credentials, stage_status from `%s`.`%s` WHERE stage_name = '%s';", "mo_catalog", "mo_stages", stagename)
 	res, err := runSql(proc, getAllStagesSql)
 	if err != nil {
-		return nil, err
+		return StageDef{}, err
 	}
 	defer res.Close()
 
-	stagemap = make(map[string]StageDef)
 	const id_idx = 0
 	const name_idx = 1
 	const url_idx = 2
@@ -187,7 +186,7 @@ func StageLoadCatalog(proc *process.Process) (stagemap map[string]StageDef, err 
 					stage_name := string(batch.Vecs[name_idx].GetBytesAt(i))
 					stage_url, err := url.Parse(string(batch.Vecs[url_idx].GetBytesAt(i)))
 					if err != nil {
-						return nil, err
+						return StageDef{}, err
 					}
 					stage_cred := string(batch.Vecs[cred_idx].GetBytesAt(i))
 					stage_status := string(batch.Vecs[status_idx].GetBytesAt(i))
@@ -196,20 +195,19 @@ func StageLoadCatalog(proc *process.Process) (stagemap map[string]StageDef, err 
 						disabled = true
 					}
 
-					key := stage_name
-					stagemap[key] = StageDef{stage_id, stage_name, stage_url, stage_cred, disabled}
 					//logutil.Infof("CATALOG: ID %d,  stage %s url %s cred %s", stage_id, stage_name, stage_url, stage_cred)
+					return StageDef{stage_id, stage_name, stage_url, stage_cred, disabled}, nil
 				}
 			}
 		}
 	}
 
-	return stagemap, nil
+	return StageDef{}, moerr.NewBadConfig(context.TODO(), "Stage %s not found", stagename)
 }
 
-func UrlToPath(furl string, stagemap map[string]StageDef) (path string, query string, err error) {
+func UrlToPath(furl string, proc *process.Process) (path string, query string, err error) {
 
-	s, err := UrlToStageDef(furl, stagemap)
+	s, err := UrlToStageDef(furl, proc)
 	if err != nil {
 		return "", "", err
 	}
@@ -247,7 +245,7 @@ func ParseS3Url(u *url.URL) (bucket, fpath, query string, err error) {
 	return
 }
 
-func UrlToStageDef(furl string, stagemap map[string]StageDef) (s StageDef, err error) {
+func UrlToStageDef(furl string, proc *process.Process) (s StageDef, err error) {
 
 	aurl, err := url.Parse(furl)
 	if err != nil {
@@ -263,18 +261,18 @@ func UrlToStageDef(furl string, stagemap map[string]StageDef) (s StageDef, err e
 		return StageDef{}, err
 	}
 
-	s, ok := stagemap[stagename]
-	if !ok {
-		return StageDef{}, moerr.NewBadConfig(context.TODO(), "stage %s not found in mo_stages table", stagename)
-	}
-
-	exs, err := s.expandSubStage(stagemap)
+	sdef, err := StageLoadCatalog(proc, stagename)
 	if err != nil {
 		return StageDef{}, err
 	}
 
-	exs.Url = exs.Url.JoinPath(subpath)
-	exs.Url.RawQuery = query
+	s, err = sdef.expandSubStage(proc)
+	if err != nil {
+		return StageDef{}, err
+	}
 
-	return exs, nil
+	s.Url = s.Url.JoinPath(subpath)
+	s.Url.RawQuery = query
+
+	return s, nil
 }
