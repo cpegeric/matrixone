@@ -3531,7 +3531,7 @@ func doCreateStage(ctx context.Context, ses *Session, cs *tree.CreateStage) (err
 		}
 	} else {
 		// format credentials and hash it
-		credentials = HashPassWord(formatCredentials(cs.Credentials))
+		credentials = formatCredentials(cs.Credentials)
 
 		if !cs.Status.Exist {
 			StageStatus = "disabled"
