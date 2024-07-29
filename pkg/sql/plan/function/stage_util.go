@@ -47,32 +47,28 @@ const S3_PROVIDER_MINIO = "minio"
 const S3_SERVICE = "s3"
 const MINIO_SERVICE = "minio"
 
+
 type StageDef struct {
 	Id          uint32
 	Name        string
 	Url         *url.URL
-	Credentials string
-	Disabled    bool
+	Credentials map[string]string
+	Status    string
 }
 
+
 func (s *StageDef) GetCredentials(key string, defval string) (string, bool) {
-	k := strings.ToLower(key)
-	switch k {
-	case PARAMKEY_AWS_KEY_ID:
-		return "KEY123", true
-	case PARAMKEY_AWS_SECRET_KEY:
-		return "SECRET123", true
-	case PARAMKEY_AWS_REGION:
-		return "local", true
-	case PARAMKEY_COMPRESSION:
-		return "", true
-	case PARAMKEY_PROVIDER:
-		return "minio", true
-	case PARAMKEY_ENDPOINT:
-		return "127.0.0.1", true
-	default:
+	if s.Credentials == nil {
+		// no credential in this stage
 		return defval, false
 	}
+
+	k := strings.ToLower(key)
+	res, ok := s.Credentials[k]
+	if !ok {
+		return defval, false
+	}
+	return res, ok
 }
 
 func (s *StageDef) expandSubStage(proc *process.Process) (StageDef, error) {
@@ -108,12 +104,27 @@ func (s *StageDef) ToPath() (mopath string, query string, err error) {
 			return "", "", err
 		}
 
-		// TODO: Decode credentials
-		aws_key_id := "KEY123aws_key_id"
-		aws_secret_key := "SECRET123"
-		aws_region := "local"
-		provider := "minio"
-		endpoint := "127.0.0.1:9000"
+		// get S3 credentials
+		aws_key_id, found := s.GetCredentials(PARAMKEY_AWS_KEY_ID, "")
+		if !found {
+			return "", "", moerr.NewBadConfig(context.TODO(), "Stage credentials: AWS_KEY_ID not found")
+		}
+		aws_secret_key, found := s.GetCredentials(PARAMKEY_AWS_SECRET_KEY, "")
+		if !found {
+			return "", "", moerr.NewBadConfig(context.TODO(), "Stage credentials: AWS_SECRET_KEY not found")
+		}
+		aws_region, found := s.GetCredentials(PARAMKEY_AWS_REGION, "")
+		if !found {
+			return "", "", moerr.NewBadConfig(context.TODO(), "Stage credentials: AWS_REGION not found")
+		}
+		provider, found := s.GetCredentials(PARAMKEY_PROVIDER, "")
+		if !found {
+			return "", "", moerr.NewBadConfig(context.TODO(), "Stage credentials: PROVIDER not found")
+		}
+		endpoint, found := s.GetCredentials(PARAMKEY_ENDPOINT, "")
+		if !found {
+			return "", "", moerr.NewBadConfig(context.TODO(), "Stage credentials: ENDPOINT not found")
+		}
 
 		service, err := getS3ServiceFromProvider(provider)
 		if err != nil {
@@ -130,7 +141,6 @@ func (s *StageDef) ToPath() (mopath string, query string, err error) {
 		w.Flush()
 		return fileservice.JoinPath(buf.String(), prefix), query, nil
 	} else if s.Url.Scheme == FILE_PROTOCOL {
-		//logutil.Infof("ToPath: prefix = %s, query = %s", s.Url.Path, s.Url.RawQuery)
 		return s.Url.Path, s.Url.RawQuery, nil
 	}
 	return "", "", nil
@@ -165,6 +175,24 @@ func runSql(proc *process.Process, sql string) (executor.Result, error) {
 	return exec.Exec(proc.Ctx, sql, opts)
 }
 
+func credentialsToMap(cred string) (map[string]string, error)  {
+	opts := strings.Split(cred, ",")
+	if len(opts) == 0 {
+		return nil, nil
+	}
+
+	credentials := make(map[string]string)
+	for _, o := range opts {
+		kv := strings.SplitN(o, "=", 2)
+		if len(kv) != 2 {
+			return nil, moerr.NewBadConfig(context.TODO(), "Format error: invalid stage credentials")
+		}
+		credentials[strings.ToLower(kv[0])] = kv[1]
+	}
+
+	return credentials, nil
+}
+
 func StageLoadCatalog(proc *process.Process, stagename string) (s StageDef, err error) {
 	getAllStagesSql := fmt.Sprintf("select stage_id, stage_name, url, stage_credentials, stage_status from `%s`.`%s` WHERE stage_name = '%s';", "mo_catalog", "mo_stages", stagename)
 	res, err := runSql(proc, getAllStagesSql)
@@ -189,14 +217,19 @@ func StageLoadCatalog(proc *process.Process, stagename string) (s StageDef, err 
 						return StageDef{}, err
 					}
 					stage_cred := string(batch.Vecs[cred_idx].GetBytesAt(i))
-					stage_status := string(batch.Vecs[status_idx].GetBytesAt(i))
-					disabled := false
-					if stage_status == "disabled" {
-						disabled = true
+
+					// TODO: ERIC HACK
+					const DEFAULT_CREDENTIALS = "AWS_KEY_ID=KEY123,AWS_SECRET_KEY=SECRET123,AWS_REGION=local,COMPRESSION=,PROVIDER=minio,ENDPOINT=127.0.0.1"
+					stage_cred = DEFAULT_CREDENTIALS
+					credmap, err := credentialsToMap(stage_cred)
+					if err != nil {
+						return StageDef{}, err
 					}
 
+					stage_status := string(batch.Vecs[status_idx].GetBytesAt(i))
+
 					//logutil.Infof("CATALOG: ID %d,  stage %s url %s cred %s", stage_id, stage_name, stage_url, stage_cred)
-					return StageDef{stage_id, stage_name, stage_url, stage_cred, disabled}, nil
+					return StageDef{stage_id, stage_name, stage_url, credmap, stage_status}, nil
 				}
 			}
 		}
