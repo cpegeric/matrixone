@@ -176,6 +176,10 @@ func runSql(proc *process.Process, sql string) (executor.Result, error) {
 }
 
 func credentialsToMap(cred string) (map[string]string, error)  {
+	if len(cred) == 0 {
+		return nil, nil
+	}
+
 	opts := strings.Split(cred, ",")
 	if len(opts) == 0 {
 		return nil, nil
@@ -218,9 +222,6 @@ func StageLoadCatalog(proc *process.Process, stagename string) (s StageDef, err 
 					}
 					stage_cred := string(batch.Vecs[cred_idx].GetBytesAt(i))
 
-					// TODO: ERIC HACK
-					const DEFAULT_CREDENTIALS = "AWS_KEY_ID=KEY123,AWS_SECRET_KEY=SECRET123,AWS_REGION=local,COMPRESSION=,PROVIDER=minio,ENDPOINT=127.0.0.1"
-					stage_cred = DEFAULT_CREDENTIALS
 					credmap, err := credentialsToMap(stage_cred)
 					if err != nil {
 						return StageDef{}, err
