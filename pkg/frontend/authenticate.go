@@ -3656,6 +3656,11 @@ func doAlterStage(ctx context.Context, ses *Session, as *tree.AlterStage) (err e
 		}
 	} else {
 		if as.UrlOption.Exist {
+			if !(strings.HasPrefix(as.UrlOption.Url, function.STAGE_PROTOCOL+"://") ||
+				strings.HasPrefix(as.UrlOption.Url, function.S3_PROTOCOL+"://") ||
+				strings.HasPrefix(as.UrlOption.Url, function.FILE_PROTOCOL+":///")) {
+				return moerr.NewBadConfig(ctx, "URL protocol only supports stage://, s3:// and file:///")
+			}
 			sql = getsqlForUpdateStageUrl(string(as.Name), as.UrlOption.Url)
 			err = bh.Exec(ctx, sql)
 			if err != nil {
