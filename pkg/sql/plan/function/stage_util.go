@@ -143,7 +143,7 @@ func (s *StageDef) ToPath() (mopath string, query string, err error) {
 	} else if s.Url.Scheme == FILE_PROTOCOL {
 		return s.Url.Path, s.Url.RawQuery, nil
 	}
-	return "", "", nil
+	return "", "", moerr.NewBadConfig(context.TODO(), "URL protocol %s not supported", s.Url.Scheme)
 }
 
 func getS3ServiceFromProvider(provider string) (string, error) {
