@@ -3569,17 +3569,6 @@ func doCheckFilePath(ctx context.Context, ses *Session, ep *tree.ExportParam) (e
 		return err
 	}
 
-	bh := ses.GetBackgroundExec(ctx)
-	defer bh.Close()
-
-	err = bh.Exec(ctx, "begin;")
-	defer func() {
-		err = finishTxn(ctx, bh, err)
-	}()
-	if err != nil {
-		return err
-	}
-
 	// detect filepath contain stage or not
 	filePath = ep.FilePath
 	if strings.HasPrefix(filePath, function.STAGE_PROTOCOL+"://") {
