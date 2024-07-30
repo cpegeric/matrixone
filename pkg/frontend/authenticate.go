@@ -3589,6 +3589,7 @@ func doCheckFilePath(ctx context.Context, ses *Session, ep *tree.ExportParam) (e
 			return err
 		}
 
+		// s.ToPath() returns the fileservice filepath, i.e. s3,...:/path for S3 or /path for local file
 		ses.ep.userConfig.StageFilePath, _, err = s.ToPath()
 		if err != nil {
 			return err
