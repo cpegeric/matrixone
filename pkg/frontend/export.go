@@ -72,7 +72,6 @@ type ExportConfig struct {
 
 type writeParam struct {
 	First            bool
-	OutFromResultSet bool
 	Index            atomic.Int32
 	WriteIndex       atomic.Int32
 	ByteChan         chan *BatchByte
@@ -134,6 +133,7 @@ func initExportFileParam(ep *ExportConfig, mrs *MysqlResultSet) {
 }
 
 var openNewFile = func(ctx context.Context, ep *ExportConfig, mrs *MysqlResultSet) error {
+	var err error
 	var filePath string
 	lineSize := ep.LineSize
 	ep.CurFileSize = 0
@@ -152,8 +152,9 @@ var openNewFile = func(ctx context.Context, ep *ExportConfig, mrs *MysqlResultSe
 	}
 
 	// init ep.FileService
+	logutil.Infof("ERIC FILEPATH =  %s", filePath)
 
-	ep.FileService, readpath, err := fileservice.GetForETL(ctx, nil, filePath)
+	ep.FileService, _, err = fileservice.GetForETL(ctx, nil, filePath)
 	if err != nil {
 		return err
 	}
@@ -791,6 +792,11 @@ func exportAllDataFromBatches(ep *ExportConfig) error {
 		}
 		ep.WriteIndex.Add(1)
 		ep.BatchMap[ep.WriteIndex.Load()] = nil
+		_, err := EndOfLine(ep)
+		if err != nil {
+			return err
+		}
+
 	}
 	ep.First = false
 	ep.FileCnt = 0

@@ -587,7 +587,6 @@ func doDumpQueryResult(ctx context.Context, ses *Session, eParam *tree.ExportPar
 		mrs:        mrs,
 	}
 	//prepare output queue
-	exportParam.OutFromResultSet = true
 	//prepare export param
 	exportParam.DefaultBufSize = getGlobalPu().SV.ExportDataDefaultFlushSize
 	//exportParam.UseFileService = true
