@@ -15,7 +15,6 @@
 package frontend
 
 import (
-	//"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -38,7 +37,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
-	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 )
 
@@ -71,11 +69,11 @@ type ExportConfig struct {
 }
 
 type writeParam struct {
-	First            bool
-	Index            atomic.Int32
-	WriteIndex       atomic.Int32
-	ByteChan         chan *BatchByte
-	BatchMap         map[int32][]byte
+	First      bool
+	Index      atomic.Int32
+	WriteIndex atomic.Int32
+	ByteChan   chan *BatchByte
+	BatchMap   map[int32][]byte
 }
 
 type BatchByte struct {
@@ -151,17 +149,15 @@ var openNewFile = func(ctx context.Context, ep *ExportConfig, mrs *MysqlResultSe
 		filePath = getExportFilePath(ep.userConfig.FilePath, ep.FileCnt)
 	}
 
-	// init ep.FileService
-	logutil.Infof("ERIC FILEPATH =  %s", filePath)
-
-	ep.FileService, _, err = fileservice.GetForETL(ctx, nil, filePath)
+	var readPath string
+	ep.FileService, readPath, err = fileservice.GetForETL(ctx, nil, filePath)
 	if err != nil {
 		return err
 	}
 
 	asyncWriteFunc := func() error {
 		vec := fileservice.IOVector{
-			FilePath: filePath,
+			FilePath: readPath,
 			Entries: []fileservice.IOEntry{
 				{
 					ReaderForWrite: ep.AsyncReader,
@@ -295,12 +291,10 @@ var Close = func(ep *ExportConfig) error {
 }
 
 var Write = func(ep *ExportConfig, output []byte) (int, error) {
-	logutil.Infof("ERIC Write callback... %s", string(output))
 	return ep.LineBuffer.Write(output)
 }
 
 var EndOfLine = func(ep *ExportConfig) (int, error) {
-	logutil.Infof("ERIC ENDOFLINE")
 	n, err := ep.AsyncWriter.Write(ep.LineBuffer.Bytes())
 	if err != nil {
 		err2 := ep.AsyncWriter.CloseWithError(err)
@@ -313,7 +307,6 @@ var EndOfLine = func(ep *ExportConfig) (int, error) {
 }
 
 func writeToCSVFile(ep *ExportConfig, output []byte) error {
-	logutil.Infof("ERIC writeToCSVFile ....%s", string(output))
 	if ep.userConfig.MaxFileSize != 0 && ep.CurFileSize+uint64(len(output)) > ep.userConfig.MaxFileSize {
 		if err := Flush(ep); err != nil {
 			return err
@@ -351,7 +344,6 @@ func writeToCSVFile(ep *ExportConfig, output []byte) error {
 
 var writeDataToCSVFile = func(ep *ExportConfig, output []byte) error {
 
-	logutil.Infof("ERIC writeDataToCSVFile callback....%s", string(output))
 	for {
 		// ERIC BUG HERE
 		if n, err := Write(ep, output); err != nil {
@@ -397,7 +389,6 @@ func constructByte(ctx context.Context, obj FeSession, bat *batch.Batch, index i
 	terminated := ep.userConfig.Fields.Terminated.Value
 	flag := ep.ColumnFlag
 	writeByte := make([]byte, 0)
-	logutil.Infof("ERIC WriteBatch go constructByte START NROW = %d.....", bat.RowCount())
 	for i := 0; i < bat.RowCount(); i++ {
 		for j, vec := range bat.Vecs {
 			if vec.GetNulls().Contains(uint64(i)) {
@@ -552,8 +543,6 @@ func addEscapeToString(s []byte) []byte {
 
 func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 	oq.LineSize = 0
-
-	logutil.Infof("ERIC exportDataToCSVFILE: MySQLRestul to CSV file...")
 
 	symbol := oq.Symbol
 	closeby := oq.userConfig.Fields.EnclosedBy.Value
@@ -741,7 +730,6 @@ func exportDataFromBatchToCSVFile(ep *ExportConfig) error {
 	default:
 	}
 
-	logutil.Infof("ERIC exportDataToCSVFile 22222222222222")
 	if tmp != nil {
 		if tmp.err != nil {
 			return tmp.err
@@ -765,7 +753,6 @@ func exportDataFromBatchToCSVFile(ep *ExportConfig) error {
 
 func exportAllDataFromBatches(ep *ExportConfig) error {
 	var tmp *BatchByte
-	logutil.Infof("ERIC ExportAllData:")
 	for {
 		tmp = nil
 		if ep.WriteIndex == ep.Index {
@@ -786,7 +773,6 @@ func exportAllDataFromBatches(ep *ExportConfig) error {
 		if !ok {
 			continue
 		}
-		logutil.Infof("ERIC ExportAllData value: %s", string(value))
 		if err := writeToCSVFile(ep, value); err != nil {
 			return err
 		}
@@ -819,16 +805,13 @@ func (ec *ExportConfig) resetLineStr() {
 }
 
 func (ec *ExportConfig) Write(execCtx *ExecCtx, bat *batch.Batch) error {
-	logutil.Infof("ERIC WriteBatch .....")
 	ec.Index.Add(1)
 	copied, err := bat.Dup(execCtx.ses.GetMemPool())
 	if err != nil {
 		return err
 	}
-	logutil.Infof("ERIC WriteBatch go constructByte.....")
 	go constructByte(execCtx.reqCtx, execCtx.ses, copied, ec.Index.Load(), ec.ByteChan, ec)
 
-	logutil.Infof("ERIC WriteBatch exportDataToCSVFile.....")
 	if err = exportDataFromBatchToCSVFile(ec); err != nil {
 		execCtx.ses.Error(execCtx.reqCtx,
 			"Error occurred while exporting to CSV file",
