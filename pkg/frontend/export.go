@@ -15,7 +15,7 @@
 package frontend
 
 import (
-	"bufio"
+	//"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -38,16 +38,14 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 )
 
 type ExportConfig struct {
 	// configs from user input
 	userConfig *tree.ExportParam
-	// file handler
-	File *os.File
-	// bufio.writer
-	Writer *bufio.Writer
+
 	// curFileSize
 	CurFileSize uint64
 	Rows        uint64
@@ -60,7 +58,6 @@ type ExportConfig struct {
 	LineSize       uint64
 
 	//file service & buffer for the line
-	UseFileService bool
 	writeParam
 	FileService fileservice.FileService
 	LineBuffer  *bytes.Buffer
@@ -74,12 +71,12 @@ type ExportConfig struct {
 }
 
 type writeParam struct {
-	First      bool
-	OutTofile  bool
-	Index      atomic.Int32
-	WriteIndex atomic.Int32
-	ByteChan   chan *BatchByte
-	BatchMap   map[int32][]byte
+	First            bool
+	OutFromResultSet bool
+	Index            atomic.Int32
+	WriteIndex       atomic.Int32
+	ByteChan         chan *BatchByte
+	BatchMap         map[int32][]byte
 }
 
 type BatchByte struct {
@@ -137,54 +134,53 @@ func initExportFileParam(ep *ExportConfig, mrs *MysqlResultSet) {
 }
 
 var openNewFile = func(ctx context.Context, ep *ExportConfig, mrs *MysqlResultSet) error {
+	var filePath string
 	lineSize := ep.LineSize
-	var err error
 	ep.CurFileSize = 0
-	if !ep.UseFileService {
-		var filePath string
-		if len(ep.userConfig.StageFilePath) != 0 {
-			filePath = getExportFilePath(ep.userConfig.StageFilePath, ep.FileCnt)
-		} else {
-			filePath = getExportFilePath(ep.userConfig.FilePath, ep.FileCnt)
-		}
-		ep.File, err = OpenFile(filePath, os.O_RDWR|os.O_EXCL|os.O_CREATE, 0o666)
-		if err != nil {
-			return err
-		}
-		ep.Writer = bufio.NewWriterSize(ep.File, int(ep.DefaultBufSize))
+
+	//default 1MB
+	if ep.LineBuffer == nil {
+		ep.LineBuffer = &bytes.Buffer{}
 	} else {
-		//default 1MB
-		if ep.LineBuffer == nil {
-			ep.LineBuffer = &bytes.Buffer{}
-		} else {
-			ep.LineBuffer.Reset()
-		}
-		ep.AsyncReader, ep.AsyncWriter = io.Pipe()
-		filePath := getExportFilePath(ep.userConfig.FilePath, ep.FileCnt)
-
-		asyncWriteFunc := func() error {
-			vec := fileservice.IOVector{
-				FilePath: filePath,
-				Entries: []fileservice.IOEntry{
-					{
-						ReaderForWrite: ep.AsyncReader,
-						Size:           -1,
-					},
-				},
-			}
-			err := ep.FileService.Write(ctx, vec)
-			if err != nil {
-				err2 := ep.AsyncReader.CloseWithError(err)
-				if err2 != nil {
-					return err2
-				}
-			}
-			return err
-		}
-
-		ep.AsyncGroup, _ = errgroup.WithContext(ctx)
-		ep.AsyncGroup.Go(asyncWriteFunc)
+		ep.LineBuffer.Reset()
 	}
+	ep.AsyncReader, ep.AsyncWriter = io.Pipe()
+	if len(ep.userConfig.StageFilePath) != 0 {
+		filePath = getExportFilePath(ep.userConfig.StageFilePath, ep.FileCnt)
+	} else {
+		filePath = getExportFilePath(ep.userConfig.FilePath, ep.FileCnt)
+	}
+
+	// init ep.FileService
+
+	ep.FileService, readpath, err := fileservice.GetForETL(ctx, nil, filePath)
+	if err != nil {
+		return err
+	}
+
+	asyncWriteFunc := func() error {
+		vec := fileservice.IOVector{
+			FilePath: filePath,
+			Entries: []fileservice.IOEntry{
+				{
+					ReaderForWrite: ep.AsyncReader,
+					Size:           -1,
+				},
+			},
+		}
+		err := ep.FileService.Write(ctx, vec)
+		if err != nil {
+			err2 := ep.AsyncReader.CloseWithError(err)
+			if err2 != nil {
+				return err2
+			}
+		}
+		return err
+	}
+
+	ep.AsyncGroup, _ = errgroup.WithContext(ctx)
+	ep.AsyncGroup.Go(asyncWriteFunc)
+
 	if ep.userConfig.Header {
 		var header string
 		n := len(mrs.Columns)
@@ -245,12 +241,10 @@ var formatOutputString = func(oq *ExportConfig, tmp, symbol []byte, enclosed byt
 }
 
 var Flush = func(ep *ExportConfig) error {
-	if !ep.UseFileService {
-		return ep.Writer.Flush()
-	}
 	return nil
 }
 
+/*
 var Seek = func(ep *ExportConfig) (int64, error) {
 	if !ep.UseFileService {
 		return ep.File.Seek(int64(ep.CurFileSize-ep.LineSize), io.SeekStart)
@@ -277,75 +271,69 @@ var Truncate = func(ep *ExportConfig) error {
 		return nil
 	}
 }
+*/
 
 var Close = func(ep *ExportConfig) error {
-	if !ep.UseFileService {
-		ep.FileCnt++
-		return ep.File.Close()
-	} else {
-		ep.FileCnt++
-		err := ep.AsyncWriter.Close()
-		if err != nil {
-			return err
-		}
-		err = ep.AsyncGroup.Wait()
-		if err != nil {
-			return err
-		}
-		err = ep.AsyncReader.Close()
-		if err != nil {
-			return err
-		}
-		ep.AsyncReader = nil
-		ep.AsyncWriter = nil
-		ep.AsyncGroup = nil
+	ep.FileCnt++
+	err := ep.AsyncWriter.Close()
+	if err != nil {
 		return err
 	}
+	err = ep.AsyncGroup.Wait()
+	if err != nil {
+		return err
+	}
+	err = ep.AsyncReader.Close()
+	if err != nil {
+		return err
+	}
+	ep.AsyncReader = nil
+	ep.AsyncWriter = nil
+	ep.AsyncGroup = nil
+	return err
 }
 
 var Write = func(ep *ExportConfig, output []byte) (int, error) {
-	if !ep.UseFileService {
-		return ep.Writer.Write(output)
-	} else {
-		return ep.LineBuffer.Write(output)
-	}
+	logutil.Infof("ERIC Write callback... %s", string(output))
+	return ep.LineBuffer.Write(output)
 }
 
 var EndOfLine = func(ep *ExportConfig) (int, error) {
-	if ep.UseFileService {
-		n, err := ep.AsyncWriter.Write(ep.LineBuffer.Bytes())
-		if err != nil {
-			err2 := ep.AsyncWriter.CloseWithError(err)
-			if err2 != nil {
-				return 0, err2
-			}
+	logutil.Infof("ERIC ENDOFLINE")
+	n, err := ep.AsyncWriter.Write(ep.LineBuffer.Bytes())
+	if err != nil {
+		err2 := ep.AsyncWriter.CloseWithError(err)
+		if err2 != nil {
+			return 0, err2
 		}
-		ep.LineBuffer.Reset()
-		return n, err
 	}
-	return 0, nil
+	ep.LineBuffer.Reset()
+	return n, err
 }
 
 func writeToCSVFile(ep *ExportConfig, output []byte) error {
+	logutil.Infof("ERIC writeToCSVFile ....%s", string(output))
 	if ep.userConfig.MaxFileSize != 0 && ep.CurFileSize+uint64(len(output)) > ep.userConfig.MaxFileSize {
 		if err := Flush(ep); err != nil {
 			return err
 		}
-		if ep.LineSize != 0 && ep.OutTofile {
-			if _, err := Seek(ep); err != nil {
-				return err
-			}
-			for {
-				if n, err := Read(ep); err != nil {
+		/*
+			if ep.LineSize != 0 && ep.OutFromResultSet {
+				if _, err := Seek(ep); err != nil {
 					return err
-				} else if uint64(n) == ep.LineSize {
-					break
+				}
+				for {
+					if n, err := Read(ep); err != nil {
+						return err
+					} else if uint64(n) == ep.LineSize {
+						break
+					}
+				}
+				if err := Truncate(ep); err != nil {
+					return err
 				}
 			}
-			if err := Truncate(ep); err != nil {
-				return err
-			}
-		}
+		*/
 		if err := Close(ep); err != nil {
 			return err
 		}
@@ -361,7 +349,10 @@ func writeToCSVFile(ep *ExportConfig, output []byte) error {
 }
 
 var writeDataToCSVFile = func(ep *ExportConfig, output []byte) error {
+
+	logutil.Infof("ERIC writeDataToCSVFile callback....%s", string(output))
 	for {
+		// ERIC BUG HERE
 		if n, err := Write(ep, output); err != nil {
 			return err
 		} else if n == len(output) {
@@ -405,6 +396,7 @@ func constructByte(ctx context.Context, obj FeSession, bat *batch.Batch, index i
 	terminated := ep.userConfig.Fields.Terminated.Value
 	flag := ep.ColumnFlag
 	writeByte := make([]byte, 0)
+	logutil.Infof("ERIC WriteBatch go constructByte START NROW = %d.....", bat.RowCount())
 	for i := 0; i < bat.RowCount(); i++ {
 		for j, vec := range bat.Vecs {
 			if vec.GetNulls().Contains(uint64(i)) {
@@ -557,11 +549,10 @@ func addEscapeToString(s []byte) []byte {
 	return ret
 }
 
-func exportDataToCSVFile(oq *ExportConfig) error {
-	if !oq.OutTofile {
-		return exportDataToCSVFile2(oq)
-	}
+func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 	oq.LineSize = 0
+
+	logutil.Infof("ERIC exportDataToCSVFILE: MySQLRestul to CSV file...")
 
 	symbol := oq.Symbol
 	closeby := oq.userConfig.Fields.EnclosedBy.Value
@@ -742,12 +733,14 @@ func exportDataToCSVFile(oq *ExportConfig) error {
 	return err
 }
 
-func exportDataToCSVFile2(ep *ExportConfig) error {
+func exportDataFromBatchToCSVFile(ep *ExportConfig) error {
 	var tmp *BatchByte
 	select {
 	case tmp = <-ep.ByteChan:
 	default:
 	}
+
+	logutil.Infof("ERIC exportDataToCSVFile 22222222222222")
 	if tmp != nil {
 		if tmp.err != nil {
 			return tmp.err
@@ -769,8 +762,9 @@ func exportDataToCSVFile2(ep *ExportConfig) error {
 	return err
 }
 
-func exportAllData(ep *ExportConfig) error {
+func exportAllDataFromBatches(ep *ExportConfig) error {
 	var tmp *BatchByte
+	logutil.Infof("ERIC ExportAllData:")
 	for {
 		tmp = nil
 		if ep.WriteIndex == ep.Index {
@@ -791,6 +785,7 @@ func exportAllData(ep *ExportConfig) error {
 		if !ok {
 			continue
 		}
+		logutil.Infof("ERIC ExportAllData value: %s", string(value))
 		if err := writeToCSVFile(ep, value); err != nil {
 			return err
 		}
@@ -818,13 +813,17 @@ func (ec *ExportConfig) resetLineStr() {
 }
 
 func (ec *ExportConfig) Write(execCtx *ExecCtx, bat *batch.Batch) error {
+	logutil.Infof("ERIC WriteBatch .....")
 	ec.Index.Add(1)
 	copied, err := bat.Dup(execCtx.ses.GetMemPool())
 	if err != nil {
 		return err
 	}
+	logutil.Infof("ERIC WriteBatch go constructByte.....")
 	go constructByte(execCtx.reqCtx, execCtx.ses, copied, ec.Index.Load(), ec.ByteChan, ec)
-	if err = exportDataToCSVFile(ec); err != nil {
+
+	logutil.Infof("ERIC WriteBatch exportDataToCSVFile.....")
+	if err = exportDataFromBatchToCSVFile(ec); err != nil {
 		execCtx.ses.Error(execCtx.reqCtx,
 			"Error occurred while exporting to CSV file",
 			zap.Error(err))
