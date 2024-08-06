@@ -56,7 +56,6 @@ type ExportConfig struct {
 	//file service & buffer for the line
 	writeParam
 	FileService fileservice.FileService
-	LineBuffer  *bytes.Buffer
 	Ctx         context.Context
 	AsyncReader *io.PipeReader
 	AsyncWriter *io.PipeWriter
@@ -131,12 +130,6 @@ var openNewFile = func(ctx context.Context, ep *ExportConfig, mrs *MysqlResultSe
 	var filePath string
 	ep.CurFileSize = 0
 
-	//default 1MB
-	if ep.LineBuffer == nil {
-		ep.LineBuffer = &bytes.Buffer{}
-	} else {
-		ep.LineBuffer.Reset()
-	}
 	ep.AsyncReader, ep.AsyncWriter = io.Pipe()
 	if len(ep.userConfig.StageFilePath) != 0 {
 		filePath = getExportFilePath(ep.userConfig.StageFilePath, ep.FileCnt)
@@ -144,10 +137,25 @@ var openNewFile = func(ctx context.Context, ep *ExportConfig, mrs *MysqlResultSe
 		filePath = getExportFilePath(ep.userConfig.FilePath, ep.FileCnt)
 	}
 
-	var readPath string
-	ep.FileService, readPath, err = fileservice.GetForETL(ctx, nil, filePath)
+	// fileservice is determined from filepath
+	// if filepath is SHARED:/path, return getGlobalPu().FileService, filepath
+	// otherwise, return fileservice.GetForETL(ctx, nil, filepath)
+	fspath, err := fileservice.ParsePath(filePath)
 	if err != nil {
 		return err
+	}
+
+	var readPath string
+	if fspath.Service == defines.SharedFileServiceName {
+		ep.FileService = getGlobalPu().FileService
+		readPath = filePath
+
+	} else {
+		ep.FileService, readPath, err = fileservice.GetForETL(ctx, nil, filePath)
+		if err != nil {
+			return err
+		}
+
 	}
 
 	asyncWriteFunc := func() error {
@@ -478,8 +486,7 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 	closeby := oq.userConfig.Fields.EnclosedBy.Value
 	flag := oq.ColumnFlag
 
-	buffer := oq.LineBuffer
-	buffer.Reset()
+	buffer := &bytes.Buffer{}
 
 	for i := uint64(0); i < oq.mrs.GetColumnCount(); i++ {
 

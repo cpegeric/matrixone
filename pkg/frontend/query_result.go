@@ -593,7 +593,6 @@ func doDumpQueryResult(ctx context.Context, ses *Session, eParam *tree.ExportPar
 	exportParam.FileService = getGlobalPu().FileService
 	exportParam.Ctx = ctx
 	defer func() {
-		exportParam.LineBuffer = nil
 		if exportParam.AsyncReader != nil {
 			_ = exportParam.AsyncReader.Close()
 		}
