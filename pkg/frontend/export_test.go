@@ -74,8 +74,7 @@ func Test_openNewFile(t *testing.T) {
 				Header:   true,
 				FilePath: "test/export.csv",
 			},
-			LineSize: 1,
-			mrs:      &MysqlResultSet{},
+			mrs: &MysqlResultSet{},
 		}
 
 		col1 := new(MysqlColumn)
@@ -107,8 +106,7 @@ func Test_formatOutputString(t *testing.T) {
 				Header:   true,
 				FilePath: "test/export.csv",
 			},
-			LineSize: 1,
-			mrs:      &MysqlResultSet{},
+			mrs: &MysqlResultSet{},
 		}
 		buffer := &bytes.Buffer{}
 		convey.So(formatOutputString(ep, nil, nil, '\n', true, buffer), convey.ShouldBeNil)
@@ -130,8 +128,7 @@ func Test_writeToCSVFile(t *testing.T) {
 				Header:   true,
 				FilePath: "test/export.csv",
 			},
-			LineSize: 1,
-			mrs:      &MysqlResultSet{},
+			mrs: &MysqlResultSet{},
 		}
 
 		var output = []byte{'1', '2'}
@@ -177,8 +174,7 @@ func Test_writeDataToCSVFile(t *testing.T) {
 				Header:   true,
 				FilePath: "test/export.csv",
 			},
-			LineSize: 1,
-			mrs:      &MysqlResultSet{},
+			mrs: &MysqlResultSet{},
 		}
 
 		var output = []byte{'1', '2'}
@@ -209,8 +205,7 @@ func Test_exportDataToCSVFile(t *testing.T) {
 				Header:   true,
 				FilePath: "test/export.csv",
 			},
-			LineSize: 1,
-			mrs:      &MysqlResultSet{},
+			mrs: &MysqlResultSet{},
 		}
 
 		var col = make([]MysqlColumn, 13)
@@ -266,8 +261,7 @@ func Test_exportDataToCSVFile(t *testing.T) {
 				Header:   true,
 				FilePath: "test/export.csv",
 			},
-			LineSize: 1,
-			mrs:      &MysqlResultSet{},
+			mrs: &MysqlResultSet{},
 		}
 
 		var col = make([]MysqlColumn, 1)

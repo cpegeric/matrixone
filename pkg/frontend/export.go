@@ -51,7 +51,6 @@ type ExportConfig struct {
 	Symbol      [][]byte
 	// default flush size
 	DefaultBufSize int64
-	LineSize       uint64
 
 	//file service & buffer for the line
 	writeParam
@@ -199,7 +198,6 @@ var openNewFile = func(ctx context.Context, ep *ExportConfig, mrs *MysqlResultSe
 		}
 	}
 
-	ep.LineSize = 0
 	ep.Rows = 0
 	return nil
 }
@@ -290,7 +288,6 @@ var writeDataToCSVFile = func(ep *ExportConfig, output []byte) error {
 			break
 		}
 	}
-	ep.LineSize += uint64(len(output))
 	ep.CurFileSize += uint64(len(output))
 	return nil
 }
@@ -480,8 +477,6 @@ func addEscapeToString(s []byte) []byte {
 }
 
 func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
-	oq.LineSize = 0
-
 	symbol := oq.Symbol
 	closeby := oq.userConfig.Fields.EnclosedBy.Value
 	flag := oq.ColumnFlag
