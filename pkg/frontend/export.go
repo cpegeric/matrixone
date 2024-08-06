@@ -19,7 +19,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -52,7 +51,6 @@ type ExportConfig struct {
 	Symbol      [][]byte
 	// default flush size
 	DefaultBufSize int64
-	OutputStr      []byte
 	LineSize       uint64
 
 	//file service & buffer for the line
@@ -64,7 +62,6 @@ type ExportConfig struct {
 	AsyncWriter *io.PipeWriter
 	AsyncGroup  *errgroup.Group
 	mrs         *MysqlResultSet
-	lineStr     []byte
 	ctx         context.Context
 }
 
@@ -82,7 +79,6 @@ type BatchByte struct {
 	err       error
 }
 
-var OpenFile = os.OpenFile
 var escape byte = '"'
 
 type CloseExportData struct {
@@ -133,7 +129,6 @@ func initExportFileParam(ep *ExportConfig, mrs *MysqlResultSet) {
 var openNewFile = func(ctx context.Context, ep *ExportConfig, mrs *MysqlResultSet) error {
 	var err error
 	var filePath string
-	lineSize := ep.LineSize
 	ep.CurFileSize = 0
 
 	//default 1MB
@@ -194,17 +189,10 @@ var openNewFile = func(ctx context.Context, ep *ExportConfig, mrs *MysqlResultSe
 		if err := writeDataToCSVFile(ep, []byte(header)); err != nil {
 			return err
 		}
-		if _, err := EndOfLine(ep); err != nil {
-			return err
-		}
 	}
-	if lineSize != 0 {
-		ep.LineSize = 0
-		ep.Rows = 0
-		if err := writeDataToCSVFile(ep, ep.OutputStr); err != nil {
-			return err
-		}
-	}
+
+	ep.LineSize = 0
+	ep.Rows = 0
 	return nil
 }
 
@@ -216,59 +204,26 @@ func getExportFilePath(filename string, fileCnt uint) string {
 	}
 }
 
-var formatOutputString = func(oq *ExportConfig, tmp, symbol []byte, enclosed byte, flag bool) error {
+var formatOutputString = func(oq *ExportConfig, tmp, symbol []byte, enclosed byte, flag bool, buffer *bytes.Buffer) error {
 	var err error
 	if flag && enclosed != 0 {
-		if err = writeToCSVFile(oq, []byte{enclosed}); err != nil {
+		if _, err = buffer.Write([]byte{enclosed}); err != nil {
 			return err
 		}
 	}
-	if err = writeToCSVFile(oq, tmp); err != nil {
+	if _, err = buffer.Write(tmp); err != nil {
 		return err
 	}
 	if flag && enclosed != 0 {
-		if err = writeToCSVFile(oq, []byte{enclosed}); err != nil {
+		if _, err = buffer.Write([]byte{enclosed}); err != nil {
 			return err
 		}
 	}
-	if err = writeToCSVFile(oq, symbol); err != nil {
+	if _, err = buffer.Write(symbol); err != nil {
 		return err
 	}
 	return nil
 }
-
-var Flush = func(ep *ExportConfig) error {
-	return nil
-}
-
-/*
-var Seek = func(ep *ExportConfig) (int64, error) {
-	if !ep.UseFileService {
-		return ep.File.Seek(int64(ep.CurFileSize-ep.LineSize), io.SeekStart)
-	}
-	return 0, nil
-}
-
-var Read = func(ep *ExportConfig) (int, error) {
-	if !ep.UseFileService {
-		ep.OutputStr = make([]byte, ep.LineSize)
-		return ep.File.Read(ep.OutputStr)
-	} else {
-		ep.OutputStr = make([]byte, ep.LineSize)
-		copy(ep.OutputStr, ep.LineBuffer.Bytes())
-		ep.LineBuffer.Reset()
-		return int(ep.LineSize), nil
-	}
-}
-
-var Truncate = func(ep *ExportConfig) error {
-	if !ep.UseFileService {
-		return ep.File.Truncate(int64(ep.CurFileSize - ep.LineSize))
-	} else {
-		return nil
-	}
-}
-*/
 
 var Close = func(ep *ExportConfig) error {
 	ep.FileCnt++
@@ -291,43 +246,19 @@ var Close = func(ep *ExportConfig) error {
 }
 
 var Write = func(ep *ExportConfig, output []byte) (int, error) {
-	return ep.LineBuffer.Write(output)
-}
-
-var EndOfLine = func(ep *ExportConfig) (int, error) {
-	n, err := ep.AsyncWriter.Write(ep.LineBuffer.Bytes())
+	n, err := ep.AsyncWriter.Write(output)
 	if err != nil {
 		err2 := ep.AsyncWriter.CloseWithError(err)
 		if err2 != nil {
 			return 0, err2
 		}
 	}
-	ep.LineBuffer.Reset()
 	return n, err
 }
 
+// wrtieToCSVFile function may create a new file. Make sure the output buffer contains the complete CSV row to keep the CSV parser happy.
 func writeToCSVFile(ep *ExportConfig, output []byte) error {
 	if ep.userConfig.MaxFileSize != 0 && ep.CurFileSize+uint64(len(output)) > ep.userConfig.MaxFileSize {
-		if err := Flush(ep); err != nil {
-			return err
-		}
-		/*
-			if ep.LineSize != 0 && ep.OutFromResultSet {
-				if _, err := Seek(ep); err != nil {
-					return err
-				}
-				for {
-					if n, err := Read(ep); err != nil {
-						return err
-					} else if uint64(n) == ep.LineSize {
-						break
-					}
-				}
-				if err := Truncate(ep); err != nil {
-					return err
-				}
-			}
-		*/
 		if err := Close(ep); err != nil {
 			return err
 		}
@@ -345,7 +276,6 @@ func writeToCSVFile(ep *ExportConfig, output []byte) error {
 var writeDataToCSVFile = func(ep *ExportConfig, output []byte) error {
 
 	for {
-		// ERIC BUG HERE
 		if n, err := Write(ep, output); err != nil {
 			return err
 		} else if n == len(output) {
@@ -547,7 +477,12 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 	symbol := oq.Symbol
 	closeby := oq.userConfig.Fields.EnclosedBy.Value
 	flag := oq.ColumnFlag
+
+	buffer := oq.LineBuffer
+	buffer.Reset()
+
 	for i := uint64(0); i < oq.mrs.GetColumnCount(); i++ {
+
 		column, err := oq.mrs.GetColumn(oq.ctx, i)
 		if err != nil {
 			return err
@@ -560,7 +495,7 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 			return err
 		} else if isNil {
 			//NULL is output as \N
-			if err = formatOutputString(oq, []byte{'\\', 'N'}, symbol[i], closeby, false); err != nil {
+			if err = formatOutputString(oq, []byte{'\\', 'N'}, symbol[i], closeby, false, buffer); err != nil {
 				return err
 			}
 			continue
@@ -572,7 +507,7 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 			if err != nil {
 				return err
 			}
-			if err = formatOutputString(oq, []byte(value), symbol[i], closeby, flag[i]); err != nil {
+			if err = formatOutputString(oq, []byte(value), symbol[i], closeby, flag[i], buffer); err != nil {
 				return err
 			}
 		case defines.MYSQL_TYPE_BOOL:
@@ -580,7 +515,7 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 			if err != nil {
 				return err
 			}
-			if err = formatOutputString(oq, []byte(value), symbol[i], closeby, flag[i]); err != nil {
+			if err = formatOutputString(oq, []byte(value), symbol[i], closeby, flag[i], buffer); err != nil {
 				return err
 			}
 		case defines.MYSQL_TYPE_BIT:
@@ -588,7 +523,7 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 			if err != nil {
 				return err
 			}
-			if err = formatOutputString(oq, []byte(value), symbol[i], closeby, flag[i]); err != nil {
+			if err = formatOutputString(oq, []byte(value), symbol[i], closeby, flag[i], buffer); err != nil {
 				return err
 			}
 		case defines.MYSQL_TYPE_TINY, defines.MYSQL_TYPE_SHORT, defines.MYSQL_TYPE_INT24, defines.MYSQL_TYPE_LONG, defines.MYSQL_TYPE_YEAR:
@@ -598,20 +533,20 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 			}
 			if mysqlColumn.ColumnType() == defines.MYSQL_TYPE_YEAR {
 				if value == 0 {
-					if err = formatOutputString(oq, []byte("0000"), symbol[i], closeby, flag[i]); err != nil {
+					if err = formatOutputString(oq, []byte("0000"), symbol[i], closeby, flag[i], buffer); err != nil {
 						return err
 					}
 				} else {
-					oq.resetLineStr()
-					oq.lineStr = strconv.AppendInt(oq.lineStr, value, 10)
-					if err = formatOutputString(oq, oq.lineStr, symbol[i], closeby, flag[i]); err != nil {
+					var lineStr []byte
+					lineStr = strconv.AppendInt(lineStr, value, 10)
+					if err = formatOutputString(oq, lineStr, symbol[i], closeby, flag[i], buffer); err != nil {
 						return err
 					}
 				}
 			} else {
-				oq.resetLineStr()
-				oq.lineStr = strconv.AppendInt(oq.lineStr, value, 10)
-				if err = formatOutputString(oq, oq.lineStr, symbol[i], closeby, flag[i]); err != nil {
+				var lineStr []byte
+				lineStr = strconv.AppendInt(lineStr, value, 10)
+				if err = formatOutputString(oq, lineStr, symbol[i], closeby, flag[i], buffer); err != nil {
 					return err
 				}
 			}
@@ -620,8 +555,8 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 			if err != nil {
 				return err
 			}
-			oq.lineStr = []byte(fmt.Sprintf("%v", value))
-			if err = formatOutputString(oq, oq.lineStr, symbol[i], closeby, flag[i]); err != nil {
+			lineStr := []byte(fmt.Sprintf("%v", value))
+			if err = formatOutputString(oq, lineStr, symbol[i], closeby, flag[i], buffer); err != nil {
 				return err
 			}
 		case defines.MYSQL_TYPE_LONGLONG:
@@ -629,9 +564,9 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 				if value, err := oq.mrs.GetUint64(oq.ctx, 0, i); err != nil {
 					return err
 				} else {
-					oq.resetLineStr()
-					oq.lineStr = strconv.AppendUint(oq.lineStr, value, 10)
-					if err = formatOutputString(oq, oq.lineStr, symbol[i], closeby, flag[i]); err != nil {
+					var lineStr []byte
+					lineStr = strconv.AppendUint(lineStr, value, 10)
+					if err = formatOutputString(oq, lineStr, symbol[i], closeby, flag[i], buffer); err != nil {
 						return err
 					}
 				}
@@ -639,9 +574,9 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 				if value, err := oq.mrs.GetInt64(oq.ctx, 0, i); err != nil {
 					return err
 				} else {
-					oq.resetLineStr()
-					oq.lineStr = strconv.AppendInt(oq.lineStr, value, 10)
-					if err = formatOutputString(oq, oq.lineStr, symbol[i], closeby, flag[i]); err != nil {
+					var lineStr []byte
+					lineStr = strconv.AppendInt(lineStr, value, 10)
+					if err = formatOutputString(oq, lineStr, symbol[i], closeby, flag[i], buffer); err != nil {
 						return err
 					}
 				}
@@ -654,7 +589,7 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 				return err
 			}
 			value = addEscapeToString(value.([]byte))
-			if err = formatOutputString(oq, value.([]byte), symbol[i], closeby, true); err != nil {
+			if err = formatOutputString(oq, value.([]byte), symbol[i], closeby, true, buffer); err != nil {
 				return err
 			}
 		case defines.MYSQL_TYPE_DATE:
@@ -662,7 +597,7 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 			if err != nil {
 				return err
 			}
-			if err = formatOutputString(oq, []byte(value.(types.Date).String()), symbol[i], closeby, flag[i]); err != nil {
+			if err = formatOutputString(oq, []byte(value.(types.Date).String()), symbol[i], closeby, flag[i], buffer); err != nil {
 				return err
 			}
 		case defines.MYSQL_TYPE_TIME:
@@ -670,7 +605,7 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 			if err != nil {
 				return err
 			}
-			if err = formatOutputString(oq, []byte(value.(types.Time).String()), symbol[i], closeby, flag[i]); err != nil {
+			if err = formatOutputString(oq, []byte(value.(types.Time).String()), symbol[i], closeby, flag[i], buffer); err != nil {
 				return err
 			}
 		case defines.MYSQL_TYPE_DATETIME:
@@ -678,7 +613,7 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 			if err != nil {
 				return err
 			}
-			if err = formatOutputString(oq, []byte(value.(string)), symbol[i], closeby, flag[i]); err != nil {
+			if err = formatOutputString(oq, []byte(value.(string)), symbol[i], closeby, flag[i], buffer); err != nil {
 				return err
 			}
 		case defines.MYSQL_TYPE_TIMESTAMP:
@@ -686,7 +621,7 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 			if err != nil {
 				return err
 			}
-			if err = formatOutputString(oq, []byte(value), symbol[i], closeby, flag[i]); err != nil {
+			if err = formatOutputString(oq, []byte(value), symbol[i], closeby, flag[i], buffer); err != nil {
 				return err
 			}
 		case defines.MYSQL_TYPE_JSON:
@@ -695,7 +630,7 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 				return err
 			}
 			jsonStr := value.(bytejson.ByteJson).String()
-			if err = formatOutputString(oq, []byte(jsonStr), symbol[i], closeby, flag[i]); err != nil {
+			if err = formatOutputString(oq, []byte(jsonStr), symbol[i], closeby, flag[i], buffer); err != nil {
 				return err
 			}
 		case defines.MYSQL_TYPE_UUID:
@@ -703,7 +638,7 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 			if err != nil {
 				return err
 			}
-			if err = formatOutputString(oq, []byte(value), symbol[i], closeby, flag[i]); err != nil {
+			if err = formatOutputString(oq, []byte(value), symbol[i], closeby, flag[i], buffer); err != nil {
 				return err
 			}
 		case defines.MYSQL_TYPE_ENUM:
@@ -711,15 +646,20 @@ func exportDataFromResultSetToCSVFile(oq *ExportConfig) error {
 			if err != nil {
 				return err
 			}
-			if err = formatOutputString(oq, []byte(value), symbol[i], closeby, flag[i]); err != nil {
+			if err = formatOutputString(oq, []byte(value), symbol[i], closeby, flag[i], buffer); err != nil {
 				return err
 			}
 		default:
 			return moerr.NewInternalError(oq.ctx, "unsupported column type %d ", mysqlColumn.ColumnType())
 		}
 	}
+
+	// write the complete CSV row to CSV Writer
+	err := writeToCSVFile(oq, buffer.Bytes())
+	if err != nil {
+		return err
+	}
 	oq.Rows++
-	_, err := EndOfLine(oq)
 	return err
 }
 
@@ -742,12 +682,12 @@ func exportDataFromBatchToCSVFile(ep *ExportConfig) error {
 		return nil
 	}
 
-	if err := writeToCSVFile(ep, value); err != nil {
+	err := writeToCSVFile(ep, value)
+	if err != nil {
 		return err
 	}
 	ep.WriteIndex.Add(1)
 	ep.BatchMap[ep.WriteIndex.Load()] = nil
-	_, err := EndOfLine(ep)
 	return err
 }
 
@@ -778,10 +718,6 @@ func exportAllDataFromBatches(ep *ExportConfig) error {
 		}
 		ep.WriteIndex.Add(1)
 		ep.BatchMap[ep.WriteIndex.Load()] = nil
-		_, err := EndOfLine(ep)
-		if err != nil {
-			return err
-		}
 
 	}
 	ep.First = false
@@ -798,10 +734,6 @@ func (ec *ExportConfig) init() {
 	ec.BatchMap = make(map[int32][]byte)
 	ec.Index.Store(0)
 	ec.WriteIndex.Store(0)
-}
-
-func (ec *ExportConfig) resetLineStr() {
-	ec.lineStr = ec.lineStr[:0]
 }
 
 func (ec *ExportConfig) Write(execCtx *ExecCtx, bat *batch.Batch) error {
@@ -824,7 +756,6 @@ func (ec *ExportConfig) Write(execCtx *ExecCtx, bat *batch.Batch) error {
 func (ec *ExportConfig) Close() {
 	if ec != nil {
 		ec.mrs = nil
-		ec.lineStr = nil
 		ec.ctx = nil
 	}
 }

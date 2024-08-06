@@ -76,9 +76,7 @@ func executeStatusStmt(ses *Session, execCtx *ExecCtx) (err error) {
 			if err = exportAllDataFromBatches(ep); err != nil {
 				return
 			}
-			if err = Flush(ep); err != nil {
-				return
-			}
+
 			if err = Close(ep); err != nil {
 				return
 			}

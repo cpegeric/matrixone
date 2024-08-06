@@ -594,7 +594,6 @@ func doDumpQueryResult(ctx context.Context, ses *Session, eParam *tree.ExportPar
 	exportParam.Ctx = ctx
 	defer func() {
 		exportParam.LineBuffer = nil
-		exportParam.OutputStr = nil
 		if exportParam.AsyncReader != nil {
 			_ = exportParam.AsyncReader.Close()
 		}
