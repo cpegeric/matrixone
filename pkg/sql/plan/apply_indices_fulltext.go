@@ -198,7 +198,8 @@ func (builder *QueryBuilder) applyJoinFullTextIndices(nodeID int32, projNode *pl
 			},
 		}
 
-		curr_ftnode_id, err := builder.buildTable(tmpTableFunc, ctx, -1, nil)
+		curr_ftnode_id, err := builder.buildTable(tmpTableFunc, ctx, scanNode.NodeId, ctx)
+		//curr_ftnode_id, err := builder.buildTable(tmpTableFunc, ctx, -1, nil)
 		if err != nil {
 			panic(err.Error())
 		}

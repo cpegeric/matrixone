@@ -17,6 +17,7 @@ package plan
 import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 )
@@ -53,6 +54,14 @@ func (builder *QueryBuilder) buildFullTextIndexScan(tbl *tree.TableFunction, ctx
 	}
 
 	colDefs := _getColDefs(ftIndexColdefs)
+
+	if childId != -1 {
+		scanNode := builder.qry.Nodes[childId]
+		pkPos := scanNode.TableDef.Name2ColIndex[scanNode.TableDef.Pkey.PkeyColName]
+		pkType := scanNode.TableDef.Cols[pkPos].Typ
+		logutil.Infof("BuildFullTextIndexScan pkType %v", pkType)
+		colDefs[0].Typ = pkType
+	}
 
 	/*
 		val, err := builder.compCtx.ResolveVariable("save_query_result", true, false)
