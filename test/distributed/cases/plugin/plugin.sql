@@ -10,6 +10,13 @@ select * from moplugin_table('stage://llmstage/cat.wasm', 'cat', null, '[1a,2,3]
 select * from moplugin_table('stage://llmstage/cat.wasm', 'cat',
         cast('["header", "footer"]' as JSON), '1,2,3') as f;
 
+create table errplugin(url varchar, func varchar, cfg varchar, data varchar);
+insert into errplugin values ('stage://llmstage/cat.wasm', 'cat', '{"header":"["}', '[1,2,3]');
+select * from errplugin as src cross apply moplugin_table(src.url, src.func, src.cfg, src.data) as f;
+select * from errplugin as src cross apply moplugin_table('stage://llmstage/cat.wasm', src.func, src.cfg, src.data) as f;
+
+drop table errplugin;
+
 -- start test
 -- index of multistream.json (offset, size) = [(0, 155), (155, 164)]
 

@@ -131,107 +131,73 @@ func (u *pluginState) start(tf *TableFunction, proc *process.Process, nthRow int
 
 	// plugin exec: number of args is always 4. (wasm_url string, func_name string, config map in JSON, datalink)
 
-	// wasm
-	wasmVec := tf.ctr.argVecs[0]
-	switch wasmVec.GetType().Oid {
-	case types.T_varchar, types.T_datalink, types.T_char, types.T_text:
-	default:
-		return moerr.NewInternalError(proc.Ctx, "wasm URL only support varchar, char, text and datalink type")
-	}
-
-	if !wasmVec.IsConst() {
-		return moerr.NewInternalError(proc.Ctx, "wasm URL must be a constant")
-	}
-
-	if wasmVec.IsNull(uint64(nthRow)) {
-		u.batch.SetRowCount(0)
-		return nil
-	}
-	wasmurl := wasmVec.GetStringAt(nthRow)
-
-	// func name
-	funcVec := tf.ctr.argVecs[1]
-	if funcVec.IsNull(uint64(nthRow)) {
-		u.batch.SetRowCount(0)
-		return nil
-	}
-	funcname := funcVec.GetStringAt(nthRow)
-
-	// config
-	var cfgbytes []byte
-	cfgVec := tf.ctr.argVecs[2]
-
-	if !cfgVec.IsConst() {
-		return moerr.NewInternalError(proc.Ctx, "config must be a constant string")
-	}
-
-	if !cfgVec.IsNull(uint64(nthRow)) {
-		switch cfgVec.GetType().Oid {
-		case types.T_json:
-
-			cfg := cfgVec.GetBytesAt(nthRow)
-			cfgjs := bytejson.ByteJson{}
-			cfgjs.Unmarshal(cfg)
-
-			if cfgjs.Type != bytejson.TpCodeObject {
-				return moerr.NewInternalError(proc.Ctx, "config must be a JSON object")
-			}
-
-			cfgbytes, _ = cfgjs.MarshalJSON()
-		case types.T_varchar, types.T_text, types.T_char:
-			cfgbytes = cfgVec.GetBytesAt(nthRow)
-		default:
-			return moerr.NewInternalError(proc.Ctx, "config must be a JSON Object or string")
-		}
-	}
-
-	cfgmap := make(map[string]string)
-
-	if cfgbytes != nil {
-		//logutil.Infof("COMMAND %s", string(cmdbytes))
-		jsonparser.ObjectEach(cfgbytes, func(key []byte, value []byte, dataType jsonparser.ValueType, offset int) error {
-
-			if dataType != jsonparser.String {
-				return moerr.NewInternalError(proc.Ctx, "config value is not string")
-			}
-
-			cfgmap[string(key)] = string(value)
-			return nil
-		})
-	}
-	//logutil.Infof("ARGS %v", args)
-
-	// datalink
-	dlVec := tf.ctr.argVecs[3]
-	if dlVec.IsNull(uint64(nthRow)) {
-		u.batch.SetRowCount(0)
-		return nil
-	}
-	src := dlVec.GetStringAt(nthRow)
-
-	var bytes []byte
-	switch dlVec.GetType().Oid {
-	case types.T_datalink:
-		dl, err := datalink.NewDatalink(src, proc)
-		if err != nil {
-			return err
-		}
-		bytes, err = dl.GetPlainText(proc)
-		if err != nil {
-			return err
-		}
-	case types.T_varchar, types.T_text, types.T_char:
-		bytes = []byte(src)
-	default:
-		return moerr.NewInternalError(proc.Ctx, "plugin_exec input type not supported")
-	}
-
-	wurl, err := url.Parse(wasmurl)
-	if err != nil {
-		return err
-	}
-
 	if u.plugin == nil {
+		// wasm
+		wasmVec := tf.ctr.argVecs[0]
+		switch wasmVec.GetType().Oid {
+		case types.T_varchar, types.T_datalink, types.T_char, types.T_text:
+		default:
+			return moerr.NewInternalError(proc.Ctx, "wasm URL only support varchar, char, text and datalink type")
+		}
+
+		if !wasmVec.IsConst() {
+			return moerr.NewInternalError(proc.Ctx, "wasm URL must be a constant")
+		}
+
+		if wasmVec.IsNull(uint64(nthRow)) {
+			u.batch.SetRowCount(0)
+			return nil
+		}
+		wasmurl := wasmVec.GetStringAt(nthRow)
+
+		// config
+		var cfgbytes []byte
+		cfgVec := tf.ctr.argVecs[2]
+
+		if !cfgVec.IsConst() {
+			return moerr.NewInternalError(proc.Ctx, "config must be a constant string")
+		}
+
+		if !cfgVec.IsNull(uint64(nthRow)) {
+			switch cfgVec.GetType().Oid {
+			case types.T_json:
+
+				cfg := cfgVec.GetBytesAt(nthRow)
+				cfgjs := bytejson.ByteJson{}
+				cfgjs.Unmarshal(cfg)
+
+				if cfgjs.Type != bytejson.TpCodeObject {
+					return moerr.NewInternalError(proc.Ctx, "config must be a JSON object")
+				}
+
+				cfgbytes, _ = cfgjs.MarshalJSON()
+			case types.T_varchar, types.T_text, types.T_char:
+				cfgbytes = cfgVec.GetBytesAt(nthRow)
+			default:
+				return moerr.NewInternalError(proc.Ctx, "config must be a JSON Object or string")
+			}
+		}
+
+		cfgmap := make(map[string]string)
+
+		if cfgbytes != nil {
+			//logutil.Infof("COMMAND %s", string(cmdbytes))
+			jsonparser.ObjectEach(cfgbytes, func(key []byte, value []byte, dataType jsonparser.ValueType, offset int) error {
+
+				if dataType != jsonparser.String {
+					return moerr.NewInternalError(proc.Ctx, "config value is not string")
+				}
+
+				cfgmap[string(key)] = string(value)
+				return nil
+			})
+		}
+
+		wurl, err := url.Parse(wasmurl)
+		if err != nil {
+			return err
+		}
+
 		var manifest extism.Manifest
 		if wurl.Scheme == "https" || wurl.Scheme == "http" {
 
@@ -274,6 +240,39 @@ func (u *pluginState) start(tf *TableFunction, proc *process.Process, nthRow int
 		if err != nil {
 			return err
 		}
+	}
+
+	// func name
+	funcVec := tf.ctr.argVecs[1]
+	if funcVec.IsNull(uint64(nthRow)) {
+		u.batch.SetRowCount(0)
+		return nil
+	}
+	funcname := funcVec.GetStringAt(nthRow)
+
+	// datalink
+	dlVec := tf.ctr.argVecs[3]
+	if dlVec.IsNull(uint64(nthRow)) {
+		u.batch.SetRowCount(0)
+		return nil
+	}
+	src := dlVec.GetStringAt(nthRow)
+
+	var bytes []byte
+	switch dlVec.GetType().Oid {
+	case types.T_datalink:
+		dl, err := datalink.NewDatalink(src, proc)
+		if err != nil {
+			return err
+		}
+		bytes, err = dl.GetPlainText(proc)
+		if err != nil {
+			return err
+		}
+	case types.T_varchar, types.T_text, types.T_char:
+		bytes = []byte(src)
+	default:
+		return moerr.NewInternalError(proc.Ctx, "plugin_exec input type not supported")
 	}
 
 	exit, out, err := u.plugin.Call(funcname, bytes)
