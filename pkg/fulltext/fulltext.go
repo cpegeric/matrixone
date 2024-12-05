@@ -41,7 +41,7 @@ import (
 */
 
 func NewWordAccum() *WordAccum {
-	return &WordAccum{Words: make(map[any]*Word)}
+	return &WordAccum{Words: make(map[any]*Word, 512)}
 }
 
 func NewSearchAccum(srctbl string, tblname string, pattern string, mode int64, params string) (*SearchAccum, error) {
@@ -51,7 +51,7 @@ func NewSearchAccum(srctbl string, tblname string, pattern string, mode int64, p
 		return nil, err
 	}
 
-	return &SearchAccum{SrcTblName: srctbl, TblName: tblname, Mode: mode, Pattern: ps, Params: params, WordAccums: make(map[string]*WordAccum)}, nil
+	return &SearchAccum{SrcTblName: srctbl, TblName: tblname, Mode: mode, Pattern: ps, Params: params, WordAccums: make(map[string]*WordAccum, 8)}, nil
 }
 
 func findPatternByOperator(ps []*Pattern, op int) []*Pattern {

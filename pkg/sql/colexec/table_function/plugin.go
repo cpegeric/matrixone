@@ -102,9 +102,11 @@ func pluginPrepare(proc *process.Process, arg *TableFunction) (tvfState, error) 
 	}
 	arg.ctr.argVecs = make([]*vector.Vector, len(arg.Args))
 
-	for i := range arg.Attrs {
-		arg.Attrs[i] = strings.ToUpper(arg.Attrs[i])
-	}
+	/*
+		for i := range arg.Attrs {
+			arg.Attrs[i] = strings.ToUpper(arg.Attrs[i])
+		}
+	*/
 
 	val, err := proc.GetResolveVariableFunc()("moplugin_allowed_hosts", true, false)
 	if err != nil {
@@ -328,6 +330,8 @@ func (u *pluginState) start(tf *TableFunction, proc *process.Process, nthRow int
 	if jserr != nil {
 		return jserr
 	}
+
+	//logutil.Infof("OUTPUT %d ROWS", nitem)
 
 	u.batch.SetRowCount(nitem)
 	return nil
