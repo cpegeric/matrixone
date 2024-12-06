@@ -15,10 +15,13 @@
 package fulltext
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	"github.com/minio/highwayhash"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -863,4 +866,55 @@ func TestFullTextCombine(t *testing.T) {
 	assert.Equal(t, result[0], float32(2))
 	assert.Equal(t, result[2], float32(2))
 	assert.Equal(t, result[1], float32(4))
+}
+
+func TestCache(t *testing.T) {
+	key := []byte("_matrixone1matrixone2matrixone3_")
+	nbucket := 4
+	maxsize := 10
+
+	c := NewCache(nbucket, maxsize)
+
+	for i := 0; i < 10; i++ {
+
+		r := DocRow{Docid: int32(i), Pos: 2, Widx: 0}
+		hashv := highwayhash.Sum64(types.EncodeValue(r.Docid, types.T_int32), key)
+		c.Add(hashv, &r)
+		bid := hashv % uint64(nbucket)
+		fmt.Printf("H %d, bucket id %d\n", hashv, bid)
+	}
+
+	buckets := c.GetBuckets()
+
+	results := []int{2, 5, 1, 2}
+	for i, b := range buckets {
+		nitem := b.Len()
+		require.Equal(t, nitem, results[i])
+		fmt.Printf("bucket[%d] nitem = %d\n", i, nitem)
+	}
+
+	for {
+		r := c.GetNext()
+		if r == nil {
+			break
+		}
+		fmt.Printf("%v\n", r)
+	}
+
+	/*
+		for i, b := range buckets {
+			for j := 0; j < results[i]; j++ {
+				r := b.Pop()
+				fmt.Printf("bucket[%d] %v\n", i, r)
+			}
+		}
+	*/
+
+	/*
+		r := buckets[bid].Pop()
+		require.NotNil(t, r)
+
+		fmt.Printf("%v\n", r)
+	*/
+
 }

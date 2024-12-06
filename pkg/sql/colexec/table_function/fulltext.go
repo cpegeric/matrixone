@@ -24,11 +24,13 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/fulltext"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	"github.com/matrixorigin/matrixone/pkg/util/executor"
 	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
+	"github.com/minio/highwayhash"
 )
 
 const (
@@ -36,17 +38,21 @@ const (
 )
 
 type fulltextState struct {
-	inited      bool
-	errors      chan error
-	stream_chan chan executor.Result
-	score_array []map[any]float32
-	n_doc_id    int
-	last_doc_id any
-	n_result    uint64
-	sql_closed  bool
-	sacc        *fulltext.SearchAccum
-	limit       uint64
-	nrows       int
+	inited       bool
+	errors       chan error
+	stream_chan  chan executor.Result
+	score_array  []map[any]float32
+	n_doc_id     int
+	last_doc_id  any
+	n_result     uint64
+	sql_closed   bool
+	sacc         *fulltext.SearchAccum
+	limit        uint64
+	nrows        int
+	idx2word     map[int]string
+	cache        *fulltext.Cache
+	curr_bucket  int
+	cache_closed bool
 
 	// holding output batch
 	batch *batch.Batch
@@ -120,7 +126,6 @@ func (u *fulltextState) returnResult(proc *process.Process, scoremap map[any]flo
 
 func (u *fulltextState) call(tf *TableFunction, proc *process.Process) (vm.CallResult, error) {
 
-	var scoremap map[any]float32
 	u.batch.CleanOnlyData()
 
 	// number of result more than pushdown limit and exit
@@ -128,22 +133,15 @@ func (u *fulltextState) call(tf *TableFunction, proc *process.Process) (vm.CallR
 		return vm.CancelResult, nil
 	}
 
-	// return scoremap when array is not empty
-	if len(u.score_array) > 0 {
-		scoremap, u.score_array = u.score_array[0], u.score_array[1:]
-		return u.returnResult(proc, scoremap)
-	}
-
 	// array is empty, try to get batch from SQL executor
-	for !u.sql_closed {
-		sql_closed, err := getResults(u, proc, u.sacc)
+	for !u.cache_closed {
+		scoremap, cache_closed, err := getFromCache(u, proc, u.sacc)
 		if err != nil {
 			return vm.CancelResult, err
 		}
-		u.sql_closed = sql_closed
+		u.cache_closed = cache_closed
 
-		if len(u.score_array) > 0 {
-			scoremap, u.score_array = u.score_array[0], u.score_array[1:]
+		if scoremap != nil {
 			return u.returnResult(proc, scoremap)
 		}
 	}
@@ -159,6 +157,8 @@ func (u *fulltextState) start(tf *TableFunction, proc *process.Process, nthRow i
 		u.errors = make(chan error)
 		u.stream_chan = make(chan executor.Result, 8)
 		u.score_array = make([]map[any]float32, 0, 512)
+		u.idx2word = make(map[int]string)
+		u.cache = fulltext.NewCache(200, 2000000)
 		u.inited = true
 	}
 
@@ -255,16 +255,19 @@ func runWordStats(u *fulltextState, proc *process.Process, s *fulltext.SearchAcc
 	for _, p := range s.Pattern {
 		ssNoOp := p.GetLeafText(fulltext.TEXT)
 		for _, w := range ssNoOp {
-			keywords = append(keywords, "'"+w+"'")
+			keywords = append(keywords, w)
 		}
 	}
 
-	if len(keywords) > 0 {
-		union = append(union, fmt.Sprintf("SELECT doc_id, pos, word FROM %s WHERE word IN (%s)",
-			s.TblName, strings.Join(keywords, ",")))
+	npattern := 0
+	for _, kw := range keywords {
+		union = append(union, fmt.Sprintf("SELECT doc_id, pos, CAST(%d as int) FROM %s WHERE word = '%s'",
+			npattern, s.TblName, kw))
+		u.idx2word[npattern] = kw
+		npattern++
 	}
 
-	sqlfmt := "SELECT doc_id, pos, '%s' FROM %s WHERE prefix_eq(word, '%s')"
+	sqlfmt := "SELECT doc_id, pos, CAST(%d as int) FROM %s WHERE prefix_eq(word, '%s')"
 	for _, p := range s.Pattern {
 		ssStar := p.GetLeafText(fulltext.STAR)
 		for _, w := range ssStar {
@@ -275,18 +278,22 @@ func runWordStats(u *fulltextState, proc *process.Process, s *fulltext.SearchAcc
 			}
 			// prefix search
 			prefix := w[0 : slen-1]
-			union = append(union, fmt.Sprintf(sqlfmt, w, s.TblName, prefix))
+			union = append(union, fmt.Sprintf(sqlfmt, npattern, s.TblName, prefix))
+			u.idx2word[npattern] = w
+			npattern++
 		}
 	}
 
 	sql := strings.Join(union, " UNION ")
 
-	if len(union) == 1 {
-		sql += " ORDER BY doc_id"
-	} else {
-		sql = fmt.Sprintf("SELECT * FROM (%s) ORDER BY doc_id", sql)
-	}
-	//logutil.Infof("SQL is %s", sql)
+	/*
+		if len(union) == 1 {
+			sql += " ORDER BY doc_id"
+		} else {
+			sql = fmt.Sprintf("SELECT * FROM (%s) ORDER BY doc_id", sql)
+		}
+	*/
+	logutil.Infof("SQL is %s", sql)
 
 	res, err := ft_runSql_streaming(proc, sql, u.stream_chan)
 	if err != nil {
@@ -294,6 +301,73 @@ func runWordStats(u *fulltextState, proc *process.Process, s *fulltext.SearchAcc
 	}
 
 	return res, nil
+}
+
+func getFromCache(u *fulltextState, proc *process.Process, s *fulltext.SearchAccum) (scoremap map[any]float32, stream_closed bool, err error) {
+
+	buckets := u.cache.GetBuckets()
+
+	for buckets[u.curr_bucket].Len() > 0 {
+		r := buckets[u.curr_bucket].Pop()
+		doc_id := r.Docid
+		word := u.idx2word[int(r.Widx)]
+		pos := r.Pos
+
+		if u.last_doc_id == nil {
+			u.last_doc_id = doc_id
+		} else if u.last_doc_id != doc_id {
+			// new doc_id
+			u.last_doc_id = doc_id
+			u.n_doc_id++
+		}
+
+		//logutil.Infof("WORD:%s, DOC_ID:%v, POS:%d, LAST: %v", word, doc_id, pos, last_doc_id)
+		if u.n_doc_id >= 8192 {
+			scoremap, err := s.Eval()
+			if err != nil {
+				return nil, false, err
+			}
+
+			clear(s.WordAccums)
+			u.n_doc_id = 0
+
+			if len(scoremap) > 0 {
+				return scoremap, false, nil
+			}
+		}
+
+		w, ok := s.WordAccums[word]
+		if !ok {
+			s.WordAccums[word] = fulltext.NewWordAccum()
+			w = s.WordAccums[word]
+		}
+		_, ok = w.Words[doc_id]
+		if ok {
+			w.Words[doc_id].Position = append(w.Words[doc_id].Position, pos)
+			w.Words[doc_id].DocCount += 1
+		} else {
+			positions := make([]int32, 0, 4)
+			positions = append(positions, pos)
+			w.Words[doc_id] = &fulltext.Word{DocId: doc_id, Position: positions, DocCount: 1}
+		}
+	}
+
+	u.last_doc_id = nil
+	u.n_doc_id = 0
+	u.curr_bucket++
+
+	scoremap, err = s.Eval()
+	if err != nil {
+		return nil, false, err
+	}
+
+	clear(s.WordAccums)
+
+	if len(scoremap) > 0 {
+		return scoremap, (u.curr_bucket == u.cache.GetNBucket()), nil
+	}
+
+	return nil, (u.curr_bucket == u.cache.GetNBucket()), nil
 }
 
 // get one batch and evaluate the result in mini batches with size 8192
@@ -391,6 +465,62 @@ func getResults(u *fulltextState, proc *process.Process, s *fulltext.SearchAccum
 	return false, nil
 }
 
+func saveToBucket(u *fulltextState, proc *process.Process, s *fulltext.SearchAccum) (stream_closed bool, err error) {
+	highwaykey := []byte("_matrixone1matrixone2matrixone3_") // 32 bytes
+
+	// first receive the batch and calculate the scoremap
+	// We don't need to calculate mini-batch?????
+	var res executor.Result
+	var ok bool
+	select {
+	case res, ok = <-u.stream_chan:
+		if !ok {
+			// channel closed and evaluate the rest of result
+			return true, nil
+		}
+	case err = <-u.errors:
+		return false, err
+	case <-proc.Ctx.Done():
+		return false, moerr.NewInternalError(proc.Ctx, "context cancelled")
+	}
+
+	bat := res.Batches[0]
+	defer res.Close()
+
+	if len(bat.Vecs) != 3 {
+		return false, moerr.NewInternalError(proc.Ctx, "output vector columns not match")
+	}
+
+	u.nrows += bat.RowCount()
+
+	for i := 0; i < bat.RowCount(); i++ {
+		// doc_id any
+		doc_id := vector.GetAny(bat.Vecs[0], i)
+
+		hashv := highwayhash.Sum64(types.EncodeValue(doc_id, bat.Vecs[0].GetType().Oid), highwaykey)
+
+		bytes, ok := doc_id.([]byte)
+		if ok {
+			// change it to string
+			key := string(bytes)
+			doc_id = key
+		}
+
+		// pos int32
+		pos := vector.GetFixedAtWithTypeCheck[int32](bat.Vecs[1], i)
+
+		// word string
+		widx := vector.GetFixedAtWithTypeCheck[int32](bat.Vecs[2], i)
+
+		r := &fulltext.DocRow{Docid: doc_id, Pos: pos, Widx: widx}
+		u.cache.Add(hashv, r)
+
+		logutil.Infof("ROW widx=%d, pos = %d, docid = %v,  hashv=%d", widx, pos, doc_id, hashv)
+	}
+
+	return false, nil
+}
+
 // Run SQL to get number of records in source table
 func runCountStar(proc *process.Process, s *fulltext.SearchAccum) (int64, error) {
 	var nrow int64
@@ -442,6 +572,17 @@ func fulltextIndexMatch(u *fulltextState, proc *process.Process, tableFunction *
 			return
 		}
 	}()
+
+	// array is empty, try to get batch from SQL executor
+	for !u.sql_closed {
+		sql_closed, err := saveToBucket(u, proc, u.sacc)
+		if err != nil {
+			return err
+		}
+		u.sql_closed = sql_closed
+	}
+
+	u.cache.InsertEnd()
 
 	return nil
 }

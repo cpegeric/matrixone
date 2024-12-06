@@ -56,6 +56,7 @@ require (
 	github.com/lni/vfs v0.2.1-0.20220616104132-8852fd867376
 	github.com/matrixorigin/mysql v1.8.2-0.20241106110439-6ac9ee94770d
 	github.com/matrixorigin/simdcsv v0.0.0-20230210060146-09b8e45209dd
+	github.com/minio/highwayhash v1.0.3
 	github.com/minio/minio-go/v7 v7.0.78
 	github.com/mohae/deepcopy v0.0.0-20170929034955-c48cc78d4826
 	github.com/ncruces/go-dns v1.2.5
