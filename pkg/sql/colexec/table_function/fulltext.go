@@ -37,20 +37,15 @@ const (
 )
 
 type fulltextState struct {
-	inited       bool
-	errors       chan error
-	stream_chan  chan executor.Result
-	score_array  []map[any]float32
-	n_doc_id     int
-	last_doc_id  any
-	n_result     uint64
-	sql_closed   bool
-	sacc         *fulltext.SearchAccum
-	limit        uint64
-	nrows        int
-	idx2word     map[int]string
-	curr_bucket  int
-	cache_closed bool
+	inited      bool
+	errors      chan error
+	stream_chan chan executor.Result
+	n_result    uint64
+	sql_closed  bool
+	sacc        *fulltext.SearchAccum
+	limit       uint64
+	nrows       int
+	idx2word    map[int]string
 
 	// holding output batch
 	batch *batch.Batch
@@ -132,7 +127,7 @@ func (u *fulltextState) call(tf *TableFunction, proc *process.Process) (vm.CallR
 	}
 
 	// array is empty, try to get batch from SQL executor
-	scoremap, err := getFromCache(u, proc, u.sacc)
+	scoremap, err := evaluate(u, proc, u.sacc)
 	if err != nil {
 		return vm.CancelResult, err
 	}
@@ -151,7 +146,6 @@ func (u *fulltextState) start(tf *TableFunction, proc *process.Process, nthRow i
 		u.batch = tf.createResultBatch()
 		u.errors = make(chan error)
 		u.stream_chan = make(chan executor.Result, 8)
-		u.score_array = make([]map[any]float32, 0, 512)
 		u.idx2word = make(map[int]string)
 		u.inited = true
 	}
@@ -301,7 +295,7 @@ func runWordStats(u *fulltextState, proc *process.Process, s *fulltext.SearchAcc
 	return res, nil
 }
 
-func getFromCache(u *fulltextState, proc *process.Process, s *fulltext.SearchAccum) (scoremap map[any]float32, err error) {
+func evaluate(u *fulltextState, proc *process.Process, s *fulltext.SearchAccum) (scoremap map[any]float32, err error) {
 
 	scoremap = make(map[any]float32, 8192)
 	keys := make([]any, 0, 8192)
@@ -332,7 +326,7 @@ func getFromCache(u *fulltextState, proc *process.Process, s *fulltext.SearchAcc
 	return scoremap, nil
 }
 
-func saveToBucket(u *fulltextState, proc *process.Process, s *fulltext.SearchAccum) (stream_closed bool, err error) {
+func groupby(u *fulltextState, proc *process.Process, s *fulltext.SearchAccum) (stream_closed bool, err error) {
 
 	// first receive the batch and calculate the scoremap
 	// We don't need to calculate mini-batch?????
@@ -446,7 +440,7 @@ func fulltextIndexMatch(u *fulltextState, proc *process.Process, tableFunction *
 
 	// array is empty, try to get batch from SQL executor
 	for !u.sql_closed {
-		sql_closed, err := saveToBucket(u, proc, u.sacc)
+		sql_closed, err := groupby(u, proc, u.sacc)
 		if err != nil {
 			return err
 		}
