@@ -65,6 +65,7 @@ type SearchAccum struct {
 	Nrow       int64
 	Agghtab    map[any][]uint8
 	Aggcnt     []int64
+	Nkeywords  int
 }
 
 // Boolean mode search string parsing

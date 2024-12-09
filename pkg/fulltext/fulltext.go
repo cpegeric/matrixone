@@ -49,7 +49,7 @@ func NewSearchAccum(srctbl string, tblname string, pattern string, mode int64, p
 
 	nwords := GetTextCountFromPattern(ps)
 	return &SearchAccum{SrcTblName: srctbl, TblName: tblname, Mode: mode, Pattern: ps, Params: params, Agghtab: make(map[any][]uint8, 1024),
-		Aggcnt: make([]int64, nwords)}, nil
+		Aggcnt: make([]int64, nwords), Nkeywords: nwords}, nil
 }
 
 func findPatternByOperator(ps []*Pattern, op int) []*Pattern {
