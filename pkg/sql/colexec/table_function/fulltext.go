@@ -276,7 +276,7 @@ func runWordStats(u *fulltextState, proc *process.Process, s *fulltext.SearchAcc
 		u.idx2word[int(idx)] = w
 	}
 
-	sql := strings.Join(union, " UNION ")
+	sql := strings.Join(union, " UNION ALL ")
 
 	logutil.Infof("SQL is %s", sql)
 
