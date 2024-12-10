@@ -278,13 +278,55 @@ func runWordStats(u *fulltextState, proc *process.Process, s *fulltext.SearchAcc
 
 	sql := strings.Join(union, " UNION ")
 
-	/*
-		if len(union) == 1 {
-			sql += " ORDER BY doc_id"
-		} else {
-			sql = fmt.Sprintf("SELECT * FROM (%s) ORDER BY doc_id", sql)
+	logutil.Infof("SQL is %s", sql)
+
+	res, err := ft_runSql_streaming(proc, sql, u.stream_chan)
+	if err != nil {
+		return executor.Result{}, err
+	}
+
+	return res, nil
+}
+
+// run SQL to get the (doc_id, pos) of all patterns (words) in the search string
+func runPhraseStats(u *fulltextState, proc *process.Process, s *fulltext.SearchAccum) (executor.Result, error) {
+	var sql string
+	var union []string
+	var keywords []string
+	var indexes []int32
+	var positions []int32
+
+	// get plain text
+	for _, p := range s.Pattern {
+		keywords, indexes, positions = fulltext.GetPhraseTextFromPattern(p, keywords, indexes, positions)
+	}
+
+	if len(keywords) == 1 {
+		sql = fmt.Sprintf("SELECT doc_id, CAST(%d as int) FROM %s WHERE word = '%d'",
+			indexes[0], keywords[0])
+	} else {
+		oncond := make([]string, len(keywords)-1)
+		tables := make([]string, len(keywords))
+		for i, kw := range keywords {
+			idx := indexes[i]
+			tblname := fmt.Sprintf("kw%d", i)
+			tables[i] = tblname
+			union = append(union, fmt.Sprintf("%s AS (SELECT doc_id, pos FROM %s WHERE word = '%s')",
+				tblname, s.TblName, kw))
+			u.idx2word[int(idx)] = kw
+			if i > 0 {
+				oncond[i-1] = fmt.Sprintf("%s.doc_id = %s.doc_id AND %s.pos - %s.pos = %d",
+					tables[0], tables[i], tables[i], tables[0], positions[i]-positions[0])
+			}
 		}
-	*/
+		sql = "WITH "
+		sql += strings.Join(union, ", ")
+		sql += fmt.Sprintf(" SELECT %s.doc_id, CAST(0 as int) FROM ", tables[0])
+		sql += strings.Join(tables, ", ")
+		sql += " WHERE "
+		sql += strings.Join(oncond, " AND ")
+	}
+
 	logutil.Infof("SQL is %s", sql)
 
 	res, err := ft_runSql_streaming(proc, sql, u.stream_chan)
@@ -367,17 +409,41 @@ func groupby(u *fulltextState, proc *process.Process, s *fulltext.SearchAccum) (
 		// word string
 		widx := vector.GetFixedAtWithTypeCheck[int32](bat.Vecs[1], i)
 
-		s.Aggcnt[widx]++
-		docvec, ok := s.Agghtab[doc_id]
-		if ok {
-			if docvec[widx] < 255 {
-				// limit doc count to 255 to fit uint8
-				docvec[widx]++
+		if s.Pattern[0].Operator == fulltext.PHRASE {
+			// phrase search widx is dummy and fill in value 1 for all keywords
+			nwords := s.Nkeywords
+			for i := 0; i < nwords; i++ {
+				s.Aggcnt[i]++
 			}
+			docvec, ok := s.Agghtab[doc_id]
+			if ok {
+				for i := 0; i < nwords; i++ {
+					if docvec[i] < 255 {
+						docvec[i]++
+					}
+				}
+			} else {
+				docvec = make([]uint8, s.Nkeywords)
+				for i := 0; i < nwords; i++ {
+					docvec[i] = 1
+				}
+				s.Agghtab[doc_id] = docvec
+			}
+
 		} else {
-			docvec = make([]uint8, s.Nkeywords)
-			docvec[widx] = 1
-			s.Agghtab[doc_id] = docvec
+
+			s.Aggcnt[widx]++
+			docvec, ok := s.Agghtab[doc_id]
+			if ok {
+				if docvec[widx] < 255 {
+					// limit doc count to 255 to fit uint8
+					docvec[widx]++
+				}
+			} else {
+				docvec = make([]uint8, s.Nkeywords)
+				docvec[widx] = 1
+				s.Agghtab[doc_id] = docvec
+			}
 		}
 
 		//logutil.Infof("ROW widx=%d, docid = %v", widx, doc_id)
@@ -431,10 +497,19 @@ func fulltextIndexMatch(u *fulltextState, proc *process.Process, tableFunction *
 
 	go func() {
 		// get the statistic of search string ([]Pattern) and store in SearchAccum
-		_, err = runWordStats(u, proc, u.sacc)
-		if err != nil {
-			u.errors <- err
-			return
+		if len(s.Pattern) > 0 && s.Pattern[0].Operator == fulltext.PHRASE {
+			_, err = runPhraseStats(u, proc, u.sacc)
+			if err != nil {
+				u.errors <- err
+				return
+			}
+
+		} else {
+			_, err = runWordStats(u, proc, u.sacc)
+			if err != nil {
+				u.errors <- err
+				return
+			}
 		}
 	}()
 
