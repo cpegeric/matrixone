@@ -302,8 +302,8 @@ func runPhraseStats(u *fulltextState, proc *process.Process, s *fulltext.SearchA
 	}
 
 	if len(keywords) == 1 {
-		sql = fmt.Sprintf("SELECT doc_id, CAST(%d as int) FROM %s WHERE word = '%d'",
-			indexes[0], keywords[0])
+		sql = fmt.Sprintf("SELECT doc_id, CAST(%d as int) FROM %s WHERE word = '%s'",
+			indexes[0], s.TblName, keywords[0])
 	} else {
 		oncond := make([]string, len(keywords)-1)
 		tables := make([]string, len(keywords))
