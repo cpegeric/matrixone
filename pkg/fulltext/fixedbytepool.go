@@ -216,6 +216,29 @@ func (part *Partition) Spill() error {
 		return nil
 	}
 
+	/*
+		fs, err := part.proc.GetSpillFileService()
+		if err != nil {
+			return err
+		}
+
+
+		fpath := "foo"
+		err = fs.Write(part.proc.Ctx, fileservice.IOVector{
+			FilePath: fpath,
+			Entries: []fileservice.IOEntry{
+				{
+					Offset: 0,
+					Size:   int64(len(part.data)),
+					Data:   part.data,
+				},
+			},
+		})
+		if err != nil {
+			return err
+		}
+	*/
+
 	f, err := os.CreateTemp("", "fulltext")
 	if err != nil {
 		return err
@@ -243,6 +266,44 @@ func (part *Partition) Unspill() error {
 	}
 
 	fpath := part.spill_fpath
+
+	/*
+		fs, err := part.proc.GetSpillFileService()
+		if err != nil {
+			return err
+		}
+
+		buf := new(bytes.Buffer)
+		vec := &fileservice.IOVector{
+			FilePath: fpath,
+			Entries: []fileservice.IOEntry{
+				{
+					Offset:        0,
+					Size:          -1,
+					WriterForRead: buf,
+				},
+			},
+		}
+		err = fs.Read(part.proc.Ctx, vec)
+		if err != nil {
+			return err
+		}
+		b := buf.Bytes()
+		if uint64(len(b)) != part.capacity {
+			return moerr.NewInternalError(part.proc.Ctx, "Spill file size not match with capacity")
+		}
+
+		// alloc memory with capacity
+		capacity := part.capacity
+		err = part.alloc(capacity)
+		if err != nil {
+			return err
+		}
+
+		copy(part.data, b)
+		b = nil
+		buf = nil // release memory
+	*/
 
 	f, err := os.Open(fpath)
 	if err != nil {
@@ -315,6 +376,7 @@ func (pool *FixedBytePool) NewItem() (addr uint64, b []byte, err error) {
 		// spill
 		err := pool.Spill()
 		if err != nil {
+			fmt.Printf("ERRI %v\n", err)
 			return 0, nil, err
 		}
 	}
