@@ -376,7 +376,6 @@ func (pool *FixedBytePool) NewItem() (addr uint64, b []byte, err error) {
 		// spill
 		err := pool.Spill()
 		if err != nil {
-			fmt.Printf("ERRI %v\n", err)
 			return 0, nil, err
 		}
 	}
