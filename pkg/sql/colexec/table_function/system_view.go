@@ -35,6 +35,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/queryservice"
 	qclient "github.com/matrixorigin/matrixone/pkg/queryservice/client"
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
@@ -266,6 +267,10 @@ func moConfigurationsPrepare(proc *process.Process, tf *TableFunction) (tvfState
 		return nil, moerr.NewInternalError(proc.Ctx, "invalid column count")
 	}
 	return &moConfigurationState{}, nil
+}
+
+func (s *moConfigurationState) eof(tf *TableFunction, proc *process.Process) (vm.CallResult, error) {
+	return vm.CancelResult, nil
 }
 
 func (s *moConfigurationState) start(tf *TableFunction, proc *process.Process, nthRow int, analyzer process.Analyzer) error {

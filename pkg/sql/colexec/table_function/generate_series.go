@@ -195,6 +195,10 @@ func (g *generateSeriesArg) free(tf *TableFunction, proc *process.Process, pipel
 	}
 }
 
+func (g *generateSeriesArg) eof(tf *TableFunction, proc *process.Process) (vm.CallResult, error) {
+	return vm.CancelResult, nil
+}
+
 func (g *generateSeriesArg) start(tf *TableFunction, proc *process.Process, nthRow int, analyzer process.Analyzer) error {
 	var err error
 	var startVec, endVec, stepVec *vector.Vector

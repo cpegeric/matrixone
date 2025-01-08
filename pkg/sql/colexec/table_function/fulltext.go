@@ -82,6 +82,10 @@ func (u *fulltextState) free(tf *TableFunction, proc *process.Process, pipelineF
 	}
 }
 
+func (u *fulltextState) eof(tf *TableFunction, proc *process.Process) (vm.CallResult, error) {
+	return vm.CancelResult, nil
+}
+
 // return (doc_id, score) as result
 // when scoremap is empty, return result end.
 func (u *fulltextState) returnResult(proc *process.Process, scoremap map[any]float32) (vm.CallResult, error) {

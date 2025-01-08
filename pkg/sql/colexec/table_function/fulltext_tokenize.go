@@ -55,6 +55,10 @@ func (u *tokenizeState) reset(tf *TableFunction, proc *process.Process) {
 	}
 }
 
+func (u *tokenizeState) eof(tf *TableFunction, proc *process.Process) (vm.CallResult, error) {
+	return vm.CancelResult, nil
+}
+
 func (u *tokenizeState) call(tf *TableFunction, proc *process.Process) (vm.CallResult, error) {
 
 	u.batch.CleanOnlyData()

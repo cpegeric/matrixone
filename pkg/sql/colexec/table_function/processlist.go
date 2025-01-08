@@ -27,6 +27,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/pb/status"
 	"github.com/matrixorigin/matrixone/pkg/queryservice"
 	qclient "github.com/matrixorigin/matrixone/pkg/queryservice/client"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
@@ -37,6 +38,10 @@ type processlistState struct {
 func processlistPrepare(_ *process.Process, _ *TableFunction) (tvfState, error) {
 	var st processlistState
 	return &st, nil
+}
+
+func (s *processlistState) eof(tf *TableFunction, proc *process.Process) (vm.CallResult, error) {
+	return vm.CancelResult, nil
 }
 
 func (s *processlistState) start(tf *TableFunction, proc *process.Process, nthRow int, analyzer process.Analyzer) error {

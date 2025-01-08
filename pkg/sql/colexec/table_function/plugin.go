@@ -93,6 +93,11 @@ func (u *pluginState) free(tf *TableFunction, proc *process.Process, pipelineFai
 	}
 }
 
+// TODO: return aggregate result
+func (u *pluginState) eof(tf *TableFunction, proc *process.Process) (vm.CallResult, error) {
+	return vm.CancelResult, nil
+}
+
 func pluginPrepare(proc *process.Process, arg *TableFunction) (tvfState, error) {
 	var err error
 	st := &pluginState{}

@@ -42,6 +42,10 @@ func (tableFunction *TableFunction) Call(proc *process.Process) (vm.CallResult, 
 		return vm.CancelResult, moerr.NewInternalErrorf(proc.Ctx, "table function %s state is nil", tableFunction.FuncName)
 	}
 
+	if tableFunction.eof {
+		return vm.CancelResult, nil
+	}
+
 	// loop
 	for {
 		if tableFunction.ctr.inputBatch.IsDone() || tableFunction.ctr.nextRow >= tableFunction.ctr.inputBatch.RowCount() {
@@ -53,7 +57,13 @@ func (tableFunction *TableFunction) Call(proc *process.Process) (vm.CallResult, 
 
 			tableFunction.ctr.inputBatch = input.Batch
 			if input.Batch.IsDone() {
-				return input, nil
+				// EOF
+				tableFunction.eof = true
+				res, err := tableFunction.ctr.state.eof(tableFunction, proc)
+				if err != nil {
+					return vm.CancelResult, err
+				}
+				return res, nil
 			}
 
 			// Got a valid batch, eval tbf args

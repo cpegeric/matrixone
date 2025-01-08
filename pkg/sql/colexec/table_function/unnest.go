@@ -81,6 +81,10 @@ func (u *unnestState) reset(tf *TableFunction, proc *process.Process) {
 	u.called = false
 }
 
+func (u *unnestState) eof(tf *TableFunction, proc *process.Process) (vm.CallResult, error) {
+	return vm.CancelResult, nil
+}
+
 func (u *unnestState) call(tf *TableFunction, proc *process.Process) (vm.CallResult, error) {
 	var res vm.CallResult
 	if u.called {
