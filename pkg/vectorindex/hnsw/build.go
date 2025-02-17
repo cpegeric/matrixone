@@ -132,16 +132,16 @@ func (idx *HnswBuildIndex) SaveToFile() error {
 
 // Generate the SQL to update the secondary index tables.
 // 1. store the index file into the index table
-func (idx *HnswBuildIndex) ToSql(cfg vectorindex.IndexTableConfig) (string, error) {
+func (idx *HnswBuildIndex) ToSql(cfg vectorindex.IndexTableConfig) ([]string, error) {
 
 	err := idx.SaveToFile()
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	fi, err := os.Stat(idx.Path)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
 	filesz := fi.Size()
@@ -151,27 +151,41 @@ func (idx *HnswBuildIndex) ToSql(cfg vectorindex.IndexTableConfig) (string, erro
 
 	idx.Size = filesz
 
-	sql := fmt.Sprintf("INSERT INTO `%s`.`%s` VALUES ", cfg.DbName, cfg.IndexTable)
+	nchunk := int64(math.Ceil(float64(filesz) / float64(vectorindex.MaxChunkSize)))
+	max_chunk_per_sql := int64(128)
+	nsql := int64(math.Ceil(float64(nchunk) / float64(max_chunk_per_sql)))
+	sqls := make([]string, 0, nsql)
 	values := make([]string, 0, int64(math.Ceil(float64(filesz)/float64(vectorindex.MaxChunkSize))))
-	for offset = 0; offset < filesz; {
-		if offset+vectorindex.MaxChunkSize < filesz {
-			chunksz = vectorindex.MaxChunkSize
+	for offset < filesz {
+		n := int64(0)
+		sql := fmt.Sprintf("INSERT INTO `%s`.`%s` VALUES ", cfg.DbName, cfg.IndexTable)
+		for offset < filesz {
+			if offset+vectorindex.MaxChunkSize < filesz {
+				chunksz = vectorindex.MaxChunkSize
 
-		} else {
-			chunksz = filesz - offset
+			} else {
+				chunksz = filesz - offset
+			}
+
+			url := fmt.Sprintf("file://%s?offset=%d&size=%d", idx.Path, offset, chunksz)
+			tuple := fmt.Sprintf("('%s', %d, load_file(cast('%s' as datalink)), 0)", idx.Id, chunkid, url)
+			values = append(values, tuple)
+
+			// offset and chunksz
+			offset += chunksz
+			chunkid++
+			n++
+
+			if n >= max_chunk_per_sql {
+				break
+			}
 		}
-
-		url := fmt.Sprintf("file://%s?offset=%d&size=%d", idx.Path, offset, chunksz)
-		tuple := fmt.Sprintf("('%s', %d, load_file(cast('%s' as datalink)), 0)", idx.Id, chunkid, url)
-		values = append(values, tuple)
-
-		// offset and chunksz
-		offset += chunksz
-		chunkid++
+		sql += strings.Join(values, ", ")
+		values = values[:0]
+		sqls = append(sqls, sql)
 	}
 
-	sql += strings.Join(values, ", ")
-	return sql, nil
+	return sqls, nil
 }
 
 // is the index empty
@@ -198,9 +212,25 @@ func (idx *HnswBuildIndex) Add(key int64, vec []float32) error {
 }
 
 // create HsnwBuild struct
-func NewHnswBuild(proc *process.Process, uid string, cfg vectorindex.IndexConfig, tblcfg vectorindex.IndexTableConfig) (info *HnswBuild, err error) {
+func NewHnswBuild(proc *process.Process, uid string, nworker int32,
+	cfg vectorindex.IndexConfig, tblcfg vectorindex.IndexTableConfig) (info *HnswBuild, err error) {
 
-	nthread := vectorindex.GetConcurrency(tblcfg.ThreadsBuild)
+	// estimate the number of worker threads
+	nthread := 0
+	if nworker <= 1 {
+		// single database thread and set nthread to ThreadsBuild
+		nthread = int(vectorindex.GetConcurrency(tblcfg.ThreadsBuild))
+	} else {
+		// multiple database worker threads
+		threadsbuild := vectorindex.GetConcurrency(tblcfg.ThreadsBuild)
+		nthread = int(float64(threadsbuild) / float64(nworker))
+	}
+	if nthread < 1 {
+		nthread = 1
+	}
+	os.Stderr.WriteString(fmt.Sprintf("NewHnswBuild nthread %d\n", nthread))
+
+	// create struct
 	info = &HnswBuild{
 		uid:     uid,
 		cfg:     cfg,
@@ -404,16 +434,16 @@ func (h *HnswBuild) ToInsertSql(ts int64) ([]string, error) {
 		return []string{}, nil
 	}
 
-	sqls := make([]string, 0, len(h.indexes)+1)
+	ret_sqls := make([]string, 0, len(h.indexes)+1)
 
 	metas := make([]string, 0, len(h.indexes))
 	for _, idx := range h.indexes {
-		sql, err := idx.ToSql(h.tblcfg)
+		sqls, err := idx.ToSql(h.tblcfg)
 		if err != nil {
 			return nil, err
 		}
 
-		sqls = append(sqls, sql)
+		ret_sqls = append(ret_sqls, sqls...)
 
 		//os.Stderr.WriteString(fmt.Sprintf("Sql: %s\n", sql))
 		chksum, err := vectorindex.CheckSum(idx.Path)
@@ -432,8 +462,8 @@ func (h *HnswBuild) ToInsertSql(ts int64) ([]string, error) {
 
 	metasql := fmt.Sprintf("INSERT INTO `%s`.`%s` VALUES %s", h.tblcfg.DbName, h.tblcfg.MetadataTable, strings.Join(metas, ", "))
 
-	sqls = append(sqls, metasql)
-	return sqls, nil
+	ret_sqls = append(ret_sqls, metasql)
+	return ret_sqls, nil
 }
 
 func (h *HnswBuild) GetIndexes() []*HnswBuildIndex {

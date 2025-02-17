@@ -50,7 +50,7 @@ func TestBuildMulti(t *testing.T) {
 		ThreadsBuild:  int64(nthread)}
 
 	uid := fmt.Sprintf("%s:%d:%d", "localhost", 1, 0)
-	build, err := NewHnswBuild(proc, uid, idxcfg, tblcfg)
+	build, err := NewHnswBuild(proc, uid, 1, idxcfg, tblcfg)
 	require.Nil(t, err)
 	defer build.Destroy()
 
@@ -202,7 +202,7 @@ func TestBuildSingleThread(t *testing.T) {
 		ThreadsSearch: 0,
 		ThreadsBuild:  1}
 	uid := fmt.Sprintf("%s:%d:%d", "localhost", 1, 0)
-	build, err := NewHnswBuild(proc, uid, idxcfg, tblcfg)
+	build, err := NewHnswBuild(proc, uid, 1, idxcfg, tblcfg)
 	require.Nil(t, err)
 	defer build.Destroy()
 
@@ -237,9 +237,9 @@ func TestBuildSingleThread(t *testing.T) {
 	fmt.Printf("model built\n")
 	sqls, err := build.ToInsertSql(time.Now().UnixMicro())
 	require.Nil(t, err)
-	require.Equal(t, 3, len(sqls))
+	require.Equal(t, 5, len(sqls))
 	fmt.Println(sqls[0])
-	fmt.Println(sqls[2])
+	fmt.Println(sqls[4])
 
 	indexes := build.GetIndexes()
 	require.Equal(t, 2, len(indexes))
