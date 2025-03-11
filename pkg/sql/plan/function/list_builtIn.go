@@ -2230,6 +2230,26 @@ var supportedArrayOperations = []FuncNew{
 					return L2DistanceArray[float64]
 				},
 			},
+			{
+				overloadId: 0,
+				args:       []types.T{types.T_array_float32, types.T_json},
+				retType: func(parameters []types.Type) types.Type {
+					return types.T_json.ToType()
+				},
+				newOp: func() executeLogicOfOverload {
+					return L2DistanceArrayJson[float32]
+				},
+			},
+			{
+				overloadId: 1,
+				args:       []types.T{types.T_array_float64, types.T_json},
+				retType: func(parameters []types.Type) types.Type {
+					return types.T_json.ToType()
+				},
+				newOp: func() executeLogicOfOverload {
+					return L2DistanceArrayJson[float64]
+				},
+			},
 		},
 	},
 	// function `l2_distance_sq`

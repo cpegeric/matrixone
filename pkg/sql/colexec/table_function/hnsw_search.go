@@ -17,10 +17,12 @@ package table_function
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/bytejson"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
@@ -186,13 +188,17 @@ func (u *hnswSearchState) start(tf *TableFunction, proc *process.Process, nthRow
 
 		// f32vec
 		f32aVec := tf.ctr.argVecs[1]
-		if f32aVec.GetType().Oid != types.T_array_float32 {
-			return moerr.NewInvalidInput(proc.Ctx, "Third argument (vector must be a vecfs32 type")
+		if f32aVec.GetType().Oid == types.T_array_float32 {
+			dimension := f32aVec.GetType().Width
+			// dimension
+			u.idxcfg.Usearch.Dimensions = uint(dimension)
+		} else if f32aVec.GetType().Oid == types.T_json {
+			// dimension
+			u.idxcfg.Usearch.Dimensions = u.tblcfg.Dimensions
+		} else {
+			return moerr.NewInvalidInput(proc.Ctx, "Third argument (vector must be a vecf32 type or json")
 		}
-		dimension := f32aVec.GetType().Width
 
-		// dimension
-		u.idxcfg.Usearch.Dimensions = uint(dimension)
 		u.idxcfg.Type = "hnsw"
 
 		u.batch = tf.createResultBatch()
@@ -212,25 +218,47 @@ func (u *hnswSearchState) start(tf *TableFunction, proc *process.Process, nthRow
 		return nil
 	}
 
-	f32a := types.BytesToArray[float32](f32aVec.GetBytesAt(nthRow))
-	if uint(len(f32a)) != u.idxcfg.Usearch.Dimensions {
-		return moerr.NewInvalidInput(proc.Ctx, fmt.Sprintf("vector ops between different dimensions (%d, %d) is not permitted.", u.idxcfg.Usearch.Dimensions, len(f32a)))
+	if f32aVec.GetType().Oid == types.T_array_float32 {
+		f32a := types.BytesToArray[float32](f32aVec.GetBytesAt(nthRow))
+		if uint(len(f32a)) != u.idxcfg.Usearch.Dimensions {
+			return moerr.NewInvalidInput(proc.Ctx, fmt.Sprintf("vector ops between different dimensions (%d, %d) is not permitted.", u.idxcfg.Usearch.Dimensions, len(f32a)))
+		}
+
+		veccache.Cache.Once()
+
+		algo := newHnswAlgo(u.idxcfg, u.tblcfg)
+
+		var keys any
+		keys, u.distances, err = veccache.Cache.Search(proc, u.tblcfg.IndexTable, algo, f32a, vectorindex.RuntimeConfig{Limit: uint(u.limit)})
+		if err != nil {
+			return err
+		}
+
+		var ok bool
+		u.keys, ok = keys.([]int64)
+		if !ok {
+			return moerr.NewInternalError(proc.Ctx, "keys is not []int64")
+		}
+	} else if f32aVec.GetType().Oid == types.T_json {
+
+		c := f32aVec.GetRawBytesAt(nthRow)
+		var bj bytejson.ByteJson
+		if err := bj.Unmarshal(c); err != nil {
+			return err
+		}
+
+		var vecs [][]float32
+		if err := json.Unmarshal([]byte(bj.String()), &vecs); err != nil {
+			return err
+		}
+		os.Stderr.WriteString(fmt.Sprintf("float32[][], %v\n", vecs))
+
+		for i, f := range vecs {
+			os.Stderr.WriteString(fmt.Sprintf("f[%d], %v\n", i, f))
+
+		}
+		os.Stderr.WriteString(fmt.Sprintf("dimension %d\n", u.idxcfg.Usearch.Dimensions))
 	}
 
-	veccache.Cache.Once()
-
-	algo := newHnswAlgo(u.idxcfg, u.tblcfg)
-
-	var keys any
-	keys, u.distances, err = veccache.Cache.Search(proc, u.tblcfg.IndexTable, algo, f32a, vectorindex.RuntimeConfig{Limit: uint(u.limit)})
-	if err != nil {
-		return err
-	}
-
-	var ok bool
-	u.keys, ok = keys.([]int64)
-	if !ok {
-		return moerr.NewInternalError(proc.Ctx, "keys is not []int64")
-	}
 	return nil
 }

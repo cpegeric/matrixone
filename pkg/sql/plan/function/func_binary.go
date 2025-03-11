@@ -3020,3 +3020,7 @@ func castBinaryArrayToInt(array []uint8) int64 {
 	}
 	return result
 }
+
+func L2DistanceArrayJson[T types.RealNumbers](ivecs []*vector.Vector, result vector.FunctionResultWrapper, proc *process.Process, length int, selectList *FunctionSelectList) error {
+	return moerr.NewNotSupported(proc.Ctx, "L2DistanceArrayJson not implemented yet")
+}

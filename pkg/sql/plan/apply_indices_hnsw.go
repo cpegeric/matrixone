@@ -16,6 +16,8 @@ package plan
 
 import (
 	"encoding/json"
+	"fmt"
+	"os"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -29,6 +31,8 @@ import (
 
 func (builder *QueryBuilder) checkValidHnswDistFn(nodeID int32, projNode, sortNode, scanNode *plan.Node,
 	colRefCnt map[[2]int32]int, idxColMap map[[2]int32]*plan.Expr, multiTableIndex *MultiTableIndex) bool {
+
+	os.Stderr.WriteString("check valid hsnw disfn \n")
 
 	if len(sortNode.OrderBy) != 1 {
 		return false
@@ -75,17 +79,27 @@ func (builder *QueryBuilder) checkValidHnswDistFn(nodeID int32, projNode, sortNo
 		return false
 	}
 
-	if value.Typ.GetId() != int32(types.T_array_float32) {
-		return false
-	}
-
-	if value.GetF() != nil {
-		fnexpr := value.GetF()
-		if fnexpr.Func.ObjName != "cast" {
+	if value.Typ.GetId() == int32(types.T_array_float32) {
+		if value.GetF() != nil {
+			fnexpr := value.GetF()
+			os.Stderr.WriteString(fmt.Sprintf("GetF() %v\n", fnexpr))
+			if fnexpr.Func.ObjName != "cast" {
+				return false
+			}
+		} else {
 			return false
 		}
-	} else {
-		return false
+	} else if value.Typ.GetId() == int32(types.T_json) {
+		os.Stderr.WriteString(fmt.Sprintf("JSON GetF() %v\n", value))
+		if value.GetF() != nil {
+			fnexpr := value.GetF()
+			os.Stderr.WriteString(fmt.Sprintf("GetF() %v\n", fnexpr))
+			if fnexpr.Func.ObjName != "cast" {
+				return false
+			}
+		} else {
+			return false
+		}
 	}
 
 	return true
@@ -121,7 +135,8 @@ func (builder *QueryBuilder) applyIndicesForSortUsingHnsw(nodeID int32, projNode
 		SrcTable:      scanNode.TableDef.Name,
 		MetadataTable: metadef.IndexTableName,
 		IndexTable:    idxdef.IndexTableName,
-		ThreadsSearch: val.(int64)}
+		ThreadsSearch: val.(int64),
+		Dimensions:    uint(partType.Width)}
 
 	cfgbytes, err := json.Marshal(tblcfg)
 	if err != nil {
@@ -147,13 +162,25 @@ func (builder *QueryBuilder) applyIndicesForSortUsingHnsw(nodeID int32, projNode
 	exprs = append(exprs, tree.NewNumVal[string](tblcfgstr, tblcfgstr, false, tree.P_char))
 
 	fnexpr := value.GetF()
-	f32vec := fnexpr.Args[0].GetLit().GetSval()
+	if value.Typ.GetId() == int32(types.T_array_float32) {
+		// array float32
+		f32vec := fnexpr.Args[0].GetLit().GetSval()
 
-	valExpr := &tree.CastExpr{Expr: tree.NewNumVal[string](f32vec, f32vec, false, tree.P_char),
-		Type: &tree.T{InternalType: tree.InternalType{Oid: uint32(defines.MYSQL_TYPE_VAR_STRING),
-			FamilyString: "vecf32", Family: tree.ArrayFamily, DisplayWith: partType.Width}}}
+		valExpr := &tree.CastExpr{Expr: tree.NewNumVal[string](f32vec, f32vec, false, tree.P_char),
+			Type: &tree.T{InternalType: tree.InternalType{Oid: uint32(defines.MYSQL_TYPE_VAR_STRING),
+				FamilyString: "vecf32", Family: tree.ArrayFamily, DisplayWith: partType.Width}}}
 
-	exprs = append(exprs, valExpr)
+		exprs = append(exprs, valExpr)
+	} else if value.Typ.GetId() == int32(types.T_json) {
+		// json array of array_float32
+		f32vec := fnexpr.Args[0].GetLit().GetSval()
+
+		valExpr := &tree.CastExpr{Expr: tree.NewNumVal[string](f32vec, f32vec, false, tree.P_char),
+			Type: &tree.T{InternalType: tree.InternalType{Oid: uint32(defines.MYSQL_TYPE_JSON),
+				Family: tree.JsonFamily, DisplayWith: partType.Width}}}
+
+		exprs = append(exprs, valExpr)
+	}
 
 	hnsw_func := tree.NewCStr(hnsw_search_func_name, 1)
 	alias_name := "mo_hnsw_alias_0"

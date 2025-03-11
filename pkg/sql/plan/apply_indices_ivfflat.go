@@ -142,7 +142,8 @@ func (builder *QueryBuilder) applyIndicesForSortUsingIvfflat(nodeID int32, projN
 		PKeyType:      pkType.Id,
 		PKey:          scanNode.TableDef.Pkey.PkeyColName,
 		KeyPart:       keypart,
-		KeyPartType:   partType.Id}
+		KeyPartType:   partType.Id,
+		Dimensions:    uint(partType.Width)}
 
 	cfgbytes, err := json.Marshal(tblcfg)
 	if err != nil {

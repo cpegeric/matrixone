@@ -43,6 +43,7 @@ type IndexTableConfig struct {
 	KeyPart       string `json:"part"`
 	ThreadsBuild  int64  `json:"threads_build"`
 	ThreadsSearch int64  `json:"threads_search"`
+	Dimensions    uint   `json:"dimension"`
 
 	// IVF related
 	EntriesTable string `json:"entries"`
