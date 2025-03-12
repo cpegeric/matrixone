@@ -113,6 +113,15 @@ func (builder *QueryBuilder) applyIndicesForSortUsingHnsw(nodeID int32, projNode
 		limit = projNode.Limit
 	}
 
+	// user variable @mo_vector_batchsize
+	batchsz, err := builder.compCtx.ResolveVariable("mo_batch_test_size", false, true)
+	if err != nil {
+		return nodeID, err
+	}
+	if batchsz == nil {
+		batchsz = any(int64(0))
+	}
+
 	val, err := builder.compCtx.ResolveVariable("hnsw_threads_search", true, false)
 	if err != nil {
 		return nodeID, err
@@ -121,7 +130,8 @@ func (builder *QueryBuilder) applyIndicesForSortUsingHnsw(nodeID int32, projNode
 		SrcTable:      scanNode.TableDef.Name,
 		MetadataTable: metadef.IndexTableName,
 		IndexTable:    idxdef.IndexTableName,
-		ThreadsSearch: val.(int64)}
+		ThreadsSearch: val.(int64),
+		BatchSize:     batchsz.(int64)}
 
 	cfgbytes, err := json.Marshal(tblcfg)
 	if err != nil {
