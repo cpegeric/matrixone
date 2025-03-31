@@ -17,8 +17,11 @@ package ivfflat
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -52,6 +55,12 @@ type IvfflatSearch[T types.RealNumbers] struct {
 	Tblcfg        vectorindex.IndexTableConfig
 	Index         *IvfflatSearchIndex[T]
 	ThreadsSearch int64
+}
+
+type IvfflatStat struct {
+	nbatch   atomic.Int64
+	searchts atomic.Int64
+	waitts   atomic.Int64
 }
 
 func (idx *IvfflatSearchIndex[T]) LoadIndex(proc *process.Process, idxcfg vectorindex.IndexConfig, tblcfg vectorindex.IndexTableConfig, nthread int64) error {
@@ -90,17 +99,18 @@ func (idx *IvfflatSearchIndex[T]) LoadIndex(proc *process.Process, idxcfg vector
 		}
 	}
 
-	//os.Stderr.WriteString(fmt.Sprintf("%d centroids loaded... lists = %d, centroid %v\n", len(idx.Centroids), idxcfg.Ivfflat.Lists, idx.Centroids))
+	os.Stderr.WriteString(fmt.Sprintf("%d centroids loaded... lists = %d\n", len(idx.Centroids), idxcfg.Ivfflat.Lists))
 	return nil
 }
 
 // load chunk from database
 func (idx *IvfflatSearchIndex[T]) searchEntries(proc *process.Process, query []T, distfn metric.DistanceFunction[T], heap *vectorindex.SearchResultSafeHeap,
-	stream_chan chan executor.Result, error_chan chan error) (stream_closed bool, err error) {
+	stream_chan chan executor.Result, error_chan chan error, stat *IvfflatStat) (stream_closed bool, err error) {
 
 	var res executor.Result
 	var ok bool
 
+	start := time.Now()
 	select {
 	case res, ok = <-stream_chan:
 		if !ok {
@@ -115,6 +125,8 @@ func (idx *IvfflatSearchIndex[T]) searchEntries(proc *process.Process, query []T
 	bat := res.Batches[0]
 	defer res.Close()
 
+	wait := time.Now()
+	stat.nbatch.Add(1)
 	for i := 0; i < bat.RowCount(); i++ {
 		pk := vector.GetAny(bat.Vecs[0], i)
 		if bat.Vecs[1].IsNull(uint64(i)) {
@@ -128,6 +140,13 @@ func (idx *IvfflatSearchIndex[T]) searchEntries(proc *process.Process, query []T
 
 		heap.Push(&vectorindex.SearchResultAnyKey{Id: pk, Distance: float64(dist)})
 	}
+	end := time.Now()
+	diff := end.Sub(wait)
+	waitdiff := wait.Sub(start)
+	stat.searchts.Add(diff.Nanoseconds() / 1000)
+	stat.waitts.Add(waitdiff.Nanoseconds() / 1000)
+	os.Stderr.WriteString(fmt.Sprintf("searchEntries: batch size %d,  wait batch %v, distance measure (batch) %v\n", bat.RowCount(), waitdiff, diff))
+
 	return false, nil
 }
 
@@ -182,15 +201,20 @@ func (idx *IvfflatSearchIndex[T]) findCentroids(proc *process.Process, query []T
 		res = append(res, sr.Id)
 	}
 
-	//os.Stderr.WriteString(fmt.Sprintf("probe %d... return centroid ids %v\n", probe, res))
+	os.Stderr.WriteString(fmt.Sprintf("probe nthread = %d, probe = %d... return centroid ids %v\n", nthread, probe, res))
 	return res, nil
 }
 
 // Call usearch.Search
 func (idx *IvfflatSearchIndex[T]) Search(proc *process.Process, idxcfg vectorindex.IndexConfig, tblcfg vectorindex.IndexTableConfig, query []T, rt vectorindex.RuntimeConfig, nthread int64) (keys any, distances []float64, err error) {
 
-	stream_chan := make(chan executor.Result, nthread)
+	// NOTE: 1 buffer per thread will keep thread waiting for data and very slow.  Use 8 buffer per threads.
+	stream_chan := make(chan executor.Result, nthread*8)
 	error_chan := make(chan error, nthread)
+	stat := &IvfflatStat{}
+
+	start := time.Now()
+	end := time.Now()
 
 	distfn, err := metric.ResolveDistanceFn[T](metric.MetricType(idxcfg.Ivfflat.Metric))
 	if err != nil {
@@ -201,6 +225,13 @@ func (idx *IvfflatSearchIndex[T]) Search(proc *process.Process, idxcfg vectorind
 	if err != nil {
 		return nil, nil, err
 	}
+
+	end = time.Now()
+
+	diff := end.Sub(start)
+	os.Stderr.WriteString(fmt.Sprintf("timing: nthread = %d, find Centroids %v\n", nthread, diff))
+
+	start = time.Now()
 
 	var instr string
 	for i, c := range centroids_ids {
@@ -246,7 +277,7 @@ func (idx *IvfflatSearchIndex[T]) Search(proc *process.Process, idxcfg vectorind
 			// brute force search with selected centroids
 			sql_closed := false
 			for !sql_closed {
-				sql_closed, err = idx.searchEntries(proc, query, distfn, heap, stream_chan, error_chan)
+				sql_closed, err = idx.searchEntries(proc, query, distfn, heap, stream_chan, error_chan, stat)
 				if err != nil {
 					errs = errors.Join(errs, err)
 					return
@@ -256,6 +287,12 @@ func (idx *IvfflatSearchIndex[T]) Search(proc *process.Process, idxcfg vectorind
 	}
 
 	wg.Wait()
+
+	end = time.Now()
+	diff = end.Sub(start)
+	start = time.Now()
+	os.Stderr.WriteString(fmt.Sprintf("timing: nthread = %d, total batch = %d, total dist_ts = %d us, total wait_ts %d ms, ivf search %v\n",
+		nthread, stat.nbatch.Load(), stat.searchts.Load(), stat.waitts.Load()/1000, diff))
 
 	if errs != nil {
 		return nil, nil, errs
@@ -273,6 +310,10 @@ func (idx *IvfflatSearchIndex[T]) Search(proc *process.Process, idxcfg vectorind
 		resid = append(resid, sr.Id)
 		resdist = append(resdist, sr.Distance)
 	}
+
+	end = time.Now()
+	diff = end.Sub(start)
+	os.Stderr.WriteString(fmt.Sprintf("timing: nthread = %d, heap n-best search %v\n", nthread, diff))
 
 	return resid, resdist, nil
 }
