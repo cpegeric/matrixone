@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"os"
 	"time"
 
 	"go.uber.org/zap"
@@ -370,7 +371,8 @@ func (exec *txnExecutor) Exec(
 							err_chan <- moerr.NewInternalError(proc.Ctx, "context cancelled")
 							return moerr.NewInternalError(proc.Ctx, "context cancelled")
 						default:
-							time.Sleep(1 * time.Millisecond)
+							os.Stderr.WriteString("BAD SLEEP....\n")
+							time.Sleep(10 * time.Nanosecond)
 						}
 					}
 					stream_result.Batches = []*batch.Batch{rows}

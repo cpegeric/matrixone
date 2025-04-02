@@ -251,7 +251,8 @@ func (idx *IvfflatSearchIndex[T]) Search(proc *process.Process, idxcfg vectorind
 		instr,
 	)
 
-	//os.Stderr.WriteString(sql)
+	os.Stderr.WriteString(sql)
+	os.Stderr.WriteString("\n")
 	go func() {
 		_, err := runSql_streaming(proc, sql, stream_chan, error_chan)
 		if err != nil {

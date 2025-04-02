@@ -18,7 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/matrixorigin/matrixone/pkg/common/malloc"
+	"fmt"
 	"io"
 	"io/fs"
 	"iter"
@@ -30,6 +30,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/matrixorigin/matrixone/pkg/common/malloc"
 
 	"go.uber.org/zap"
 
@@ -477,6 +479,8 @@ func (l *LocalFS) ReadCache(ctx context.Context, vector *IOVector) (err error) {
 		}
 	}
 
+	os.Stderr.WriteString(fmt.Sprintf("ReadCache: cache not found, memCache = %v\n", l.memCache))
+
 	return nil
 }
 
@@ -506,6 +510,8 @@ func (l *LocalFS) read(ctx context.Context, vector *IOVector, bytesCounter *atom
 		metric.FSReadLocalCounter.Add(float64(numNotDoneEntries))
 	}()
 
+	start := time.Now()
+
 	for i, entry := range vector.Entries {
 		if entry.Size == 0 {
 			return moerr.NewEmptyRangeNoCtx(path.File)
@@ -517,6 +523,7 @@ func (l *LocalFS) read(ctx context.Context, vector *IOVector, bytesCounter *atom
 		numNotDoneEntries++
 
 		if entry.WriterForRead != nil {
+			os.Stderr.WriteString("WriteForRead\n")
 			fileWithChecksum, put := NewFileWithChecksumOSFile(ctx, file, _BlockContentSize, l.perfCounterSets)
 			defer put.Put()
 
@@ -569,6 +576,7 @@ func (l *LocalFS) read(ctx context.Context, vector *IOVector, bytesCounter *atom
 			}
 
 		} else if entry.ReadCloserForRead != nil {
+			os.Stderr.WriteString("ReaderForRead\n")
 			if err := l.handleReadCloserForRead(
 				ctx,
 				vector,
@@ -600,6 +608,7 @@ func (l *LocalFS) read(ctx context.Context, vector *IOVector, bytesCounter *atom
 			}
 
 			if entry.Size < 0 {
+				os.Stderr.WriteString("size <0, read all\n")
 				var data []byte
 				data, err = io.ReadAll(r)
 				if err != nil {
@@ -609,6 +618,7 @@ func (l *LocalFS) read(ctx context.Context, vector *IOVector, bytesCounter *atom
 				entry.Size = int64(len(data))
 
 			} else {
+				os.Stderr.WriteString("size >0, read full\n")
 				finally := entry.prepareData(ctx)
 				defer finally(&err)
 				var n int
@@ -631,6 +641,9 @@ func (l *LocalFS) read(ctx context.Context, vector *IOVector, bytesCounter *atom
 
 	}
 
+	end := time.Now()
+	diff := end.Sub(start)
+	os.Stderr.WriteString(fmt.Sprintf("READ time %v, entry = %d\n", diff, len(vector.Entries)))
 	return nil
 
 }

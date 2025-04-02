@@ -17,6 +17,7 @@ package compile
 import (
 	"context"
 	"fmt"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -753,6 +754,7 @@ func (s *Scope) isTableScan() bool {
 }
 
 func newParallelScope(s *Scope) (*Scope, []*Scope) {
+	os.Stderr.WriteString(fmt.Sprintf("NEwParallelScope ncpu = %d\n", s.NodeInfo.Mcpu))
 	if s.NodeInfo.Mcpu == 1 {
 		return s, nil
 	}

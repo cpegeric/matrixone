@@ -34,9 +34,11 @@ func (i *IOEntry) setCachedData(ctx context.Context, allocator CacheDataAllocato
 		metric.FSReadDurationSetCachedData.Observe(time.Since(t0).Seconds())
 	}()
 	if i.ToCacheData == nil {
+		os.Stderr.WriteString("setCacheData: ToCacheData is nil\n")
 		return nil
 	}
 	if len(i.Data) == 0 {
+		os.Stderr.WriteString("setCacheDAta: data is nil\n")
 		return nil
 	}
 	LogEvent(ctx, str_to_cache_data_begin)
