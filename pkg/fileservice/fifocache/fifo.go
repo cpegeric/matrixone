@@ -92,8 +92,8 @@ func estimateGhostSize(capacity int64) int {
 		// only 50%
 		estimate /= 2
 	}
-	if estimate < 1000 {
-		estimate = 1000
+	if estimate < 256*1024 {
+		estimate = 256 * 1024
 	}
 	return estimate
 
