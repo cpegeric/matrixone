@@ -84,6 +84,21 @@ func (c *_CacheItem[K, V]) dec() {
 	}
 }
 
+// assume cache size is 256K
+// if cache capacity is smaller than 4G, ghost size is 100%.  Otherwise, 50%
+func estimateGhostSize(capacity int64) int {
+	estimate := int(capacity / int64(256000))
+	if capacity > 4000000000 { // 4G
+		// only 50%
+		estimate /= 2
+	}
+	if estimate < 1000 {
+		estimate = 1000
+	}
+	return estimate
+
+}
+
 func New[K comparable, V any](
 	capacity fscache.CapacityFunc,
 	keyShardFunc func(K) uint64,
@@ -91,6 +106,8 @@ func New[K comparable, V any](
 	postGet func(ctx context.Context, key K, value V, size int64),
 	postEvict func(ctx context.Context, key K, value V, size int64),
 ) *Cache[K, V] {
+
+	ghostsize := estimateGhostSize(capacity())
 	ret := &Cache[K, V]{
 		capacity: capacity,
 		capacity1: func() int64 {
@@ -98,7 +115,7 @@ func New[K comparable, V any](
 		},
 		small:        *NewQueue[*_CacheItem[K, V]](),
 		main:         *NewQueue[*_CacheItem[K, V]](),
-		ghost:        newGhost[K](int(10000)),
+		ghost:        newGhost[K](ghostsize),
 		keyShardFunc: keyShardFunc,
 		postSet:      postSet,
 		postGet:      postGet,
