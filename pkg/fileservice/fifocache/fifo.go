@@ -57,45 +57,36 @@ type _CacheItem[K comparable, V any] struct {
 	key   K
 	value V
 	size  int64
-	count atomic.Int32
+	freq  int32
 }
 
 func (c *_CacheItem[K, V]) inc() {
-	for {
-		cur := c.count.Load()
-		if cur >= 3 {
-			return
-		}
-		if c.count.CompareAndSwap(cur, cur+1) {
-			return
-		}
+	if c.freq < 3 {
+		c.freq += 1
 	}
 }
 
 func (c *_CacheItem[K, V]) dec() {
-	for {
-		cur := c.count.Load()
-		if cur <= 0 {
-			return
-		}
-		if c.count.CompareAndSwap(cur, cur-1) {
-			return
-		}
+	if c.freq > 0 {
+		c.freq -= 1
 	}
 }
 
 // assume cache size is 256K
 // if cache capacity is smaller than 4G, ghost size is 100%.  Otherwise, 50%
 func estimateGhostSize(capacity int64) int {
-	estimate := int(capacity / int64(256000))
-	if capacity > 4000000000 { // 4G
-		// only 50%
-		estimate /= 2
-	}
-	if estimate < 256*1024 {
-		estimate = 256 * 1024
-	}
-	return estimate
+	/*
+		estimate := int(capacity / int64(256000))
+		if capacity > 4000000000 { // 4G
+			// only 50%
+			estimate /= 2
+		}
+		if estimate < 256*1024 {
+			estimate = 256 * 1024
+		}
+		return estimate
+	*/
+	return 256 * 1024
 
 }
 
@@ -152,21 +143,27 @@ func (c *Cache[K, V]) set(ctx context.Context, key K, value V, size int64) *_Cac
 
 func (c *Cache[K, V]) Set(ctx context.Context, key K, value V, size int64) {
 	if item := c.set(ctx, key, value, size); item != nil {
-		c.queueLock.Lock()
-		defer c.queueLock.Unlock()
-		// enqueue
-		if c.ghost.contains(item.key) {
-			c.ghost.remove(item.key)
-			c.main.enqueue(item)
-			c.usedMain.Add(item.size)
-		} else {
-			c.small.enqueue(item)
-			c.usedSmall.Add(item.size)
-		}
-
-		// evict
-		c.evictAll(ctx, nil, 0)
+		c.enqueue(ctx, item)
 	}
+}
+
+func (c *Cache[K, V]) enqueue(ctx context.Context, item *_CacheItem[K, V]) {
+
+	c.queueLock.Lock()
+	defer c.queueLock.Unlock()
+
+	// enqueue
+	if c.ghost.contains(item.key) {
+		c.ghost.remove(item.key)
+		c.main.enqueue(item)
+		c.usedMain.Add(item.size)
+	} else {
+		c.small.enqueue(item)
+		c.usedSmall.Add(item.size)
+	}
+
+	// evict
+	c.evictAll(ctx, nil, 0)
 }
 
 func (c *Cache[K, V]) Get(ctx context.Context, key K) (value V, ok bool) {
@@ -283,7 +280,7 @@ func (c *Cache[K, V]) evictSmall(ctx context.Context) {
 			// queue empty
 			return
 		}
-		if item.count.Load() > 1 {
+		if item.freq > 1 {
 			// put main
 			c.main.enqueue(item)
 			c.usedSmall.Add(-item.size)
@@ -316,7 +313,7 @@ func (c *Cache[K, V]) evictMain(ctx context.Context) {
 			// empty queue
 			break
 		}
-		if item.count.Load() > 0 {
+		if item.freq > 0 {
 			// re-enqueue
 			item.dec()
 			c.main.enqueue(item)
