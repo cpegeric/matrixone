@@ -170,6 +170,17 @@ func (c *Cache[K, V]) Set(ctx context.Context, key K, value V, size int64) {
 }
 
 func (c *Cache[K, V]) Get(ctx context.Context, key K) (value V, ok bool) {
+	var item *_CacheItem[K, V]
+	if item, ok = c.get(ctx, key); ok {
+		c.queueLock.Lock()
+		defer c.queueLock.Unlock()
+		c.ghost.remove(item.key)
+		return item.value, true
+	}
+	return
+}
+
+func (c *Cache[K, V]) get(ctx context.Context, key K) (value *_CacheItem[K, V], ok bool) {
 	shard := &c.shards[c.keyShardFunc(key)%numShards]
 	shard.Lock()
 	defer shard.Unlock()
@@ -183,7 +194,7 @@ func (c *Cache[K, V]) Get(ctx context.Context, key K) (value V, ok bool) {
 		c.postGet(ctx, item.key, item.value, item.size)
 	}
 	item.inc()
-	return item.value, true
+	return item, true
 }
 
 func (c *Cache[K, V]) Delete(ctx context.Context, key K) {
