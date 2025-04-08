@@ -49,8 +49,6 @@ type Cache[K comparable, V any] struct {
 	usedMain  atomic.Int64
 	main      Queue[*_CacheItem[K, V]]
 	ghost     *ghost[K]
-
-	capacityCut atomic.Int64
 }
 
 type _CacheItem[K comparable, V any] struct {
@@ -75,19 +73,15 @@ func (c *_CacheItem[K, V]) dec() {
 // assume cache size is 256K
 // if cache capacity is smaller than 4G, ghost size is 100%.  Otherwise, 50%
 func estimateGhostSize(capacity int64) int {
-	/*
-		estimate := int(capacity / int64(256000))
-		if capacity > 4000000000 { // 4G
-			// only 50%
-			estimate /= 2
-		}
-		if estimate < 256*1024 {
-			estimate = 256 * 1024
-		}
-		return estimate
-	*/
-	return 256 * 1024
-
+	estimate := int(capacity / int64(128000))
+	if capacity > 8000000000 { // 4G
+		// only 50%
+		estimate /= 2
+	}
+	if estimate < 256*1024 {
+		estimate = 256 * 1024
+	}
+	return estimate
 }
 
 func New[K comparable, V any](
@@ -210,25 +204,8 @@ func (c *Cache[K, V]) Delete(ctx context.Context, key K) {
 }
 
 func (c *Cache[K, V]) Evict(ctx context.Context, done chan int64, capacityCut int64) {
-	if done == nil {
-		// can be async
-		if c.queueLock.TryLock() {
-			defer c.queueLock.Unlock()
-		} else {
-			if capacityCut > 0 {
-				// let the holder do more evict
-				c.capacityCut.Add(capacityCut)
-			}
-			return
-		}
-
-	} else {
-		if cap(done) < 1 {
-			panic("should be buffered chan")
-		}
-		c.queueLock.Lock()
-		defer c.queueLock.Unlock()
-	}
+	c.queueLock.Lock()
+	defer c.queueLock.Unlock()
 
 	target := c.evictAll(ctx, done, capacityCut)
 	if done != nil {
@@ -250,15 +227,14 @@ func (c *Cache[K, V]) used() int64 {
 func (c *Cache[K, V]) evictAll(ctx context.Context, done chan int64, capacityCut int64) int64 {
 	var target int64
 	for {
-		globalCapacityCut := c.capacityCut.Swap(0)
-		target = c.capacity() - capacityCut - globalCapacityCut
+		target = c.capacity() - capacityCut
 		if target < 0 {
 			target = 0
 		}
 		if c.used() <= target {
 			break
 		}
-		target1 := c.capacity1() - capacityCut - globalCapacityCut
+		target1 := c.capacity1() - capacityCut
 		if target1 < 0 {
 			target1 = 0
 		}
