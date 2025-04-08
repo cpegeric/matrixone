@@ -163,9 +163,6 @@ func (c *Cache[K, V]) enqueue(ctx context.Context, item *_CacheItem[K, V]) {
 func (c *Cache[K, V]) Get(ctx context.Context, key K) (value V, ok bool) {
 	var item *_CacheItem[K, V]
 	if item, ok = c.get(ctx, key); ok {
-		c.queueLock.Lock()
-		defer c.queueLock.Unlock()
-		c.ghost.remove(item.key)
 		return item.value, true
 	}
 	return
