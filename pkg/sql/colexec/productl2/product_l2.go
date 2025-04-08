@@ -134,7 +134,7 @@ func (productl2 *Productl2) build(proc *process.Process, analyzer process.Analyz
 		return nil
 	}
 	batches := mp.GetBatches()
-	//maybe optimize this in the future
+	//optimize this by using a pool
 	for i := range batches {
 		ctr.bat, err = ctr.bat.AppendWithCopy(proc.Ctx, proc.Mp(), batches[i])
 		if err != nil {
@@ -145,66 +145,37 @@ func (productl2 *Productl2) build(proc *process.Process, analyzer process.Analyz
 	return nil
 }
 
-//var (
-//	arrayF32Pool = sync.Pool{
-//		New: func() interface{} {
-//			s := make([]float32, 0)
-//			return &s
-//		},
-//	}
-//	arrayF64Pool = sync.Pool{
-//		New: func() interface{} {
-//			s := make([]float64, 0)
-//			return &s
-//		},
-//	}
-//)
-
-func newMat[T types.RealNumbers](ctr *container, ap *Productl2) ([][]T, [][]T) {
+func newMat[T types.RealNumbers](ctr *container, ap *Productl2) ([][]T, [][]T, error) {
 	buildCount := ctr.bat.RowCount()
 	probeCount := ctr.inBat.RowCount()
 	centroidColPos := ap.OnExpr.GetF().GetArgs()[0].GetCol().GetColPos()
 	tblColPos := ap.OnExpr.GetF().GetArgs()[1].GetCol().GetColPos()
 	centroidmat := make([][]T, buildCount)
-	for i := 0; i < buildCount; i++ {
-		switch ctr.bat.Vecs[centroidColPos].GetType().Oid {
-		case types.T_array_float32:
-			if ctr.bat.Vecs[centroidColPos].IsNull(uint64(i)) {
-				centroidmat[i] = nil
-				continue
-			}
-			centroidmat[i] = types.BytesToArray[T](ctr.bat.Vecs[centroidColPos].GetBytesAt(i))
-		case types.T_array_float64:
-			if ctr.bat.Vecs[centroidColPos].IsNull(uint64(i)) {
-				centroidmat[i] = nil
-				continue
-			}
-			centroidmat[i] = types.BytesToArray[T](ctr.bat.Vecs[centroidColPos].GetBytesAt(i))
-		}
-	}
-
-	// embedding mat
 	embedmat := make([][]T, probeCount)
-	for j := 0; j < probeCount; j++ {
 
-		switch ctr.bat.Vecs[centroidColPos].GetType().Oid {
-		case types.T_array_float32:
-			if ctr.inBat.Vecs[tblColPos].IsNull(uint64(j)) {
-				embedmat[j] = nil
-				continue
-			}
-			embedmat[j] = types.BytesToArray[T](ctr.inBat.Vecs[tblColPos].GetBytesAt(j))
-		case types.T_array_float64:
-			if ctr.inBat.Vecs[tblColPos].IsNull(uint64(j)) {
-				embedmat[j] = nil
-				continue
-			}
-			embedmat[j] = types.BytesToArray[T](ctr.inBat.Vecs[tblColPos].GetBytesAt(j))
+	var err error
+	for i := 0; i < buildCount; i++ {
+		centroidmat[i], err = getMatRow[T](ctr.bat.Vecs[centroidColPos], i)
+		if err != nil {
+			return nil, nil, err
 		}
-
 	}
 
-	return centroidmat, embedmat
+	for j := 0; j < probeCount; j++ {
+		embedmat[j], err = getMatRow[T](ctr.inBat.Vecs[tblColPos], j)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return centroidmat, embedmat, nil
+}
+
+func getMatRow[T types.RealNumbers](vec *vector.Vector, row int) ([]T, error) {
+	if vec.IsNull(uint64(row)) {
+		return nil, nil
+	}
+	return types.BytesToArray[T](vec.GetBytesAt(row))
 }
 
 func (ctr *container) probe(ap *Productl2, proc *process.Process, result *vm.CallResult) error {
@@ -234,15 +205,10 @@ func probeRun[T types.RealNumbers](ctr *container, ap *Productl2, proc *process.
 		}
 	}
 
-	leastClusterIndex := make([]int, probeCount)
-	leastDistance := make([]T, probeCount)
-
-	for i := 0; i < probeCount; i++ {
-		leastClusterIndex[i] = 0
-		leastDistance[i] = metric.MaxFloat[T]()
+	centroidmat, embedmat, err := newMat[T](ctr, ap)
+	if err != nil {
+		return err
 	}
-
-	centroidmat, embedmat := newMat[T](ctr, ap)
 	distfn, err := metric.ResolveDistanceFn[T](ctr.metrictype)
 	if err != nil {
 		return moerr.NewInternalError(proc.Ctx, "ProductL2: failed to get distance function")
@@ -252,39 +218,48 @@ func probeRun[T types.RealNumbers](ctr *container, ap *Productl2, proc *process.
 	var mutex sync.Mutex
 	var wg sync.WaitGroup
 
+	// Create a shared slice to store the final results
+	sharedLeastClusterIndex := make([]int, probeCount)
+	sharedLeastDistance := make([]T, probeCount)
+	for i := 0; i < probeCount; i++ {
+		sharedLeastDistance[i] = metric.MaxFloat[T]()
+	}
+
 	for n := 0; n < ncpu; n++ {
-
 		wg.Add(1)
-		go func() {
+		go func(n int) { // Pass n to the goroutine
 			defer wg.Done()
-			for j := 0; j < probeCount; j++ {
-
-				if j%ncpu != n {
-					continue
-				}
+			// Each goroutine only works on its assigned subset of j
+			for j := n; j < probeCount; j += ncpu {
+				// local copies for each j
+				localLeastClusterIndex := 0
+				localLeastDistance := metric.MaxFloat[T]()
 
 				// for each row in probe table,
 				// find the nearest cluster center from the build table.
 				for i := 0; i < buildCount; i++ {
-
+					var dist T
 					if embedmat[j] == nil || centroidmat[i] == nil {
-						leastDistance[j] = 0
-						leastClusterIndex[j] = i
+						dist = 0
 					} else {
-						dist, err := distfn(centroidmat[i], embedmat[j])
+						dist, err = distfn(centroidmat[i], embedmat[j])
 						if err != nil {
 							errs <- err
 							return
 						}
-						if dist < leastDistance[j] {
-							leastDistance[j] = dist
-							leastClusterIndex[j] = i
-						}
+					}
+					if dist < localLeastDistance {
+						localLeastDistance = dist
+						localLeastClusterIndex = i
 					}
 				}
 
+				// Update the shared slices with the local results
+				mutex.Lock()
+				sharedLeastClusterIndex[j] = localLeastClusterIndex
+				sharedLeastDistance[j] = localLeastDistance
+
 				err := func() error {
-					mutex.Lock()
 					defer mutex.Unlock()
 					for k, rp := range ap.Result {
 						if rp.Rel == 0 {
@@ -292,12 +267,11 @@ func probeRun[T types.RealNumbers](ctr *container, ap *Productl2, proc *process.
 								return err
 							}
 						} else {
-							if err := ctr.rbat.Vecs[k].UnionOne(ctr.bat.Vecs[rp.Pos], int64(leastClusterIndex[j]), proc.Mp()); err != nil {
+							if err := ctr.rbat.Vecs[k].UnionOne(ctr.bat.Vecs[rp.Pos], int64(sharedLeastClusterIndex[j]), proc.Mp()); err != nil {
 								return err
 							}
 						}
 					}
-
 					return nil
 				}()
 
@@ -306,7 +280,7 @@ func probeRun[T types.RealNumbers](ctr *container, ap *Productl2, proc *process.
 					return
 				}
 			}
-		}()
+		}(n) // Pass n to the goroutine
 	}
 
 	wg.Wait()
@@ -315,7 +289,6 @@ func probeRun[T types.RealNumbers](ctr *container, ap *Productl2, proc *process.
 		return <-errs
 	}
 
-	// ctr.rbat.AddRowCount(count * count2)
 	ctr.rbat.SetRowCount(ctr.rbat.Vecs[0].Length())
 	result.Batch = ctr.rbat
 

@@ -70,6 +70,7 @@ type VectorIndexSearch struct {
 	LastUpdate atomic.Int64
 	Status     atomic.Int32 // 0 - NOT INIT, 1 - LOADED, 2 - marked as outdated,  3 - DESTROYED,  4 or above ERRCODE
 	Algo       VectorIndexSearchIf
+	cond       *sync.Cond
 }
 
 func (s *VectorIndexSearch) Destroy() {
@@ -78,6 +79,7 @@ func (s *VectorIndexSearch) Destroy() {
 	s.Algo.Destroy()
 	// destroyed
 	s.Status.Store(STATUS_DESTROYED)
+	s.cond.Broadcast()
 }
 
 func (s *VectorIndexSearch) Load(proc *process.Process) error {
@@ -88,18 +90,17 @@ func (s *VectorIndexSearch) Load(proc *process.Process) error {
 	if err != nil {
 		// load error
 		s.Status.Store(STATUS_ERROR)
+		s.cond.Broadcast()
 		return err
 	}
 	// Loaded
 	s.Status.Store(STATUS_LOADED)
 	s.extend(true)
+	s.cond.Broadcast()
 	return nil
 }
 
 func (s *VectorIndexSearch) Expired() bool {
-	//s.Mutex.RLock()
-	//defer s.Mutex.RUnlock()
-
 	ts := s.ExpireAt.Load()
 	now := time.Now().UnixMicro()
 	return (ts > 0 && ts < now)
@@ -118,9 +119,7 @@ func (s *VectorIndexSearch) Search(proc *process.Process, newalgo VectorIndexSea
 	s.Mutex.RLock()
 
 	for s.Status.Load() == 0 {
-		s.Mutex.RUnlock()
-		time.Sleep(time.Millisecond)
-		s.Mutex.RLock()
+		s.cond.Wait()
 	}
 	defer s.Mutex.RUnlock()
 
@@ -185,7 +184,6 @@ func (c *VectorIndexCache) serve() {
 			case <-c.sigc:
 				// sig can be syscall.SIGTERM or syscall.SIGINT
 				c.exited.Store(true)
-				c.Destroy()
 				return
 			case <-c.ticker.C:
 				// delete expired index
@@ -218,7 +216,6 @@ func (c *VectorIndexCache) HouseKeeping() {
 		if loaded {
 			algo := value.(*VectorIndexSearch)
 			algo.Destroy()
-			algo = nil
 		}
 	}
 }
@@ -226,7 +223,6 @@ func (c *VectorIndexCache) HouseKeeping() {
 // destroy the cache
 func (c *VectorIndexCache) Destroy() {
 	if c.started.Load() {
-		//c.ticker.Stop()
 		if !c.exited.Load() {
 			c.done <- true
 		}
@@ -236,7 +232,6 @@ func (c *VectorIndexCache) Destroy() {
 		c.IndexMap.Delete(key)
 		algo := value.(*VectorIndexSearch)
 		algo.Destroy()
-		algo = nil
 		return true
 	})
 }
@@ -244,11 +239,11 @@ func (c *VectorIndexCache) Destroy() {
 // Get index from cache and return VectorIndexSearchIf interface
 func (c *VectorIndexCache) Search(proc *process.Process, key string, newalgo VectorIndexSearchIf,
 	query any, rt vectorindex.RuntimeConfig) (keys any, distances []float64, err error) {
-	value, loaded := c.IndexMap.LoadOrStore(key, &VectorIndexSearch{Algo: newalgo})
+	value, loaded := c.IndexMap.LoadOrStore(key, &VectorIndexSearch{Algo: newalgo, cond: sync.NewCond(&sync.Mutex{})})
 	algo := value.(*VectorIndexSearch)
 	if !loaded {
 		// load model from database and if error during loading, remove the entry from gIndexMap
-		err := algo.Load(proc)
+		err = algo.Load(proc)
 		if err != nil {
 			c.IndexMap.Delete(key)
 			return nil, nil, err
@@ -263,6 +258,5 @@ func (c *VectorIndexCache) Remove(key string) {
 	if loaded {
 		algo := value.(*VectorIndexSearch)
 		algo.Destroy()
-		algo = nil
 	}
 }
