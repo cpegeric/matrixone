@@ -25,16 +25,14 @@ import (
 // Cache implements an in-memory cache with FIFO-based eviction
 // it's mostly like the S3-fifo, only without the ghost queue part
 type Cache[K comparable, V any] struct {
-	capacity     fscache.CapacityFunc
-	capacity1    fscache.CapacityFunc
-	keyShardFunc func(K) uint64
+	capacity  fscache.CapacityFunc
+	capacity1 fscache.CapacityFunc
 
 	postSet   func(ctx context.Context, key K, value V, size int64)
 	postGet   func(ctx context.Context, key K, value V, size int64)
 	postEvict func(ctx context.Context, key K, value V, size int64)
 
-	htab  map[K]*_CacheItem[K, V]
-	mutex sync.Mutex
+	htab *ShardMap[K, *_CacheItem[K, V]]
 
 	usedSmall atomic.Int64
 	small     Queue[*_CacheItem[K, V]]
@@ -115,34 +113,30 @@ func New[K comparable, V any](
 		capacity1: func() int64 {
 			return capacity() / 10
 		},
-		small:        *NewQueue[*_CacheItem[K, V]](),
-		main:         *NewQueue[*_CacheItem[K, V]](),
-		ghost:        newGhost[K](ghostsize),
-		keyShardFunc: keyShardFunc,
-		postSet:      postSet,
-		postGet:      postGet,
-		postEvict:    postEvict,
-		htab:         make(map[K]*_CacheItem[K, V]),
+		small:     *NewQueue[*_CacheItem[K, V]](),
+		main:      *NewQueue[*_CacheItem[K, V]](),
+		ghost:     newGhost[K](ghostsize),
+		postSet:   postSet,
+		postGet:   postGet,
+		postEvict: postEvict,
+		htab:      NewShardMap[K, *_CacheItem[K, V]](keyShardFunc),
 	}
 	return ret
 }
 
 // not thread safe. Internal use only
 func (c *Cache[K, V]) set(ctx context.Context, key K, value V, size int64) *_CacheItem[K, V] {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	_, ok := c.htab[key]
-	if ok {
-		// existed
-		return nil
-	}
-
 	item := &_CacheItem[K, V]{
 		key:   key,
 		value: value,
 		size:  size,
 	}
-	c.htab[key] = item
+
+	ok := c.htab.Set(key, item)
+	if !ok {
+		// existed
+		return nil
+	}
 
 	return item
 }
@@ -190,10 +184,8 @@ func (c *Cache[K, V]) Get(ctx context.Context, key K) (value V, ok bool) {
 
 // not thread safe. Internal use only
 func (c *Cache[K, V]) get(ctx context.Context, key K) (value *_CacheItem[K, V], ok bool) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
 	var item *_CacheItem[K, V]
-	item, ok = c.htab[key]
+	item, ok = c.htab.Get(key)
 	if !ok {
 		return
 	}
@@ -201,14 +193,11 @@ func (c *Cache[K, V]) get(ctx context.Context, key K) (value *_CacheItem[K, V], 
 }
 
 func (c *Cache[K, V]) Delete(ctx context.Context, key K) {
-	c.mutex.Lock()
-	item, ok := c.htab[key]
+	item, ok := c.htab.Get(key)
 	if !ok {
-		c.mutex.Unlock()
 		return
 	}
-	delete(c.htab, key)
-	c.mutex.Unlock()
+	c.htab.Remove(key)
 
 	// post evict
 	item.postFunc(ctx, c.postEvict)
@@ -288,9 +277,7 @@ func (c *Cache[K, V]) evictSmall(ctx context.Context) {
 
 // not thread safe. Internal use only
 func (c *Cache[K, V]) deleteItem(ctx context.Context, item *_CacheItem[K, V]) {
-	c.mutex.Lock()
-	delete(c.htab, item.key)
-	c.mutex.Unlock()
+	c.htab.Remove(item.key)
 
 	// post evict
 	item.postFunc(ctx, c.postEvict)
