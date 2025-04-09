@@ -17,6 +17,7 @@ package fifocache
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
 )
@@ -35,22 +36,26 @@ type Cache[K comparable, V any] struct {
 	htab  map[K]*_CacheItem[K, V]
 	mutex sync.Mutex
 
-	usedSmall int64
+	usedSmall atomic.Int64
 	small     Queue[*_CacheItem[K, V]]
-	usedMain  int64
+	usedMain  atomic.Int64
 	main      Queue[*_CacheItem[K, V]]
 	ghost     *ghost[K]
 }
 
 type _CacheItem[K comparable, V any] struct {
+	mu    sync.Mutex
 	key   K
 	value V
 	size  int64
-	freq  int32
+	freq  int8
 }
 
 // not thread safe. Internal use only
 func (c *_CacheItem[K, V]) inc() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.freq < 3 {
 		c.freq += 1
 	}
@@ -58,9 +63,28 @@ func (c *_CacheItem[K, V]) inc() {
 
 // not thread safe. Internal use only
 func (c *_CacheItem[K, V]) dec() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.freq > 0 {
 		c.freq -= 1
 	}
+}
+
+func (c *_CacheItem[K, V]) getFreq() int8 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.freq
+}
+
+func (c *_CacheItem[K, V]) postFunc(ctx context.Context, fn func(ctx context.Context, key K, value V, size int64)) {
+	if fn == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	fn(ctx, c.key, c.value, c.size)
 }
 
 // assume cache size is 128K
@@ -105,6 +129,8 @@ func New[K comparable, V any](
 
 // not thread safe. Internal use only
 func (c *Cache[K, V]) set(ctx context.Context, key K, value V, size int64) *_CacheItem[K, V] {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	_, ok := c.htab[key]
 	if ok {
 		// existed
@@ -117,17 +143,16 @@ func (c *Cache[K, V]) set(ctx context.Context, key K, value V, size int64) *_Cac
 		size:  size,
 	}
 	c.htab[key] = item
-	if c.postSet != nil {
-		c.postSet(ctx, key, value, size)
-	}
 
 	return item
 }
 
 func (c *Cache[K, V]) Set(ctx context.Context, key K, value V, size int64) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
 	if item := c.set(ctx, key, value, size); item != nil {
+
+		// post set
+		item.postFunc(ctx, c.postSet)
+
 		// enqueue
 		c.enqueue(ctx, item)
 		// evict
@@ -142,18 +167,21 @@ func (c *Cache[K, V]) enqueue(ctx context.Context, item *_CacheItem[K, V]) {
 	if c.ghost.contains(item.key) {
 		c.ghost.remove(item.key)
 		c.main.enqueue(item)
-		c.usedMain += item.size
+		c.usedMain.Add(item.size)
 	} else {
 		c.small.enqueue(item)
-		c.usedSmall += item.size
+		c.usedSmall.Add(item.size)
 	}
 }
 
 func (c *Cache[K, V]) Get(ctx context.Context, key K) (value V, ok bool) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
 	var item *_CacheItem[K, V]
 	if item, ok = c.get(ctx, key); ok {
+
+		// postGet
+		item.postFunc(ctx, c.postGet)
+
+		// increment
 		item.inc()
 		return item.value, true
 	}
@@ -162,35 +190,32 @@ func (c *Cache[K, V]) Get(ctx context.Context, key K) (value V, ok bool) {
 
 // not thread safe. Internal use only
 func (c *Cache[K, V]) get(ctx context.Context, key K) (value *_CacheItem[K, V], ok bool) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	var item *_CacheItem[K, V]
 	item, ok = c.htab[key]
 	if !ok {
 		return
-	}
-	if c.postGet != nil {
-		c.postGet(ctx, item.key, item.value, item.size)
 	}
 	return item, true
 }
 
 func (c *Cache[K, V]) Delete(ctx context.Context, key K) {
 	c.mutex.Lock()
-	defer c.mutex.Unlock()
 	item, ok := c.htab[key]
 	if !ok {
+		c.mutex.Unlock()
 		return
 	}
 	delete(c.htab, key)
-	if c.postEvict != nil {
-		c.postEvict(ctx, item.key, item.value, item.size)
-	}
+	c.mutex.Unlock()
+
+	// post evict
+	item.postFunc(ctx, c.postEvict)
 	// queues will be update in evict
 }
 
 func (c *Cache[K, V]) Evict(ctx context.Context, done chan int64, capacityCut int64) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-
 	target := c.evictAll(ctx, done, capacityCut)
 	if done != nil {
 		done <- target
@@ -204,14 +229,12 @@ func (c *Cache[K, V]) ForceEvict(ctx context.Context, n int64) {
 }
 
 func (c *Cache[K, V]) Used() int64 {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
 	return c.used()
 }
 
 // not thread safe. Internal use only
 func (c *Cache[K, V]) used() int64 {
-	return c.usedSmall + c.usedMain
+	return c.usedSmall.Load() + c.usedMain.Load()
 }
 
 // not thread safe. Internal use only
@@ -229,7 +252,7 @@ func (c *Cache[K, V]) evictAll(ctx context.Context, done chan int64, capacityCut
 		if target1 < 0 {
 			target1 = 0
 		}
-		if c.usedSmall > target1 {
+		if c.usedSmall.Load() > target1 {
 			c.evictSmall(ctx)
 		} else {
 			c.evictMain(ctx)
@@ -248,15 +271,15 @@ func (c *Cache[K, V]) evictSmall(ctx context.Context) {
 			// queue empty
 			return
 		}
-		if item.freq > 1 {
+		if item.getFreq() > 1 {
 			// put main
 			c.main.enqueue(item)
-			c.usedSmall -= item.size
-			c.usedMain += item.size
+			c.usedSmall.Add(-item.size)
+			c.usedMain.Add(item.size)
 		} else {
 			// evict
 			c.deleteItem(ctx, item)
-			c.usedSmall -= item.size
+			c.usedSmall.Add(-item.size)
 			c.ghost.add(item.key)
 			return
 		}
@@ -265,10 +288,12 @@ func (c *Cache[K, V]) evictSmall(ctx context.Context) {
 
 // not thread safe. Internal use only
 func (c *Cache[K, V]) deleteItem(ctx context.Context, item *_CacheItem[K, V]) {
+	c.mutex.Lock()
 	delete(c.htab, item.key)
-	if c.postEvict != nil {
-		c.postEvict(ctx, item.key, item.value, item.size)
-	}
+	c.mutex.Unlock()
+
+	// post evict
+	item.postFunc(ctx, c.postEvict)
 }
 
 // not thread safe. Internal use only
@@ -280,14 +305,14 @@ func (c *Cache[K, V]) evictMain(ctx context.Context) {
 			// empty queue
 			break
 		}
-		if item.freq > 0 {
+		if item.getFreq() > 0 {
 			// re-enqueue
 			item.dec()
 			c.main.enqueue(item)
 		} else {
 			// evict
 			c.deleteItem(ctx, item)
-			c.usedMain -= item.size
+			c.usedMain.Add(-item.size)
 			return
 		}
 	}

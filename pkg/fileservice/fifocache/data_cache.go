@@ -76,9 +76,8 @@ func (d *DataCache) deletePath(ctx context.Context, path string) {
 	for key, item := range d.fifo.htab {
 		if key.Path == path {
 			delete(d.fifo.htab, key)
-			if d.fifo.postEvict != nil {
-				d.fifo.postEvict(ctx, item.key, item.value, item.size)
-			}
+
+			item.postFunc(ctx, d.fifo.postEvict)
 		}
 	}
 }
