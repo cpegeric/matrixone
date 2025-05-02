@@ -16,73 +16,59 @@ package fifocache
 
 import (
 	"sync"
-
-	"golang.org/x/sys/cpu"
 )
 
 const numShards = 256
 
 type ShardMap[K comparable, V any] struct {
-	shards [numShards]struct {
-		sync.RWMutex
-		values map[K]V
-		_      cpu.CacheLinePad
-	}
-	hashfn func(K) uint64
+	htab map[K]V
+	sync.RWMutex
 }
 
 func NewShardMap[K comparable, V any](hashfn func(K) uint64) *ShardMap[K, V] {
-	m := &ShardMap[K, V]{hashfn: hashfn}
-
-	for i := range m.shards {
-		m.shards[i].values = make(map[K]V, 1024)
+	m := &ShardMap[K, V]{
+		htab: make(map[K]V, 1024),
 	}
 	return m
 }
 
 func (m *ShardMap[K, V]) Set(key K, value V) bool {
 
-	s := &m.shards[m.hashfn(key)%numShards]
-	s.Lock()
-	defer s.Unlock()
+	m.Lock()
+	defer m.Unlock()
 
-	_, ok := s.values[key]
+	_, ok := m.htab[key]
 	if ok {
 		return false
 	}
 
-	s.values[key] = value
+	m.htab[key] = value
 	return true
 }
 
 func (m *ShardMap[K, V]) Get(key K) (V, bool) {
 
-	s := &m.shards[m.hashfn(key)%numShards]
-	s.RLock()
-	defer s.RUnlock()
-	v, ok := s.values[key]
+	m.RLock()
+	defer m.RUnlock()
+	v, ok := m.htab[key]
 	return v, ok
 }
 
 func (m *ShardMap[K, V]) Remove(key K) {
 
-	s := &m.shards[m.hashfn(key)%numShards]
-	s.Lock()
-	defer s.Unlock()
-	delete(s.values, key)
+	m.Lock()
+	defer m.Unlock()
+	delete(m.htab, key)
 }
 
 func (m *ShardMap[K, V]) CompareAndDelete(key K, fn func(k1, k2 K) bool, postfn func(V)) {
 
-	for i := range m.shards {
-		s := &m.shards[i]
-		s.Lock()
-		for k, v := range s.values {
-			if fn(k, key) {
-				delete(s.values, k)
-				postfn(v)
-			}
+	m.Lock()
+	defer m.Unlock()
+	for k, v := range m.htab {
+		if fn(k, key) {
+			delete(m.htab, k)
+			postfn(v)
 		}
-		s.Unlock()
 	}
 }
