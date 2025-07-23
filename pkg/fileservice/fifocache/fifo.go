@@ -261,10 +261,6 @@ func (c *Cache[K, V]) housekeep() {
 		for {
 
 			select {
-			case <-c.sigc:
-				// sig can be syscall.SIGTERM or syscall.SIGINT
-				return
-
 			case it, ok := <-c.itemchan:
 				if !ok {
 					// channel closed
@@ -283,6 +279,9 @@ func (c *Cache[K, V]) housekeep() {
 					// enqueue
 					c.small.enqueue(it.item, it.item.Size())
 				}(it)
+			case <-c.sigc:
+				// sig can be syscall.SIGTERM or syscall.SIGINT
+				return
 			}
 		}
 	}()
