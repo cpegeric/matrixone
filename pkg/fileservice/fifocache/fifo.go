@@ -240,7 +240,7 @@ func New[K comparable, V any](
 		postGet:   postGet,
 		postEvict: postEvict,
 		htab:      NewCacheMap[K, *_CacheItem[K, V]](keyShardFunc),
-		itemchan:  make(chan CacheChanItem[K, V], 1),
+		itemchan:  make(chan CacheChanItem[K, V], 32),
 	}
 	return ret
 }
