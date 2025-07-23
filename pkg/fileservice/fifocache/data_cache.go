@@ -110,3 +110,7 @@ func (d *DataCache) Set(ctx context.Context, key query.CacheKey, value fscache.D
 func (d *DataCache) Used() int64 {
 	return d.fifo.Used()
 }
+
+func (d *DataCache) Destroy() {
+	d.fifo.Destroy()
+}
