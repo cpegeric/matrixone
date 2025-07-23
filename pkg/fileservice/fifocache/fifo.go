@@ -16,8 +16,11 @@ package fifocache
 
 import (
 	"context"
+	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
 )
@@ -38,6 +41,16 @@ type Cache[K comparable, V any] struct {
 
 	small Queue[*_CacheItem[K, V]]
 	main  Queue[*_CacheItem[K, V]]
+
+	itemchan chan CacheChanItem[K, V]
+	once     sync.Once
+	sigc     chan os.Signal
+	wg       sync.WaitGroup
+}
+
+type CacheChanItem[K comparable, V any] struct {
+	ctx  context.Context
+	item *_CacheItem[K, V]
 }
 
 type _CacheItem[K comparable, V any] struct {
@@ -227,8 +240,53 @@ func New[K comparable, V any](
 		postGet:   postGet,
 		postEvict: postEvict,
 		htab:      NewCacheMap[K, *_CacheItem[K, V]](keyShardFunc),
+		itemchan:  make(chan CacheChanItem[K, V], 1),
 	}
 	return ret
+}
+
+func (c *Cache[K, V]) Destroy() {
+	close(c.itemchan)
+	c.wg.Wait()
+}
+
+func (c *Cache[K, V]) housekeep() {
+
+	c.sigc = make(chan os.Signal, 3)
+	signal.Notify(c.sigc, syscall.SIGTERM, syscall.SIGINT, os.Interrupt)
+
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		for {
+
+			select {
+			case <-c.sigc:
+				// sig can be syscall.SIGTERM or syscall.SIGINT
+				return
+
+			case it, ok := <-c.itemchan:
+				if !ok {
+					// channel closed
+					return
+				}
+
+				func(it CacheChanItem[K, V]) {
+					if SingleMutexFlag {
+						c.mutex.Lock()
+						defer c.mutex.Unlock()
+					}
+
+					// evict
+					c.evictAll(it.ctx, nil, 0)
+
+					// enqueue
+					c.small.enqueue(it.item, it.item.Size())
+				}(it)
+			}
+		}
+	}()
+
 }
 
 func (c *Cache[K, V]) Set(ctx context.Context, key K, value V, size int64) {
@@ -253,16 +311,25 @@ func (c *Cache[K, V]) Set(ctx context.Context, key K, value V, size int64) {
 		return
 	}
 
-	if SingleMutexFlag {
-		c.mutex.Lock()
-		defer c.mutex.Unlock()
-	}
+	c.once.Do(func() { c.housekeep() })
 
-	// evict
-	c.evictAll(ctx, nil, 0)
+	c.itemchan <- CacheChanItem[K, V]{ctx: ctx, item: item}
+	/*
+		go func(it *_CacheItem[K, V]) {
 
-	// enqueue
-	c.small.enqueue(item, item.Size())
+			if SingleMutexFlag {
+				c.mutex.Lock()
+				defer c.mutex.Unlock()
+			}
+
+			// evict
+			c.evictAll(ctx, nil, 0)
+
+			// enqueue
+			c.small.enqueue(it, it.Size())
+
+		}(item)
+	*/
 
 }
 

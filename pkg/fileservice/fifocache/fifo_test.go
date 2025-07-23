@@ -25,6 +25,7 @@ import (
 func TestCacheSetGet(t *testing.T) {
 	ctx := context.Background()
 	cache := New[int, int](fscache.ConstCapacity(8), ShardInt[int], nil, nil, nil)
+	defer cache.Destroy()
 
 	cache.Set(ctx, 1, 1, 1)
 	n, ok := cache.Get(ctx, 1)
@@ -43,6 +44,7 @@ func TestCacheSetGet(t *testing.T) {
 func TestCacheEvict(t *testing.T) {
 	ctx := context.Background()
 	cache := New[int, int](fscache.ConstCapacity(8), ShardInt[int], nil, nil, nil)
+	defer cache.Destroy()
 	for i := 0; i < 64; i++ {
 		cache.Set(ctx, i, i, 1)
 		if cache.Used() > cache.capacity() {
@@ -76,6 +78,9 @@ func TestCacheEvict2(t *testing.T) {
 	v, ok = cache.Get(ctx, 4)
 	assert.True(t, ok)
 	assert.Equal(t, 4, v)
+
+	cache.Destroy()
+
 	assert.Equal(t, int64(4), cache.small.Used())
 	assert.Equal(t, int64(0), cache.main.Used())
 }
@@ -109,6 +114,9 @@ func TestCacheEvict3(t *testing.T) {
 		cache.Set(ctx, 10000+i, true, 1)
 		assert.True(t, cache.Used() <= 1024)
 	}
+
+	cache.Destroy()
+
 	assert.Equal(t, int64(102), cache.small.Used())
 	assert.Equal(t, int64(922), cache.main.Used())
 	assert.Equal(t, 1024, nEvict)
@@ -126,6 +134,7 @@ func TestDoubleFree(t *testing.T) {
 			evicts[key]++
 		},
 	)
+	defer cache.Destroy()
 	// set
 	cache.Set(t.Context(), 1, 1, 1)
 	// delete, item still in queue
