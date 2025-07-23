@@ -253,10 +253,8 @@ func (c *Cache[K, V]) Set(ctx context.Context, key K, value V, size int64) {
 		return
 	}
 
-	if SingleMutexFlag {
-		c.mutex.Lock()
-		defer c.mutex.Unlock()
-	}
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 
 	// evict
 	c.evictAll(ctx, nil, 0)
@@ -309,10 +307,8 @@ func (c *Cache[K, V]) Delete(ctx context.Context, key K) {
 }
 
 func (c *Cache[K, V]) Evict(ctx context.Context, done chan int64, capacityCut int64) {
-	if SingleMutexFlag {
-		c.mutex.Lock()
-		defer c.mutex.Unlock()
-	}
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	target := c.evictAll(ctx, done, capacityCut)
 	if done != nil {
 		done <- target
@@ -321,19 +317,15 @@ func (c *Cache[K, V]) Evict(ctx context.Context, done chan int64, capacityCut in
 
 // ForceEvict evicts n bytes despite capacity
 func (c *Cache[K, V]) ForceEvict(ctx context.Context, n int64) {
-	if SingleMutexFlag {
-		c.mutex.Lock()
-		defer c.mutex.Unlock()
-	}
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	capacityCut := c.capacity() - c.small.Used() + c.main.Used() + n
 	c.evictAll(ctx, nil, capacityCut)
 }
 
 func (c *Cache[K, V]) Used() int64 {
-	if SingleMutexFlag {
-		c.mutex.Lock()
-		defer c.mutex.Unlock()
-	}
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	return c.small.Used() + c.main.Used()
 }
 
