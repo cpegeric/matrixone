@@ -315,20 +315,18 @@ func (c *Cache[K, V]) Set(ctx context.Context, key K, value V, size int64) {
 
 	c.itemchan <- CacheChanItem[K, V]{ctx: ctx, item: item}
 	/*
-		go func(it *_CacheItem[K, V]) {
 
-			if SingleMutexFlag {
-				c.mutex.Lock()
-				defer c.mutex.Unlock()
-			}
+		if SingleMutexFlag {
+			c.mutex.Lock()
+			defer c.mutex.Unlock()
+		}
 
-			// evict
-			c.evictAll(ctx, nil, 0)
+		// evict
+		c.evictAll(ctx, nil, 0)
 
-			// enqueue
-			c.small.enqueue(it, it.Size())
+		// enqueue
+		c.small.enqueue(it, it.Size())
 
-		}(item)
 	*/
 
 }

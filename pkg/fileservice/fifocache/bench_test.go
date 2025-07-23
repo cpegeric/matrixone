@@ -27,6 +27,7 @@ func BenchmarkSequentialSet(b *testing.B) {
 	ctx := context.Background()
 	size := 65536
 	cache := New[int, int](fscache.ConstCapacity(int64(size)), ShardInt[int], nil, nil, nil)
+	defer cache.Destroy()
 	nElements := size * 16
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -38,6 +39,7 @@ func BenchmarkParallelSet(b *testing.B) {
 	ctx := context.Background()
 	size := 65536
 	cache := New[int, int](fscache.ConstCapacity(int64(size)), ShardInt[int], nil, nil, nil)
+	defer cache.Destroy()
 	nElements := size * 16
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -51,6 +53,7 @@ func BenchmarkGet(b *testing.B) {
 	ctx := context.Background()
 	size := 65536
 	cache := New[int, int](fscache.ConstCapacity(int64(size)), ShardInt[int], nil, nil, nil)
+	defer cache.Destroy()
 	nElements := size * 16
 	for i := 0; i < nElements; i++ {
 		cache.Set(ctx, i, i, int64(1+i%3))
@@ -65,6 +68,7 @@ func BenchmarkParallelGet(b *testing.B) {
 	ctx := context.Background()
 	size := 65536
 	cache := New[int, int](fscache.ConstCapacity(int64(size)), ShardInt[int], nil, nil, nil)
+	defer cache.Destroy()
 	nElements := size * 16
 	for i := 0; i < nElements; i++ {
 		cache.Set(ctx, i, i, int64(1+i%3))
@@ -81,6 +85,7 @@ func BenchmarkParallelGetOrSet(b *testing.B) {
 	ctx := context.Background()
 	size := 65536
 	cache := New[int, int](fscache.ConstCapacity(int64(size)), ShardInt[int], nil, nil, nil)
+	defer cache.Destroy()
 	nElements := size * 16
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -98,6 +103,7 @@ func BenchmarkParallelEvict(b *testing.B) {
 	ctx := context.Background()
 	size := 65536
 	cache := New[int, int](fscache.ConstCapacity(int64(size)), ShardInt[int], nil, nil, nil)
+	defer cache.Destroy()
 	nElements := size * 16
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
