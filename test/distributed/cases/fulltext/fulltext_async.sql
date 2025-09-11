@@ -18,4 +18,8 @@ select sleep(45);
 
 select * from src where match(body, title) against('red');
 
+delete from src where id = 0;
+
+select sleep(10);
+select * from src where match(body, title) against('red');
 drop table src;
