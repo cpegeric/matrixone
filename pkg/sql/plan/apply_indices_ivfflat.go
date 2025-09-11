@@ -15,8 +15,10 @@
 package plan
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/gob"
 
+	"github.com/bytedance/sonic"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
@@ -64,13 +66,12 @@ func (builder *QueryBuilder) checkValidIvfflatDistFn(nodeID int32, projNode, sor
 
 	idxdef := multiTableIndex.IndexDefs[catalog.SystemSI_IVFFLAT_TblType_Metadata]
 
-	params, err := catalog.IndexParamsStringToMap(idxdef.IndexAlgoParams)
+	val, err := sonic.Get([]byte(idxdef.IndexAlgoParams), catalog.IndexAlgoParamOpType)
 	if err != nil {
 		return false
 	}
-
-	optype, ok := params[catalog.IndexAlgoParamOpType]
-	if !ok {
+	optype, err := val.StrictString()
+	if err != nil {
 		return false
 	}
 
@@ -152,11 +153,17 @@ func (builder *QueryBuilder) applyIndicesForSortUsingIvfflat(nodeID int32, projN
 		KeyPart:       keypart,
 		KeyPartType:   partType.Id}
 
-	cfgbytes, err := json.Marshal(tblcfg)
+	var cfgbytes bytes.Buffer
+	enc := gob.NewEncoder(&cfgbytes)
 	if err != nil {
 		return nodeID, err
 	}
-	tblcfgstr := string(cfgbytes)
+	err = enc.Encode(&tblcfg)
+	if err != nil {
+		return nodeID, err
+	}
+
+	tblcfgstr := string(cfgbytes.Bytes())
 
 	var childNode *plan.Node
 	orderExpr := sortNode.OrderBy[0].Expr

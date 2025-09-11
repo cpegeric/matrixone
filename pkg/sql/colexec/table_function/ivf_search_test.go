@@ -15,6 +15,8 @@
 package table_function
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"os"
 	"testing"
@@ -270,7 +272,23 @@ func TestIvfSearchIndexTableConfigFail(t *testing.T) {
 
 func makeConstInputExprsIvfSearch() []*plan.Expr {
 
-	tblcfg := fmt.Sprintf(`{"db":"db", "src":"src", "metadata":"__metadata", "index":"__index", "entries":"__entries", "parttype": %d}`, int32(types.T_array_float32))
+	tblcfg := vectorindex.IndexTableConfig{
+		DbName:        "db",
+		SrcTable:      "src",
+		MetadataTable: "__metadata",
+		IndexTable:    "__index",
+		EntriesTable:  "__entries",
+		KeyPartType:   int32(types.T_array_float32),
+	}
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+
+	if err := enc.Encode(tblcfg); err != nil {
+		return nil
+	}
+
+	//tblcfg := fmt.Sprintf(`{"db":"db", "src":"src", "metadata":"__metadata", "index":"__index", "entries":"__entries", "parttype": %d}`, int32(types.T_array_float32))
 	ret := []*plan.Expr{
 		{
 			Typ: plan.Type{
@@ -280,7 +298,7 @@ func makeConstInputExprsIvfSearch() []*plan.Expr {
 			Expr: &plan.Expr_Lit{
 				Lit: &plan.Literal{
 					Value: &plan.Literal_Sval{
-						Sval: tblcfg,
+						Sval: string(buf.Bytes()),
 					},
 				},
 			},
@@ -298,8 +316,24 @@ func makeBatchIvfSearch(proc *process.Process) *batch.Batch {
 	bat.Vecs[0] = vector.NewVec(types.New(types.T_varchar, 128, 0))     // index table config
 	bat.Vecs[1] = vector.NewVec(types.New(types.T_array_float32, 3, 0)) // float32 array [3]float32
 
-	tblcfg := fmt.Sprintf(`{"db":"db", "src":"src", "metadata":"__metadata", "index":"__index", "entries":"__entries", "parttype": %d}`, int32(types.T_array_float32))
-	vector.AppendBytes(bat.Vecs[0], []byte(tblcfg), false, proc.Mp())
+	tblcfg := vectorindex.IndexTableConfig{
+		DbName:        "db",
+		SrcTable:      "src",
+		MetadataTable: "__metadata",
+		IndexTable:    "__index",
+		EntriesTable:  "__entries",
+		KeyPartType:   int32(types.T_array_float32),
+	}
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+
+	if err := enc.Encode(tblcfg); err != nil {
+		return nil
+	}
+
+	//tblcfg := fmt.Sprintf(`{"db":"db", "src":"src", "metadata":"__metadata", "index":"__index", "entries":"__entries", "parttype": %d}`, int32(types.T_array_float32))
+	vector.AppendBytes(bat.Vecs[0], buf.Bytes(), false, proc.Mp())
 
 	v := []float32{0, 1, 2}
 	vector.AppendArray[float32](bat.Vecs[1], v, false, proc.Mp())
@@ -314,7 +348,8 @@ func makeBatchIvfSearchFail(proc *process.Process) []failBatch {
 	failBatches := make([]failBatch, 0, 3)
 
 	{
-		tblcfg := ``
+		tblcfg := ""
+
 		ret := []*plan.Expr{
 			{
 				Typ: plan.Type{
@@ -384,7 +419,21 @@ func makeBatchIvfSearchFail(proc *process.Process) []failBatch {
 
 	}
 	{
-		tblcfg := `{"db":"db", "src":"src", "metadata":"__metadata", "index":"__index"}`
+
+		tblcfg := vectorindex.IndexTableConfig{
+			DbName:        "db",
+			SrcTable:      "src",
+			MetadataTable: "__metadata",
+			IndexTable:    "__index",
+		}
+
+		var buf bytes.Buffer
+		enc := gob.NewEncoder(&buf)
+
+		if err := enc.Encode(tblcfg); err != nil {
+			return nil
+		}
+
 		ret := []*plan.Expr{
 			{
 				Typ: plan.Type{
@@ -394,7 +443,7 @@ func makeBatchIvfSearchFail(proc *process.Process) []failBatch {
 				Expr: &plan.Expr_Lit{
 					Lit: &plan.Literal{
 						Value: &plan.Literal_Sval{
-							Sval: tblcfg,
+							Sval: string(buf.Bytes()),
 						},
 					},
 				},
@@ -419,7 +468,7 @@ func makeBatchIvfSearchFail(proc *process.Process) []failBatch {
 		bat.Vecs[0] = vector.NewVec(types.New(types.T_varchar, 128, 0)) // index table config
 		bat.Vecs[1] = vector.NewVec(types.New(types.T_int64, 8, 0))     // pkid int64
 
-		vector.AppendBytes(bat.Vecs[0], []byte(tblcfg), false, proc.Mp())
+		vector.AppendBytes(bat.Vecs[0], buf.Bytes(), false, proc.Mp())
 		vector.AppendFixed[int64](bat.Vecs[1], int64(1), false, proc.Mp())
 
 		bat.SetRowCount(1)

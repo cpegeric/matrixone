@@ -15,6 +15,8 @@
 package table_function
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"os"
 	"testing"
@@ -258,7 +260,19 @@ func TestHnswSearchIndexTableConfigFail(t *testing.T) {
 
 func makeConstInputExprsHnswSearch() []*plan.Expr {
 
-	tblcfg := `{"db":"db", "src":"src", "metadata":"__metadata", "index":"__index"}`
+	tblcfg := vectorindex.IndexTableConfig{
+		DbName:        "db",
+		SrcTable:      "src",
+		MetadataTable: "__metadata",
+		IndexTable:    "__index",
+	}
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+
+	if err := enc.Encode(tblcfg); err != nil {
+		return nil
+	}
 	ret := []*plan.Expr{
 		{
 			Typ: plan.Type{
@@ -268,7 +282,7 @@ func makeConstInputExprsHnswSearch() []*plan.Expr {
 			Expr: &plan.Expr_Lit{
 				Lit: &plan.Literal{
 					Value: &plan.Literal_Sval{
-						Sval: tblcfg,
+						Sval: string(buf.Bytes()),
 					},
 				},
 			},
@@ -286,8 +300,21 @@ func makeBatchHnswSearch(proc *process.Process) *batch.Batch {
 	bat.Vecs[0] = vector.NewVec(types.New(types.T_varchar, 128, 0))     // index table config
 	bat.Vecs[1] = vector.NewVec(types.New(types.T_array_float32, 3, 0)) // float32 array [3]float32
 
-	tblcfg := `{"db":"db", "src":"src", "metadata":"__metadata", "index":"__index"}`
-	vector.AppendBytes(bat.Vecs[0], []byte(tblcfg), false, proc.Mp())
+	tblcfg := vectorindex.IndexTableConfig{
+		DbName:        "db",
+		SrcTable:      "src",
+		MetadataTable: "__metadata",
+		IndexTable:    "__index",
+	}
+
+	var buf bytes.Buffer
+	enc := gob.NewEncoder(&buf)
+
+	if err := enc.Encode(tblcfg); err != nil {
+		return nil
+	}
+
+	vector.AppendBytes(bat.Vecs[0], buf.Bytes(), false, proc.Mp())
 
 	v := []float32{0, 1, 2}
 	vector.AppendArray[float32](bat.Vecs[1], v, false, proc.Mp())
@@ -302,6 +329,7 @@ func makeBatchHnswSearchFail(proc *process.Process) []failBatch {
 	failBatches := make([]failBatch, 0, 3)
 
 	{
+
 		tblcfg := ``
 		ret := []*plan.Expr{
 			{
@@ -326,7 +354,7 @@ func makeBatchHnswSearchFail(proc *process.Process) []failBatch {
 		bat.Vecs[0] = vector.NewVec(types.New(types.T_varchar, 128, 0))     // index table config
 		bat.Vecs[1] = vector.NewVec(types.New(types.T_array_float32, 3, 0)) // float32 array [3]float32
 
-		vector.AppendBytes(bat.Vecs[0], []byte(tblcfg), false, proc.Mp())
+		vector.AppendBytes(bat.Vecs[0], []byte(tblcfg), false, proc.Mp()) // empty config
 
 		v := []float32{0, 1, 2}
 		vector.AppendArray[float32](bat.Vecs[1], v, false, proc.Mp())
@@ -372,7 +400,20 @@ func makeBatchHnswSearchFail(proc *process.Process) []failBatch {
 
 	}
 	{
-		tblcfg := `{"db":"db", "src":"src", "metadata":"__metadata", "index":"__index"}`
+		tblcfg := vectorindex.IndexTableConfig{
+			DbName:        "db",
+			SrcTable:      "src",
+			MetadataTable: "__metadata",
+			IndexTable:    "__index",
+		}
+
+		var buf bytes.Buffer
+		enc := gob.NewEncoder(&buf)
+
+		if err := enc.Encode(tblcfg); err != nil {
+			return nil
+		}
+
 		ret := []*plan.Expr{
 			{
 				Typ: plan.Type{
@@ -382,7 +423,7 @@ func makeBatchHnswSearchFail(proc *process.Process) []failBatch {
 				Expr: &plan.Expr_Lit{
 					Lit: &plan.Literal{
 						Value: &plan.Literal_Sval{
-							Sval: tblcfg,
+							Sval: string(buf.Bytes()),
 						},
 					},
 				},
@@ -407,7 +448,7 @@ func makeBatchHnswSearchFail(proc *process.Process) []failBatch {
 		bat.Vecs[0] = vector.NewVec(types.New(types.T_varchar, 128, 0)) // index table config
 		bat.Vecs[1] = vector.NewVec(types.New(types.T_int64, 8, 0))     // pkid int64
 
-		vector.AppendBytes(bat.Vecs[0], []byte(tblcfg), false, proc.Mp())
+		vector.AppendBytes(bat.Vecs[0], buf.Bytes(), false, proc.Mp())
 		vector.AppendFixed[int64](bat.Vecs[1], int64(1), false, proc.Mp())
 
 		bat.SetRowCount(1)

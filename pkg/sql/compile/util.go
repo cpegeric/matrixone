@@ -17,11 +17,11 @@ package compile
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
@@ -586,7 +586,7 @@ func genBuildHnswIndex(proc *process.Process, indexDefs map[string]*plan.IndexDe
 
 	params := idxdef_index.IndexAlgoParams
 
-	cfgbytes, err := json.Marshal(cfg)
+	cfgbytes, err := sonic.Marshal(cfg)
 	if err != nil {
 		return nil, err
 	}

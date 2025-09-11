@@ -15,10 +15,12 @@
 package table_function
 
 import (
-	"encoding/json"
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"strconv"
 
+	"github.com/bytedance/sonic"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
@@ -122,7 +124,7 @@ func (u *hnswSearchState) start(tf *TableFunction, proc *process.Process, nthRow
 
 	if !u.inited {
 		if len(tf.Params) > 0 {
-			err = json.Unmarshal([]byte(tf.Params), &u.param)
+			err = sonic.Unmarshal([]byte(tf.Params), &u.param)
 			if err != nil {
 				return err
 			}
@@ -179,8 +181,11 @@ func (u *hnswSearchState) start(tf *TableFunction, proc *process.Process, nthRow
 		if len(cfgstr) == 0 {
 			return moerr.NewInternalError(proc.Ctx, "IndexTableConfig is empty")
 		}
-		err := json.Unmarshal([]byte(cfgstr), &u.tblcfg)
-		if err != nil {
+
+		// use gob here for search
+		buf := bytes.NewBuffer([]byte(cfgstr))
+		dec := gob.NewDecoder(buf)
+		if err := dec.Decode(&u.tblcfg); err != nil {
 			return err
 		}
 

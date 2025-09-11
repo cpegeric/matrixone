@@ -21,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/bytedance/sonic"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
@@ -194,7 +195,7 @@ func (u *ivfCreateState) start(tf *TableFunction, proc *process.Process, nthRow 
 
 	if !u.inited {
 		if len(tf.Params) > 0 {
-			err = json.Unmarshal([]byte(tf.Params), &u.param)
+			err = sonic.Unmarshal([]byte(tf.Params), &u.param)
 			if err != nil {
 				return err
 			}

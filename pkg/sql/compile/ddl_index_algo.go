@@ -15,11 +15,11 @@
 package compile
 
 import (
-	"encoding/json"
 	"fmt"
 	"slices"
 	"strconv"
 
+	"github.com/bytedance/sonic"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
@@ -282,7 +282,7 @@ func (s *Scope) handleIvfIndexCentroidsTable(c *Compile, indexDef *plan.IndexDef
 
 	params_str := indexDef.IndexAlgoParams
 
-	cfgbytes, err := json.Marshal(cfg)
+	cfgbytes, err := sonic.Marshal(cfg)
 	if err != nil {
 		return err
 	}
