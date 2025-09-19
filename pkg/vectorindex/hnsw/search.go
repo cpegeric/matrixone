@@ -18,12 +18,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
-	"github.com/detailyang/go-fallocate"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/util/executor"
@@ -46,6 +44,7 @@ type HnswSearchIndex struct {
 	Timestamp int64
 	Checksum  string
 	Filesize  int64
+	buffer    []byte
 }
 
 // This is the HNSW search implementation that implement VectorIndexSearchIf interface
@@ -59,14 +58,19 @@ type HnswSearch struct {
 	ThreadsSearch int64
 }
 
+func (idx *HnswSearchIndex) Destroy() {
+	if idx.Index != nil {
+		idx.Index.Destroy()
+	}
+	idx.buffer = nil
+}
+
 // load chunk from database
-func (idx *HnswSearchIndex) loadChunk(
-	ctx context.Context,
+func (idx *HnswSearchIndex) loadChunkFromBuffer(ctx context.Context,
 	proc *process.Process,
 	stream_chan chan executor.Result,
 	error_chan chan error,
-	fp *os.File,
-) (stream_closed bool, err error) {
+	buffer []byte) (stream_closed bool, err error) {
 	var res executor.Result
 	var ok bool
 
@@ -90,133 +94,114 @@ func (idx *HnswSearchIndex) loadChunk(
 	for i, chunkId := range chunkIds {
 		data := bat.Vecs[1].GetRawBytesAt(i)
 		offset := chunkId * vectorindex.MaxChunkSize
-
-		if _, err = fp.Seek(offset, io.SeekStart); err != nil {
-			return false, err
-		}
-
-		if _, err = fp.Write(data); err != nil {
-			return false, err
-		}
+		copy(buffer[offset:], data)
 	}
 	return false, nil
 }
 
-// load index from database
-// TODO: loading file is tricky.
-// 1. we need to know the size of the file.
-// 2. Write Zero to file to have a pre-allocated size
-// 3. SELECT chunk_id, data from index_table WHERE index_id = id.  Result will be out of order
-// 4. according to the chunk_id, seek to the offset and write the chunk
-// 5. check the checksum to verify the correctness of the file
-func (idx *HnswSearchIndex) LoadIndex(
+func (idx *HnswSearchIndex) LoadIndexFromBuffer(
 	proc *process.Process,
 	idxcfg vectorindex.IndexConfig,
 	tblcfg vectorindex.IndexTableConfig,
-	nthread int64,
-) (err error) {
+	nthread int64) (err error) {
 
 	var (
-		fp          *os.File
 		stream_chan = make(chan executor.Result, 2)
 		error_chan  = make(chan error)
 	)
 
-	// create tempfile for writing
-	if fp, err = os.CreateTemp("", "hnswindx"); err != nil {
-		return
+	if idx.Index != nil {
+		// index already loaded. ignore
+		return nil
 	}
-	fname := fp.Name()
-	defer func() {
-		if fp != nil {
-			fp.Close()
-			fp = nil
+
+	if idx.buffer == nil {
+		// model buffer is nil
+
+		idx.buffer = make([]byte, idx.Filesize)
+		defer func() {
+			if err != nil {
+				// release buffer when error
+				idx.Destroy()
+			}
+		}()
+
+		// run streaming sql
+		sql := fmt.Sprintf("SELECT chunk_id, data from `%s`.`%s` WHERE index_id = '%s'", tblcfg.DbName, tblcfg.IndexTable, idx.Id)
+
+		ctx, cancel := context.WithCancelCause(proc.GetTopContext())
+		defer cancel(nil)
+
+		go func() {
+			_, err2 := runSql_streaming(ctx, proc, sql, stream_chan, error_chan)
+			if err2 != nil {
+				error_chan <- err2
+				return
+			}
+		}()
+
+		// incremental load from database
+		sql_closed := false
+		for !sql_closed {
+			sql_closed, err = idx.loadChunkFromBuffer(ctx, proc, stream_chan, error_chan, idx.buffer)
+			if err != nil {
+				// notify the producer to stop the sql streaming
+				cancel(err)
+				break
+			}
 		}
-		os.Remove(fname)
-	}()
 
-	if err = fallocate.Fallocate(fp, 0, idx.Filesize); err != nil {
-		return
-	}
+		// wait for the sql streaming to be closed. make sure all the remaining
+		// results in stream_chan are closed.
+		if !sql_closed {
+			for res := range stream_chan {
+				res.Close()
+			}
+		}
 
-	// run streaming sql
-	sql := fmt.Sprintf(
-		"SELECT chunk_id, data from `%s`.`%s` WHERE index_id = '%s'",
-		tblcfg.DbName, tblcfg.IndexTable, idx.Id,
-	)
+		if err == nil {
+			// fetch potential remaining errors from error_chan
+			select {
+			case err = <-error_chan:
+			default:
+			}
+		}
 
-	ctx, cancel := context.WithCancelCause(proc.GetTopContext())
-	defer cancel(nil)
-
-	go func() {
-		if _, err2 := runSql_streaming(
-			ctx, proc, sql, stream_chan, error_chan,
-		); err2 != nil {
-			error_chan <- err2
+		if err != nil {
 			return
 		}
-	}()
 
-	// incremental load from database
-	sql_closed := false
-	for !sql_closed {
-		if sql_closed, err = idx.loadChunk(
-			ctx, proc, stream_chan, error_chan, fp,
-		); err != nil {
-			// notify the producer to stop the sql streaming
-			cancel(err)
-			break
-		}
 	}
 
-	// wait for the sql streaming to be closed. make sure all the remaining
-	// results in stream_chan are closed.
-	if !sql_closed {
-		for res := range stream_chan {
-			res.Close()
-		}
-	}
-
-	if err == nil {
-		// fetch potential remaining errors from error_chan
-		select {
-		case err = <-error_chan:
-		default:
-		}
-	}
-
-	if err != nil {
-		return
-	}
-
-	fp.Close()
-	fp = nil
-
-	// check checksum
-	var chksum string
-	if chksum, err = vectorindex.CheckSum(fname); err != nil {
-		return
-	}
+	chksum := vectorindex.CheckSumFromBuffer(idx.buffer)
 	if chksum != idx.Checksum {
-		return moerr.NewInternalError(ctx, "Checksum mismatch with the index file")
+		return moerr.NewInternalError(proc.Ctx, "Checksum mismatch with the index file")
 	}
 
-	var usearchidx *usearch.Index
-	if usearchidx, err = usearch.NewIndex(idxcfg.Usearch); err != nil {
-		return
+	usearchidx, err := usearch.NewIndex(idxcfg.Usearch)
+	if err != nil {
+		return err
 	}
 
-	if err = usearchidx.ChangeThreadsSearch(uint(nthread)); err != nil {
-		return
+	err = usearchidx.ChangeThreadsSearch(uint(nthread))
+	if err != nil {
+		return err
 	}
 
-	if err = usearchidx.Load(fname); err != nil {
-		return
+	err = usearchidx.ChangeThreadsAdd(uint(nthread))
+	if err != nil {
+		return err
+	}
+
+	err = usearchidx.ViewBuffer(idx.buffer, uint(idx.Filesize))
+	if err != nil {
+		return err
 	}
 
 	idx.Index = usearchidx
+	runtime.KeepAlive(idx.buffer)
 
-	return
+	return nil
 }
 
 // Call usearch.Search
@@ -345,7 +330,7 @@ func (s *HnswSearch) Contains(key int64) (bool, error) {
 func (s *HnswSearch) Destroy() {
 	// destroy index
 	for _, idx := range s.Indexes {
-		idx.Index.Destroy()
+		idx.Destroy()
 	}
 	s.Indexes = nil
 }
@@ -390,7 +375,7 @@ func (s *HnswSearch) LoadIndex(
 	proc *process.Process, indexes []*HnswSearchIndex,
 ) ([]*HnswSearchIndex, error) {
 	for _, idx := range indexes {
-		if err := idx.LoadIndex(
+		if err := idx.LoadIndexFromBuffer(
 			proc, s.Idxcfg, s.Tblcfg, s.ThreadsSearch,
 		); err != nil {
 			return nil, err
