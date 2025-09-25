@@ -163,8 +163,16 @@ func (s *Scope) AlterTableCopy(c *Compile) error {
 
 	//5. ISCP: temp table already created pitr and iscp job with temp table name
 	// and we don't want iscp to run with temp table so drop pitr and iscp job with the temp table here
-	//newTmpTableDef := newRel.CopyTableDef(c.proc.Ctx)
-	//DropAllIndexCdcTasks(c, newTmpTableDef, dbName, qry.CopyTableDef.Name)
+	newTmpTableDef := newRel.CopyTableDef(c.proc.Ctx)
+	err = DropAllIndexCdcTasks(c, newTmpTableDef, dbName, qry.CopyTableDef.Name)
+	if err != nil {
+		c.proc.Error(c.proc.Ctx, "drop all iscp job for alter table",
+			zap.String("databaseName", dbName),
+			zap.String("origin tableName", qry.GetTableDef().Name),
+			zap.String("copy tableName", qry.CopyTableDef.Name),
+			zap.Error(err))
+		return err
+	}
 
 	// 6. copy the original table data to the temporary replica table
 	err = c.runSqlWithOptions(qry.InsertTmpDataSql, opt)
@@ -221,6 +229,17 @@ func (s *Scope) AlterTableCopy(c *Compile) error {
 		c.proc.Error(c.proc.Ctx, "Rename copy tableName to origin tableName in for alter table",
 			zap.String("origin tableName", qry.GetTableDef().Name),
 			zap.String("copy table name", qry.CopyTableDef.Name),
+			zap.Error(err))
+		return err
+	}
+
+	// 9. register ISCP job
+	err = CreateAllIndexCdcTasks(c, newTmpTableDef.Indexes, dbName, tblName)
+	if err != nil {
+		c.proc.Error(c.proc.Ctx, "create all iscp job for alter table",
+			zap.String("databaseName", dbName),
+			zap.String("origin tableName", qry.GetTableDef().Name),
+			zap.String("copy tableName", qry.CopyTableDef.Name),
 			zap.Error(err))
 		return err
 	}
