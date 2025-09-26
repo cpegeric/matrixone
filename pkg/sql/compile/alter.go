@@ -17,9 +17,11 @@ package compile
 import (
 	"context"
 	"fmt"
+	"os"
+	"slices"
+
 	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/table_clone"
-	"slices"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -589,16 +591,19 @@ func cowUnaffectedIndexes(
 		releaseClone()
 	}()
 
+	os.Stderr.WriteString(fmt.Sprintf("affected cols %v\n", affectedCols))
 	for _, idxTbl := range oriTblDef.Indexes {
 		if slices.Index(affectedCols, idxTbl.IndexName) != -1 {
 			continue
 		}
 
+		os.Stderr.WriteString(fmt.Sprintf("org index %s part %v\n", idxTbl.IndexName, idxTbl.Parts))
 		oriIdxColNameToTblName[idxTbl.IndexName] = idxTbl.IndexTableName
 	}
 
 	for _, idxTbl := range newTblDef.Indexes {
 		newIdxTColNameToTblName[idxTbl.IndexName] = idxTbl.IndexTableName
+		os.Stderr.WriteString(fmt.Sprintf("new index %s part %v\n", idxTbl.IndexName, idxTbl.Parts))
 	}
 
 	cctx := compilerContext{
@@ -624,6 +629,8 @@ func cowUnaffectedIndexes(
 			DstDatabaseName: dbName,
 			DstTableName:    newIdxTblName,
 		}
+
+		os.Stderr.WriteString(fmt.Sprintf("clone %v -> %v\n", oriIdxTblName, newIdxTblName))
 
 		if clone, err = constructTableClone(c, &clonePlan); err != nil {
 			return err
