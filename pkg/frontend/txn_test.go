@@ -931,7 +931,7 @@ func (txnop *testTxnOp) GetWorkspace() client.Workspace {
 	return txnop.wp
 }
 
-func (txnop *testTxnOp) AppendEventCallback(event client.EventType, callbacks ...client.TxnEventCallback) {
+func (txnop *testTxnOp) AppendEventCallback(event client.EventType, callbacks ...func(client.TxnEvent)) {
 	//TODO implement me
 	panic("implement me")
 }

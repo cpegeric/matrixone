@@ -15,7 +15,6 @@
 package client
 
 import (
-	"context"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
@@ -49,35 +48,31 @@ var (
 
 func (tc *txnOperator) AppendEventCallback(
 	event EventType,
-	callbacks ...TxnEventCallback) {
+	callbacks ...func(TxnEvent)) {
 	tc.mu.Lock()
 	defer tc.mu.Unlock()
 	if tc.mu.closed {
 		panic("append callback on closed txn")
 	}
 	if tc.mu.callbacks == nil {
-		tc.mu.callbacks = make(map[EventType][]TxnEventCallback, 1)
+		tc.mu.callbacks = make(map[EventType][]func(TxnEvent), 1)
 	}
 	tc.mu.callbacks[event] = append(tc.mu.callbacks[event], callbacks...)
 }
 
-func (tc *txnOperator) triggerEvent(ctx context.Context, event TxnEvent) error {
+func (tc *txnOperator) triggerEvent(event TxnEvent) {
 	tc.mu.RLock()
 	defer tc.mu.RUnlock()
-	return tc.triggerEventLocked(ctx, event)
+	tc.triggerEventLocked(event)
 }
 
-func (tc *txnOperator) triggerEventLocked(ctx context.Context, event TxnEvent) (err error) {
+func (tc *txnOperator) triggerEventLocked(event TxnEvent) {
 	if tc.mu.callbacks == nil {
 		return
 	}
 	for _, cb := range tc.mu.callbacks[event.Event] {
-		err = cb.Func(ctx, tc, event, cb.Value)
-		if err != nil {
-			return
-		}
+		cb(event)
 	}
-	return
 }
 
 func newCostEvent(

@@ -181,23 +181,21 @@ func (s *service) Create(
 	if !s.options.disableAppendCreateCallback {
 		txnOp.AppendEventCallback(
 			client.ClosedEvent,
-			client.NewTxnEventCallback(
-				func(ctx context.Context, _txnOp client.TxnOperator, txn client.TxnEvent, v any) error {
-					if txn.Committed() {
-						s.logger.Info("sharding table created",
-							zap.Uint64("table", table),
-							zap.String("committed", txn.Txn.CommitTS.DebugString()),
-						)
+			func(txn client.TxnEvent) {
+				if txn.Committed() {
+					s.logger.Info("sharding table created",
+						zap.Uint64("table", table),
+						zap.String("committed", txn.Txn.CommitTS.DebugString()),
+					)
 
-						// The callback here is not guaranteed to execute after the transaction has
-						// already committed.
-						// The creation will lazy execute in Read.
-						s.createC <- table
-					} else {
-						s.atomic.abort.Add(1)
-					}
-					return nil
-				}),
+					// The callback here is not guaranteed to execute after the transaction has
+					// already committed.
+					// The creation will lazy execute in Read.
+					s.createC <- table
+				} else {
+					s.atomic.abort.Add(1)
+				}
+			},
 		)
 	}
 
@@ -222,15 +220,13 @@ func (s *service) Delete(
 	if !s.options.disableAppendDeleteCallback {
 		txnOp.AppendEventCallback(
 			client.ClosedEvent,
-			client.NewTxnEventCallback(
-				func(ctx context.Context, _txnOp client.TxnOperator, txn client.TxnEvent, v any) error {
-					if txn.Committed() {
-						s.deleteC <- table
-					} else {
-						s.atomic.abort.Add(1)
-					}
-					return nil
-				}),
+			func(txn client.TxnEvent) {
+				if txn.Committed() {
+					s.deleteC <- table
+				} else {
+					s.atomic.abort.Add(1)
+				}
+			},
 		)
 	}
 

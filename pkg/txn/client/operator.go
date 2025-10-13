@@ -235,7 +235,7 @@ type txnOperator struct {
 		txn          txn.TxnMeta
 		cachedWrites map[uint64][]txn.TxnRequest
 		lockTables   []lock.LockTable
-		callbacks    map[EventType][]TxnEventCallback
+		callbacks    map[EventType][]func(TxnEvent)
 		retry        bool
 		lockSeq      uint64
 		waitLocks    map[uint64]Lock
@@ -427,7 +427,6 @@ func (tc *txnOperator) waitActive(ctx context.Context) error {
 	}()
 
 	cost, err := tc.doCostAction(
-		ctx,
 		time.Time{},
 		WaitActiveEvent,
 		func() error {
@@ -527,7 +526,6 @@ func (tc *txnOperator) UpdateSnapshot(
 	}
 
 	_, err := tc.doCostAction(
-		ctx,
 		time.Time{},
 		UpdateSnapshotEvent,
 		func() error {
@@ -601,8 +599,7 @@ func (tc *txnOperator) Read(ctx context.Context, requests []txn.TxnRequest) (*rp
 	}
 
 	requests = tc.maybeInsertCachedWrites(requests, false)
-	result, err := tc.doSend(ctx, requests, false)
-	return tc.trimResponses(tc.handleError(ctx, result, err))
+	return tc.trimResponses(tc.handleError(tc.doSend(ctx, requests, false)))
 }
 
 func (tc *txnOperator) Write(ctx context.Context, requests []txn.TxnRequest) (*rpc.SendResult, error) {
@@ -617,7 +614,6 @@ func (tc *txnOperator) WriteAndCommit(ctx context.Context, requests []txn.TxnReq
 }
 
 func (tc *txnOperator) Commit(ctx context.Context) (err error) {
-
 	if tc.reset.runningSQL.Load() && !tc.markAborted() {
 		tc.logger.Fatal("commit on running txn",
 			zap.String("txnID", hex.EncodeToString(tc.reset.txnID)))
@@ -633,18 +629,11 @@ func (tc *txnOperator) Commit(ctx context.Context) (err error) {
 		tc.reset.commitSeq = tc.NextSequence()
 		tc.reset.commitAt = time.Now()
 
-		err = tc.triggerEvent(ctx, newEvent(CommitEvent, txnMeta, tc.reset.commitSeq, nil))
-		if err != nil {
-			return
-		}
+		tc.triggerEvent(newEvent(CommitEvent, txnMeta, tc.reset.commitSeq, nil))
 		defer func() {
 			cost := time.Since(tc.reset.commitAt)
 			v2.TxnCNCommitDurationHistogram.Observe(cost.Seconds())
-			e := tc.triggerEvent(ctx, newCostEvent(CommitEvent, tc.getTxnMeta(false), tc.reset.commitSeq, err, cost))
-			if e != nil {
-				err = errors.Join(e, err)
-			}
-
+			tc.triggerEvent(newCostEvent(CommitEvent, tc.getTxnMeta(false), tc.reset.commitSeq, err, cost))
 		}()
 	}
 
@@ -652,7 +641,7 @@ func (tc *txnOperator) Commit(ctx context.Context) (err error) {
 		tc.mu.Lock()
 		defer tc.mu.Unlock()
 		tc.mu.txn.Status = txn.TxnStatus_Committed
-		tc.closeLocked(ctx)
+		tc.closeLocked()
 		return
 	}
 
@@ -665,7 +654,6 @@ func (tc *txnOperator) Commit(ctx context.Context) (err error) {
 	if result != nil {
 		result.Release()
 	}
-
 	return
 }
 
@@ -696,15 +684,15 @@ func (tc *txnOperator) Rollback(ctx context.Context) (err error) {
 
 	seq := tc.NextSequence()
 	start := time.Now()
-	tc.triggerEventLocked(ctx, newEvent(RollbackEvent, txnMeta, seq, nil))
+	tc.triggerEventLocked(newEvent(RollbackEvent, txnMeta, seq, nil))
 	defer func() {
 		cost := time.Since(start)
-		tc.triggerEventLocked(ctx, newCostEvent(RollbackEvent, txnMeta, seq, err, cost))
+		tc.triggerEventLocked(newCostEvent(RollbackEvent, txnMeta, seq, err, cost))
 	}()
 
 	defer func() {
 		tc.mu.txn.Status = txn.TxnStatus_Aborted
-		tc.closeLocked(ctx)
+		tc.closeLocked()
 	}()
 
 	if tc.needUnlockLocked() {
@@ -715,12 +703,10 @@ func (tc *txnOperator) Rollback(ctx context.Context) (err error) {
 		return nil
 	}
 
-	sendresult, err := tc.doSend(ctx, []txn.TxnRequest{{
+	result, err := tc.handleError(tc.doSend(ctx, []txn.TxnRequest{{
 		Method:          txn.TxnMethod_Rollback,
 		RollbackRequest: &txn.TxnRollbackRequest{},
-	}}, true)
-
-	result, err := tc.handleError(ctx, sendresult, err)
+	}}, true))
 	if err != nil {
 		if moerr.IsMoErrCode(err, moerr.ErrTxnClosed) {
 			return nil
@@ -805,8 +791,7 @@ func (tc *txnOperator) Debug(ctx context.Context, requests []txn.TxnRequest) (*r
 	}
 
 	requests = tc.maybeInsertCachedWrites(requests, false)
-	result, err := tc.doSend(ctx, requests, false)
-	return tc.trimResponses(tc.handleError(ctx, result, err))
+	return tc.trimResponses(tc.handleError(tc.doSend(ctx, requests, false)))
 }
 
 func (tc *txnOperator) doWrite(ctx context.Context, requests []txn.TxnRequest, commit bool) (*rpc.SendResult, error) {
@@ -828,7 +813,7 @@ func (tc *txnOperator) doWrite(ctx context.Context, requests []txn.TxnRequest, c
 		}
 		tc.mu.Lock()
 		defer func() {
-			tc.closeLocked(ctx)
+			tc.closeLocked()
 			tc.mu.Unlock()
 		}()
 		if tc.mu.closed {
@@ -883,8 +868,7 @@ func (tc *txnOperator) doWrite(ctx context.Context, requests []txn.TxnRequest, c
 		return nil, tc.reset.commitErr
 	}
 
-	result, err := tc.doSend(ctx, requests, commit)
-	resp, err := tc.trimResponses(tc.handleError(ctx, result, err))
+	resp, err := tc.trimResponses(tc.handleError(tc.doSend(ctx, requests, commit)))
 	if err != nil && commit {
 		tc.reset.commitErr = err
 	}
@@ -1056,13 +1040,13 @@ func (tc *txnOperator) doSend(
 	return result, nil
 }
 
-func (tc *txnOperator) handleError(ctx context.Context, result *rpc.SendResult, err error) (*rpc.SendResult, error) {
+func (tc *txnOperator) handleError(result *rpc.SendResult, err error) (*rpc.SendResult, error) {
 	if err != nil {
 		return nil, err
 	}
 
 	for _, resp := range result.Responses {
-		if err := tc.handleErrorResponse(ctx, resp); err != nil {
+		if err := tc.handleErrorResponse(resp); err != nil {
 			result.Release()
 			return nil, err
 		}
@@ -1070,7 +1054,7 @@ func (tc *txnOperator) handleError(ctx context.Context, result *rpc.SendResult, 
 	return result, nil
 }
 
-func (tc *txnOperator) handleErrorResponse(ctx context.Context, resp txn.TxnResponse) error {
+func (tc *txnOperator) handleErrorResponse(resp txn.TxnResponse) error {
 	switch resp.Method {
 	case txn.TxnMethod_Read:
 		if err := tc.checkResponseTxnStatusForReadWrite(resp); err != nil {
@@ -1084,7 +1068,6 @@ func (tc *txnOperator) handleErrorResponse(ctx context.Context, resp txn.TxnResp
 		return tc.checkTxnError(resp.TxnError, writeTxnErrors)
 	case txn.TxnMethod_Commit:
 		tc.triggerEventLocked(
-			ctx,
 			newCostEvent(
 				CommitResponseEvent,
 				tc.mu.txn,
@@ -1248,7 +1231,6 @@ func (tc *txnOperator) unlock(ctx context.Context) {
 	if tc.mu.txn.IsRCIsolation() &&
 		tc.timestampWaiter != nil {
 		cost, err := tc.doCostAction(
-			ctx,
 			time.Time{},
 			CommitWaitApplyEvent,
 			func() error {
@@ -1266,7 +1248,6 @@ func (tc *txnOperator) unlock(ctx context.Context) {
 	}
 
 	_, err := tc.doCostAction(
-		ctx,
 		time.Time{},
 		UnlockEvent,
 		func() error {
@@ -1291,14 +1272,13 @@ func (tc *txnOperator) needUnlockLocked() bool {
 	return tc.lockService != nil
 }
 
-func (tc *txnOperator) closeLocked(ctx context.Context) {
+func (tc *txnOperator) closeLocked() {
 	if !tc.mu.closed {
 		tc.mu.closed = true
 		if tc.reset.commitErr != nil {
 			tc.mu.txn.Status = txn.TxnStatus_Aborted
 		}
 		tc.triggerEventLocked(
-			ctx,
 			TxnEvent{
 				Event: ClosedEvent,
 				Txn:   tc.mu.txn,
@@ -1380,7 +1360,6 @@ func (tc *txnOperator) NextSequence() uint64 {
 }
 
 func (tc *txnOperator) doCostAction(
-	ctx context.Context,
 	startAt time.Time,
 	event EventType,
 	action func() error,
@@ -1396,7 +1375,6 @@ func (tc *txnOperator) doCostAction(
 	}
 
 	tc.triggerEventLocked(
-		ctx,
 		newEvent(
 			event,
 			tc.mu.txn,
@@ -1406,7 +1384,6 @@ func (tc *txnOperator) doCostAction(
 	err := action()
 	cost := time.Since(startAt)
 	tc.triggerEventLocked(
-		ctx,
 		newCostEvent(
 			event,
 			tc.mu.txn,

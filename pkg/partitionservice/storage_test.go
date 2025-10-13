@@ -116,20 +116,18 @@ func (s *memStorage) Create(
 
 	txnOp.AppendEventCallback(
 		client.ClosedEvent,
-		client.NewTxnEventCallback(
-			func(ctx context.Context, txnOp client.TxnOperator, txn client.TxnEvent, cbdata any) error {
-				s.Lock()
-				defer s.Unlock()
+		func(txn client.TxnEvent) {
+			s.Lock()
+			defer s.Unlock()
 
-				v, ok := s.uncommitted[def.TblId]
-				if txn.Committed() {
-					if ok {
-						s.committed[def.TblId] = v
-					}
+			v, ok := s.uncommitted[def.TblId]
+			if txn.Committed() {
+				if ok {
+					s.committed[def.TblId] = v
 				}
-				delete(s.uncommitted, def.TblId)
-				return nil
-			}),
+			}
+			delete(s.uncommitted, def.TblId)
+		},
 	)
 	return nil
 }
@@ -156,17 +154,15 @@ func (s *memStorage) Delete(
 
 	txnOp.AppendEventCallback(
 		client.ClosedEvent,
-		client.NewTxnEventCallback(
-			func(ctx context.Context, txnOp client.TxnOperator, txn client.TxnEvent, v any) error {
-				s.Lock()
-				defer s.Unlock()
+		func(txn client.TxnEvent) {
+			s.Lock()
+			defer s.Unlock()
 
-				delete(s.uncommitted, table)
-				if txn.Committed() {
-					delete(s.committed, table)
-				}
-				return nil
-			}),
+			delete(s.uncommitted, table)
+			if txn.Committed() {
+				delete(s.committed, table)
+			}
+		},
 	)
 	return nil
 }
@@ -184,6 +180,56 @@ func (s *memStorage) addUncommittedTable(
 
 func (s *memStorage) nextTableID() uint64 {
 	return atomic.AddUint64(&s.id, 1)
+}
+
+func (s *memStorage) AddPartitions(
+	ctx context.Context,
+	def *plan.TableDef,
+	metadata partition.PartitionMetadata,
+	partitions []partition.Partition,
+	txnOp client.TxnOperator,
+) error {
+	return nil
+}
+
+func (s *memStorage) DropPartitions(
+	ctx context.Context,
+	def *plan.TableDef,
+	metadata partition.PartitionMetadata,
+	partitions []string,
+	txnOp client.TxnOperator,
+) error {
+	return nil
+}
+
+func (s *memStorage) TruncatePartitions(
+	ctx context.Context,
+	def *plan.TableDef,
+	metadata partition.PartitionMetadata,
+	partitions []string,
+	txnOp client.TxnOperator,
+) error {
+	return nil
+}
+
+func (s *memStorage) Rename(
+	ctx context.Context,
+	def *plan.TableDef,
+	oldName, newName string,
+	metadata partition.PartitionMetadata,
+	txnOp client.TxnOperator,
+) error {
+	return nil
+}
+
+func (s *memStorage) Redefine(
+	ctx context.Context,
+	def *plan.TableDef,
+	options *tree.PartitionOption,
+	metadata partition.PartitionMetadata,
+	txnOp client.TxnOperator,
+) error {
+	return nil
 }
 
 type partitionTable struct {
