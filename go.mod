@@ -103,7 +103,7 @@ require (
 	google.golang.org/grpc v1.65.0
 	google.golang.org/protobuf v1.36.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
-	k8s.io/utils v0.0.0-20230220204549-a5ecb0141aa5
+	k8s.io/utils v0.0.0-20251002143259-bc988d571ff4
 )
 
 require (

@@ -23,7 +23,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/monlp/tokenizer"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
-	"k8s.io/utils/pointer"
+	"k8s.io/utils/ptr"
 )
 
 /*
@@ -172,12 +172,12 @@ func (p *Pattern) EvalLeaf(s *SearchAccum, docvec []uint8, docLen int64, aggcnt 
 
 	if cnt == 0 {
 		// never return nil result
-		result := pointer.Float32(float32(0))
+		result := ptr.To(float32(0))
 		return result, nil
 	}
 
 	if result == nil {
-		result = pointer.Float32(float32(0))
+		result = ptr.To(float32(0))
 	}
 
 	var score float32
@@ -209,12 +209,12 @@ func (p *Pattern) EvalLeaf(s *SearchAccum, docvec []uint8, docLen int64, aggcnt 
 // e.g. (+ (text apple)) (+ (text banana))
 func (p *Pattern) EvalPlusPlus(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result *float32) (*float32, error) {
 	if result == nil {
-		result = pointer.Float32(float32(0))
+		result = ptr.To(float32(0))
 		return result, nil
 	}
 
 	if arg == nil || *arg == 0 {
-		return pointer.Float32(float32(0)), nil
+		return ptr.To(float32(0)), nil
 	}
 
 	if *result > 0 {
@@ -227,7 +227,7 @@ func (p *Pattern) EvalPlusPlus(s *SearchAccum, docvec []uint8, aggcnt []int64, a
 // e.g. (+ (text apple)) (text banana)
 func (p *Pattern) EvalPlusOR(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result *float32) (*float32, error) {
 	if result == nil {
-		result = pointer.Float32(float32(0))
+		result = ptr.To(float32(0))
 		return result, nil
 	}
 
@@ -242,12 +242,12 @@ func (p *Pattern) EvalPlusOR(s *SearchAccum, docvec []uint8, aggcnt []int64, arg
 // e.g. (+ (text apple)) (- (text banana))
 func (p *Pattern) EvalMinus(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result *float32) (*float32, error) {
 	if result == nil {
-		result = pointer.Float32(float32(0))
+		result = ptr.To(float32(0))
 		return result, nil
 	}
 
 	if arg != nil && *arg > 0 {
-		return pointer.Float32(float32(0)), nil
+		return ptr.To(float32(0)), nil
 	}
 
 	return result, nil
@@ -257,7 +257,7 @@ func (p *Pattern) EvalMinus(s *SearchAccum, docvec []uint8, aggcnt []int64, arg,
 // e.g. (text apple) (text banana)
 func (p *Pattern) EvalOR(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result *float32) (*float32, error) {
 	if result == nil {
-		result = pointer.Float32(float32(0))
+		result = ptr.To(float32(0))
 	}
 
 	if arg != nil && *arg > 0 {
@@ -394,7 +394,7 @@ func (p *Pattern) Eval(accum *SearchAccum, docvec []uint8, docLen int64, aggcnt 
 		}
 	case MINUS:
 		if result == nil {
-			result = pointer.Float32(float32(0))
+			result = ptr.To(float32(0))
 			return result, nil
 		} else {
 			child_result, err := p.Children[0].Eval(accum, docvec, docLen, aggcnt, weight, nil)
@@ -439,7 +439,7 @@ func (p *Pattern) Eval(accum *SearchAccum, docvec []uint8, docLen int64, aggcnt 
 			}
 		}
 	case GROUP:
-		result := pointer.Float32(float32(0))
+		result := ptr.To(float32(0))
 		for _, c := range p.Children {
 			child_result, err := c.Eval(accum, docvec, docLen, aggcnt, weight, nil)
 			if err != nil {

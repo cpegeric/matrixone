@@ -21,7 +21,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"k8s.io/utils/pointer"
 )
 
 type TestCase struct {
@@ -1060,8 +1059,8 @@ func TestFullTextPhrase(t *testing.T) {
 func TestFullTextCombine(t *testing.T) {
 	p := &Pattern{}
 
-	s1 := pointer.Float32(float32(1))
-	s2 := pointer.Float32(float32(2))
+	s1 := ptr.To(float32(1))
+	s2 := ptr.To(float32(2))
 
 	result, err := p.Combine(nil, nil, nil, s1, s2)
 	require.Nil(t, err)
