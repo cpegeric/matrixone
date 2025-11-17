@@ -335,8 +335,8 @@ func evaluate(u *fulltextState, proc *process.Process, s *fulltext.SearchAccum) 
 
 		keys = append(keys, doc_id)
 
-		if len(score) > 0 {
-			scoremap[doc_id] = score[0]
+		if score != nil && *score > 0 {
+			scoremap[doc_id] = *score
 		}
 
 		if len(scoremap) >= 8192 {
@@ -374,8 +374,8 @@ func sort_topk(u *fulltextState, proc *process.Process, s *fulltext.SearchAccum,
 			return err
 		}
 
-		if len(score) > 0 {
-			scoref64 := float64(score[0])
+		if score != nil && *score > 0 {
+			scoref64 := float64(*score)
 			if len(u.minheap) >= int(limit) {
 				if u.minheap[0].GetDistance() < scoref64 {
 					u.minheap[0] = &vectorindex.SearchResultAnyKey{Id: doc_id, Distance: scoref64}

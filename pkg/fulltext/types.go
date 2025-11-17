@@ -14,7 +14,9 @@
 
 package fulltext
 
-import "strings"
+import (
+	"strings"
+)
 
 const BM25_K1 = 1.5
 const BM25_B = 0.75

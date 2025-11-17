@@ -23,6 +23,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/monlp/tokenizer"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
+	"k8s.io/utils/pointer"
 )
 
 /*
@@ -92,8 +93,8 @@ func (s *SearchAccum) PatternAnyPlus() bool {
 }
 
 // Evaluate the search string
-func (s *SearchAccum) Eval(docvec []uint8, docLen int64, aggcnt []int64) ([]float32, error) {
-	var result []float32
+func (s *SearchAccum) Eval(docvec []uint8, docLen int64, aggcnt []int64) (*float32, error) {
+	var result *float32
 	var err error
 
 	if s.Nrow == 0 {
@@ -165,18 +166,18 @@ func (p *Pattern) GetLeafText(operator int) []string {
 }
 
 // Eval leaf node.  compute the tfidf from the data in WordAccums and return result as map[doc_id]float32
-func (p *Pattern) EvalLeaf(s *SearchAccum, docvec []uint8, docLen int64, aggcnt []int64, weight float32, result []float32) ([]float32, error) {
+func (p *Pattern) EvalLeaf(s *SearchAccum, docvec []uint8, docLen int64, aggcnt []int64, weight float32, result *float32) (*float32, error) {
 	index := p.Index
 	cnt := docvec[index]
 
 	if cnt == 0 {
 		// never return nil result
-		result = []float32{}
+		result := pointer.Float32(float32(0))
 		return result, nil
 	}
 
 	if result == nil {
-		result = []float32{}
+		result = pointer.Float32(float32(0))
 	}
 
 	var score float32
@@ -199,43 +200,39 @@ func (p *Pattern) EvalLeaf(s *SearchAccum, docvec []uint8, docLen int64, aggcnt 
 		score = weight * idfSq * tfSq
 	}
 
-	if len(result) > 0 {
-		result[0] = score
-	} else {
-		result = append(result, score)
-	}
+	*result = score
 
 	return result, nil
 }
 
 // Eval Plus Plus operation.  Basically AND operation between input argument and result from the previous Eval()
 // e.g. (+ (text apple)) (+ (text banana))
-func (p *Pattern) EvalPlusPlus(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result []float32) ([]float32, error) {
+func (p *Pattern) EvalPlusPlus(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result *float32) (*float32, error) {
 	if result == nil {
-		result = []float32{}
+		result = pointer.Float32(float32(0))
 		return result, nil
 	}
 
-	if len(arg) == 0 {
-		return []float32{}, nil
+	if arg == nil || *arg == 0 {
+		return pointer.Float32(float32(0)), nil
 	}
 
-	if len(result) > 0 {
-		result[0] += arg[0]
+	if *result > 0 {
+		*result += *arg
 	}
 	return result, nil
 }
 
 // Eval Plus OR.  The previous result from Eval() is a Plus Operator and current Pattern is a Text or Star.
 // e.g. (+ (text apple)) (text banana)
-func (p *Pattern) EvalPlusOR(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result []float32) ([]float32, error) {
+func (p *Pattern) EvalPlusOR(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result *float32) (*float32, error) {
 	if result == nil {
-		result = []float32{}
+		result = pointer.Float32(float32(0))
 		return result, nil
 	}
 
-	if len(arg) > 0 && len(result) > 0 {
-		result[0] += arg[0]
+	if arg != nil && *arg > 0 && *result > 0 {
+		*result += *arg
 	}
 
 	return result, nil
@@ -243,14 +240,14 @@ func (p *Pattern) EvalPlusOR(s *SearchAccum, docvec []uint8, aggcnt []int64, arg
 
 // Minus operation.  Remove the result when doc_id is present in argument
 // e.g. (+ (text apple)) (- (text banana))
-func (p *Pattern) EvalMinus(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result []float32) ([]float32, error) {
+func (p *Pattern) EvalMinus(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result *float32) (*float32, error) {
 	if result == nil {
-		result = []float32{}
+		result = pointer.Float32(float32(0))
 		return result, nil
 	}
 
-	if len(arg) > 0 {
-		return []float32{}, nil
+	if arg != nil && *arg > 0 {
+		return pointer.Float32(float32(0)), nil
 	}
 
 	return result, nil
@@ -258,16 +255,16 @@ func (p *Pattern) EvalMinus(s *SearchAccum, docvec []uint8, aggcnt []int64, arg,
 
 // OR operation. Either apple and banana can be the result
 // e.g. (text apple) (text banana)
-func (p *Pattern) EvalOR(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result []float32) ([]float32, error) {
+func (p *Pattern) EvalOR(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result *float32) (*float32, error) {
 	if result == nil {
-		result = []float32{}
+		result = pointer.Float32(float32(0))
 	}
 
-	if len(arg) > 0 {
-		if len(result) == 0 {
-			result = arg
+	if arg != nil && *arg > 0 {
+		if *result == 0 {
+			*result = *arg
 		} else {
-			result[0] += arg[0]
+			*result += *arg
 		}
 	}
 
@@ -335,26 +332,26 @@ func (p *Pattern) GetWeight() float32 {
 }
 
 // Combine two score maps into single map. max(float32) will return when same doc_id (key) exists in both arg and result.
-func (p *Pattern) Combine(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result []float32) ([]float32, error) {
+func (p *Pattern) Combine(s *SearchAccum, docvec []uint8, aggcnt []int64, arg, result *float32) (*float32, error) {
 	if result == nil {
 		return arg, nil
 	}
 
-	if len(arg) > 0 {
-		if len(result) > 0 {
+	if arg != nil && *arg > 0 {
+		if *result > 0 {
 			// max
-			if arg[0] > result[0] {
-				result[0] = arg[0]
+			if *arg > *result {
+				*result = *arg
 			}
 		} else {
-			result = arg
+			*result = *arg
 		}
 	}
 	return result, nil
 }
 
 // Eval() function to evaluate the previous result from Eval and the current pattern (with data from datasource)  and return map[doc_id]float32
-func (p *Pattern) Eval(accum *SearchAccum, docvec []uint8, docLen int64, aggcnt []int64, weight float32, result []float32) ([]float32, error) {
+func (p *Pattern) Eval(accum *SearchAccum, docvec []uint8, docLen int64, aggcnt []int64, weight float32, result *float32) (*float32, error) {
 	switch p.Operator {
 	case TEXT, STAR:
 		// leaf node: TEXT, STAR
@@ -397,7 +394,7 @@ func (p *Pattern) Eval(accum *SearchAccum, docvec []uint8, docLen int64, aggcnt 
 		}
 	case MINUS:
 		if result == nil {
-			result = []float32{}
+			result = pointer.Float32(float32(0))
 			return result, nil
 		} else {
 			child_result, err := p.Children[0].Eval(accum, docvec, docLen, aggcnt, weight, nil)
@@ -442,7 +439,7 @@ func (p *Pattern) Eval(accum *SearchAccum, docvec []uint8, docLen int64, aggcnt 
 			}
 		}
 	case GROUP:
-		result := []float32{}
+		result := pointer.Float32(float32(0))
 		for _, c := range p.Children {
 			child_result, err := c.Eval(accum, docvec, docLen, aggcnt, weight, nil)
 			if err != nil {

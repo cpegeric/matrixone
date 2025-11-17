@@ -52,20 +52,21 @@ func TestFullTextNLBM25(t *testing.T) {
 	aggcnt[1] = 3
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 4)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		for _, p := range s.Pattern {
 			result, err = p.Eval(s, docvec, 0, aggcnt, float32(1.0), result)
 			require.Nil(t, err)
 		}
 
-		if len(result) > 0 {
-			test_result[key] = result[0]
+		if result != nil && *result > 0 {
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -100,20 +101,21 @@ func TestFullTextOrBM25(t *testing.T) {
 	aggcnt[1] = 3
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 4)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		for _, p := range s.Pattern {
 			result, err = p.Eval(s, docvec, 0, aggcnt, float32(1.0), result)
 			require.Nil(t, err)
 		}
 
-		if len(result) > 0 {
-			test_result[key] = result[0]
+		if result != nil && *result > 0 {
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -151,12 +153,13 @@ func TestFullTextPlusPlusBM25(t *testing.T) {
 	aggcnt[1] = 3
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 4)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -164,9 +167,9 @@ func TestFullTextPlusPlusBM25(t *testing.T) {
 			require.Nil(t, err)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -200,12 +203,13 @@ func TestFullTextPlusOrBM25(t *testing.T) {
 	aggcnt[1] = 3
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 4)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -213,9 +217,9 @@ func TestFullTextPlusOrBM25(t *testing.T) {
 			require.Nil(t, err)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -249,12 +253,13 @@ func TestFullTextMinusBM25(t *testing.T) {
 	aggcnt[1] = 3
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 4)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -262,9 +267,9 @@ func TestFullTextMinusBM25(t *testing.T) {
 			require.Nil(t, err)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -299,12 +304,13 @@ func TestFullTextTildaBM25(t *testing.T) {
 	aggcnt[1] = 3
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 4)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -312,9 +318,9 @@ func TestFullTextTildaBM25(t *testing.T) {
 			require.Nil(t, err)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -367,12 +373,13 @@ func TestFullText1BM25(t *testing.T) {
 	aggcnt[3] = 4
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 13)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -381,9 +388,9 @@ func TestFullText1BM25(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -431,12 +438,13 @@ func TestFullText2BM25(t *testing.T) {
 	aggcnt[3] = 3
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 13)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -445,9 +453,9 @@ func TestFullText2BM25(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -494,12 +502,13 @@ func TestFullText3BM25(t *testing.T) {
 	aggcnt[3] = 4
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 13)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -508,9 +517,9 @@ func TestFullText3BM25(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -543,12 +552,13 @@ func TestFullText5BM25(t *testing.T) {
 	aggcnt[2] = 2
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 13)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -557,9 +567,9 @@ func TestFullText5BM25(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -597,12 +607,13 @@ func TestFullTextGroupBM25(t *testing.T) {
 	aggcnt[2] = 6
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 13)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -611,9 +622,9 @@ func TestFullTextGroupBM25(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -654,12 +665,13 @@ func TestFullTextJoinGroupTildaBM25(t *testing.T) {
 	aggcnt[2] = 6
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 13)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -668,9 +680,9 @@ func TestFullTextJoinGroupTildaBM25(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -712,12 +724,13 @@ func TestFullTextGroupTildaBM25(t *testing.T) {
 	aggcnt[2] = 6
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 13)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -726,9 +739,9 @@ func TestFullTextGroupTildaBM25(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -759,12 +772,13 @@ func TestFullTextStarBM25(t *testing.T) {
 	aggcnt[0] = 2
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 13)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -773,9 +787,9 @@ func TestFullTextStarBM25(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -829,12 +843,13 @@ func TestFullTextPhraseBM25(t *testing.T) {
 	aggcnt[3] = 5
 
 	s.Nrow = 100
+	s.AvgDocLen = 10
 
 	test_result := make(map[any]float32, 13)
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -843,9 +858,9 @@ func TestFullTextPhraseBM25(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}

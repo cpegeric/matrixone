@@ -21,6 +21,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"k8s.io/utils/pointer"
 )
 
 type TestCase struct {
@@ -258,15 +259,15 @@ func TestFullTextNL(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		for _, p := range s.Pattern {
 			result, err = p.Eval(s, docvec, 0, aggcnt, float32(1.0), result)
 			require.Nil(t, err)
 		}
 
-		if len(result) > 0 {
-			test_result[key] = result[0]
+		if result != nil && *result > 0 {
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -306,15 +307,15 @@ func TestFullTextOr(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		for _, p := range s.Pattern {
 			result, err = p.Eval(s, docvec, 0, aggcnt, float32(1.0), result)
 			require.Nil(t, err)
 		}
 
-		if len(result) > 0 {
-			test_result[key] = result[0]
+		if result != nil && *result > 0 {
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -357,7 +358,7 @@ func TestFullTextPlusPlus(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -365,9 +366,9 @@ func TestFullTextPlusPlus(t *testing.T) {
 			require.Nil(t, err)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -406,7 +407,7 @@ func TestFullTextPlusOr(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -414,9 +415,9 @@ func TestFullTextPlusOr(t *testing.T) {
 			require.Nil(t, err)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -455,7 +456,7 @@ func TestFullTextMinus(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -463,9 +464,9 @@ func TestFullTextMinus(t *testing.T) {
 			require.Nil(t, err)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -505,7 +506,7 @@ func TestFullTextTilda(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -513,9 +514,9 @@ func TestFullTextTilda(t *testing.T) {
 			require.Nil(t, err)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -573,7 +574,7 @@ func TestFullText1(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -582,9 +583,9 @@ func TestFullText1(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -637,7 +638,7 @@ func TestFullText2(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -646,9 +647,9 @@ func TestFullText2(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -700,7 +701,7 @@ func TestFullText3(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -709,9 +710,9 @@ func TestFullText3(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -749,7 +750,7 @@ func TestFullText5(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -758,9 +759,9 @@ func TestFullText5(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -803,7 +804,7 @@ func TestFullTextGroup(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -812,9 +813,9 @@ func TestFullTextGroup(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -860,7 +861,7 @@ func TestFullTextJoinGroupTilda(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -869,9 +870,9 @@ func TestFullTextJoinGroupTilda(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -918,7 +919,7 @@ func TestFullTextGroupTilda(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -927,9 +928,9 @@ func TestFullTextGroupTilda(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -965,7 +966,7 @@ func TestFullTextStar(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -974,9 +975,9 @@ func TestFullTextStar(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -1035,7 +1036,7 @@ func TestFullTextPhrase(t *testing.T) {
 	// eval
 	i := 0
 	for key := range agghtab {
-		var result []float32
+		var result *float32
 		docvec := agghtab[key]
 		//fmt.Printf("docvec %v %v\n", key, docvec)
 		for _, p := range s.Pattern {
@@ -1044,9 +1045,9 @@ func TestFullTextPhrase(t *testing.T) {
 			//fmt.Printf("result %v\n", result)
 		}
 
-		if len(result) > 0 {
+		if result != nil && *result > 0 {
 			//fmt.Printf("result %v %f\n", key, result[0])
-			test_result[key] = result[0]
+			test_result[key] = *result
 		}
 		i++
 	}
@@ -1059,11 +1060,11 @@ func TestFullTextPhrase(t *testing.T) {
 func TestFullTextCombine(t *testing.T) {
 	p := &Pattern{}
 
-	s1 := []float32{1}
-	s2 := []float32{2}
+	s1 := pointer.Float32(float32(1))
+	s2 := pointer.Float32(float32(2))
 
 	result, err := p.Combine(nil, nil, nil, s1, s2)
 	require.Nil(t, err)
 
-	assert.Equal(t, result[0], float32(2))
+	assert.Equal(t, *result, float32(2))
 }
