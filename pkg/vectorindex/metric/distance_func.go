@@ -19,6 +19,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	usearch "github.com/unum-cloud/usearch/golang"
 	"gonum.org/v1/gonum/blas/blas32"
 	"gonum.org/v1/gonum/blas/blas64"
 )
@@ -61,12 +62,20 @@ func L2Distance[T types.RealNumbers](v1, v2 []T) (T, error) {
 }
 
 func L2DistanceSq[T types.RealNumbers](v1, v2 []T) (T, error) {
-	var sumOfSquares T
-	for i := range v1 {
-		diff := v1[i] - v2[i]
-		sumOfSquares += diff * diff
+	switch any(v1).(type) {
+	case []float32:
+		_v1 := any(v1).([]float32)
+		_v2 := any(v2).([]float32)
+		ret, err := usearch.Distance(_v1, _v2, uint(len(v1)), usearch.L2sq)
+		return T(ret), err
+	default:
+		var sumOfSquares T
+		for i := range v1 {
+			diff := v1[i] - v2[i]
+			sumOfSquares += diff * diff
+		}
+		return sumOfSquares, nil
 	}
-	return sumOfSquares, nil
 
 }
 
