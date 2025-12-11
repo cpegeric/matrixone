@@ -17,6 +17,7 @@
 #ifndef _MO_H_
 #define _MO_H_
 
+#include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
 

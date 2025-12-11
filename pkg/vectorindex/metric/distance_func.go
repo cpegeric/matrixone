@@ -14,6 +14,10 @@
 
 package metric
 
+/*
+#include "../../../cgo/usearch_extend.h"
+*/
+import "C"
 import (
 	"math"
 
@@ -22,6 +26,17 @@ import (
 	"gonum.org/v1/gonum/blas/blas32"
 	"gonum.org/v1/gonum/blas/blas64"
 )
+
+func CDistance() (float32, error) {
+	var errorMessage *C.char
+	var x C.usearch_error_t
+	var _ = x
+	dist := float32(C.mo_distance(nil, nil, C.size_t(0), (*C.mo_error_t)(&errorMessage)))
+	if errorMessage != nil {
+		return dist, moerr.NewInternalErrorNoCtx(C.GoString(errorMessage))
+	}
+	return dist, nil
+}
 
 func L2Distance[T types.RealNumbers](v1, v2 []T) (T, error) {
 	switch any(v1).(type) {
