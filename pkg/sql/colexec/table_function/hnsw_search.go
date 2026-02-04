@@ -220,16 +220,16 @@ func (u *hnswSearchState) start(tf *TableFunction, proc *process.Process, nthRow
 
 	switch u.idxcfg.Usearch.Quantization {
 	case usearch.F32:
-		return runHnswSearch[float32](proc, u, faVec, nthRow)
+		return runHnswSearch[float32](proc, tf, u, faVec, nthRow)
 	case usearch.F64:
-		return runHnswSearch[float64](proc, u, faVec, nthRow)
+		return runHnswSearch[float64](proc, tf, u, faVec, nthRow)
 	default:
 		// should not go here
 		panic("invalid Quantization")
 	}
 }
 
-func runHnswSearch[T types.RealNumbers](proc *process.Process, u *hnswSearchState, faVec *vector.Vector, nthRow int) (err error) {
+func runHnswSearch[T types.RealNumbers](proc *process.Process, tf *TableFunction, u *hnswSearchState, faVec *vector.Vector, nthRow int) (err error) {
 
 	fa := types.BytesToArray[T](faVec.GetBytesAt(nthRow))
 	if uint(len(fa)) != u.idxcfg.Usearch.Dimensions {
@@ -242,8 +242,11 @@ func runHnswSearch[T types.RealNumbers](proc *process.Process, u *hnswSearchStat
 		Limit:        uint(u.limit),
 		OrigFuncName: u.tblcfg.OrigFuncName,
 	}
+	sqlproc := sqlexec.NewSqlProcess(proc)
+	sqlproc.RuntimeFilterSpecs = tf.RuntimeFilterSpecs
+
 	var keys any
-	keys, u.distances, err = veccache.Cache.Search(sqlexec.NewSqlProcess(proc), u.tblcfg.IndexTable, algo, fa, rt)
+	keys, u.distances, err = veccache.Cache.Search(sqlproc, u.tblcfg.IndexTable, algo, fa, rt)
 	if err != nil {
 		return err
 	}

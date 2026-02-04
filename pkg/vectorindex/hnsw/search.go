@@ -17,9 +17,11 @@ package hnsw
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
 
+	"github.com/matrixorigin/matrixone/pkg/common/bitmap"
 	"github.com/matrixorigin/matrixone/pkg/common/concurrent"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
@@ -28,6 +30,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/cache"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/metric"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/sqlexec"
+	"github.com/matrixorigin/matrixone/pkg/vectorindex/usearchex"
 )
 
 var runSql = sqlexec.RunSql
@@ -68,6 +71,39 @@ func (s *HnswSearch[T]) unlock() {
 	s.Cond.Signal()
 }
 
+func (s *HnswSearch[T]) getFilterBitSet(sqlproc *sqlexec.SqlProcess, rt vectorindex.RuntimeConfig) (bm *bitmap.Bitmap, err error) {
+
+	if sqlproc.Proc == nil {
+		return
+	}
+
+	if len(sqlproc.RuntimeFilterSpecs) == 0 {
+		return
+	}
+	spec := sqlproc.RuntimeFilterSpecs[0]
+	if !spec.UseBloomFilter {
+		return
+	}
+
+	vecbytes, err := sqlexec.WaitBloomFilter(sqlproc)
+	if err != nil {
+		return
+	}
+
+	if len(vecbytes) == 0 {
+		return
+	}
+
+	keyvec := new(vector.Vector)
+	err = keyvec.UnmarshalBinary(vecbytes)
+	if err != nil {
+		return
+	}
+
+	os.Stderr.WriteString("....HNSW finally have bitset\n")
+	return usearchex.CreateBitSetFromInt64Vector(keyvec)
+}
+
 // Search the hnsw index (implement VectorIndexSearch.Search)
 func (s *HnswSearch[T]) Search(sqlproc *sqlexec.SqlProcess, anyquery any, rt vectorindex.RuntimeConfig) (keys any, distances []float64, err error) {
 
@@ -80,6 +116,11 @@ func (s *HnswSearch[T]) Search(sqlproc *sqlexec.SqlProcess, anyquery any, rt vec
 
 	if len(s.Indexes) == 0 {
 		return []int64{}, []float64{}, nil
+	}
+
+	filterBitmap, err := s.getFilterBitSet(sqlproc, rt)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	s.lock()
@@ -104,13 +145,26 @@ func (s *HnswSearch[T]) Search(sqlproc *sqlexec.SqlProcess, anyquery any, rt vec
 					return ctx.Err()
 				}
 
-				keys, distances, err2 := subindex[j].Search(query, limit)
-				if err2 != nil {
-					return err2
-				}
+				if filterBitmap == nil {
+					keys, distances, err2 := subindex[j].Search(query, limit)
+					if err2 != nil {
+						return err2
+					}
 
-				for k := range keys {
-					heap.Push(&vectorindex.SearchResult{Id: int64(keys[k]), Distance: float64(distances[k])})
+					for k := range keys {
+						heap.Push(&vectorindex.SearchResult{Id: int64(keys[k]), Distance: float64(distances[k])})
+					}
+				} else {
+
+					keys, distances, err2 := subindex[j].FilteredSearch(query, limit, filterBitmap)
+					if err2 != nil {
+						return err2
+					}
+
+					for k := range keys {
+						heap.Push(&vectorindex.SearchResult{Id: int64(keys[k]), Distance: float64(distances[k])})
+					}
+
 				}
 			}
 			return

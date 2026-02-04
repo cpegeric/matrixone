@@ -27,6 +27,7 @@ import (
 
 	"github.com/detailyang/go-fallocate"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/common/bitmap"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/util"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
@@ -35,6 +36,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/util/executor"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/sqlexec"
+	"github.com/matrixorigin/matrixone/pkg/vectorindex/usearchex"
 	usearch "github.com/unum-cloud/usearch/golang"
 )
 
@@ -866,4 +868,27 @@ func (idx *HnswModel[T]) Search(query []T, limit uint) (keys []usearch.Key, dist
 
 	defer runtime.KeepAlive(query)
 	return idx.Index.SearchUnsafe(util.UnsafePointer(&query[0]), limit)
+}
+
+// Filtered Search
+func (idx *HnswModel[T]) FilteredSearch(query []T, limit uint, bm *bitmap.Bitmap) (keys []usearch.Key, distances []float32, err error) {
+	if idx.Index == nil {
+		return nil, nil, moerr.NewInternalErrorNoCtx("usearch index is nil")
+	}
+
+	if query == nil {
+		return nil, nil, moerr.NewInternalErrorNoCtx("usearch query is nil")
+	}
+
+	dim, err := idx.Index.Dimensions()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if uint(len(query)) != dim {
+		return nil, nil, moerr.NewInternalErrorNoCtx("usearch dimension not match")
+	}
+
+	defer runtime.KeepAlive(query)
+	return usearchex.FilteredSearchUnsafeWithBitmap(idx.Index, util.UnsafePointer(&query[0]), limit, bm)
 }
