@@ -109,8 +109,14 @@ func (idx *GpuBruteForceIndex[T]) Search(proc *sqlexec.SqlProcess, _queries any,
 		return nil, nil, moerr.NewInternalErrorNoCtx("queries type invalid")
 	}
 
+	stream, err := cuvs.NewCudaStream()
+	if err != nil {
+		return nil, nil, err
+	}
+	defer stream.Close()
+
 	// local resource for concurrent search
-	resource, err := cuvs.NewResource(nil)
+	resource, err := cuvs.NewResource(stream)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -138,7 +144,7 @@ func (idx *GpuBruteForceIndex[T]) Search(proc *sqlexec.SqlProcess, _queries any,
 		return nil, nil, err
 	}
 
-	err = brute_force.SearchIndex(resource, *idx.Index, &queries, &neighbors, &distances)
+	err = brute_force.SearchIndex(resource, idx.Index, &queries, &neighbors, &distances)
 	if err != nil {
 		return nil, nil, err
 	}

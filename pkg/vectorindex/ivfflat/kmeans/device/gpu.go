@@ -44,7 +44,13 @@ func (c *GpuClusterer[T]) InitCentroids(ctx context.Context) error {
 
 func (c *GpuClusterer[T]) Cluster(ctx context.Context) (any, error) {
 
-	resource, err := cuvs.NewResource(nil)
+	stream, err := cuvs.NewCudaStream()
+	if err != nil {
+		return nil, err
+	}
+	defer stream.Close()
+
+	resource, err := cuvs.NewResource(stream)
 	if err != nil {
 		return nil, err
 	}
@@ -56,7 +62,7 @@ func (c *GpuClusterer[T]) Cluster(ctx context.Context) (any, error) {
 	}
 	defer dataset.Close()
 
-	index, err := ivf_flat.CreateIndex(c.indexParams, &dataset)
+	index, err := ivf_flat.CreateIndex[T](c.indexParams)
 	if err != nil {
 		return nil, err
 	}
