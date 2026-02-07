@@ -20,6 +20,7 @@ import (
 	//"os"
 
 	"context"
+	"runtime"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
@@ -43,6 +44,8 @@ func (c *GpuClusterer[T]) InitCentroids(ctx context.Context) error {
 }
 
 func (c *GpuClusterer[T]) Cluster(ctx context.Context) (any, error) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	stream, err := cuvs.NewCudaStream()
 	if err != nil {
@@ -55,6 +58,7 @@ func (c *GpuClusterer[T]) Cluster(ctx context.Context) (any, error) {
 		return nil, err
 	}
 	defer resource.Close()
+	defer runtime.KeepAlive(resource)
 
 	dataset, err := cuvs.NewTensor(c.vectors)
 	if err != nil {
@@ -103,6 +107,12 @@ func (c *GpuClusterer[T]) Cluster(ctx context.Context) (any, error) {
 		return nil, err
 	}
 
+	runtime.KeepAlive(resource)
+	runtime.KeepAlive(stream)
+	runtime.KeepAlive(index)
+	runtime.KeepAlive(dataset)
+	runtime.KeepAlive(centers)
+	runtime.KeepAlive(c)
 	return result, nil
 }
 

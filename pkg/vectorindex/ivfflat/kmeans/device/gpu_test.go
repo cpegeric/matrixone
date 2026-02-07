@@ -19,6 +19,7 @@ package device
 import (
 	//"fmt"
 	"math/rand/v2"
+	"runtime"
 	"sync"
 	"testing"
 	"context"
@@ -33,6 +34,8 @@ import (
 )
 
 func TestGpu(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	dim := 128
 	dsize := 1024
@@ -62,6 +65,8 @@ func TestGpu(t *testing.T) {
 }
 
 func TestIVFAndBruteForce(t *testing.T) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	m := mpool.MustNewZero()
 	proc := testutil.NewProcessWithMPool(t, "", m)
@@ -112,6 +117,8 @@ func TestIVFAndBruteForce(t *testing.T) {
 
 		wg.Add(1)
 		go func() {
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
 			defer wg.Done()
 			for i := 0; i < 1000; i++ {
 				_, _, err := idx.Search(sqlproc, queries, rt)

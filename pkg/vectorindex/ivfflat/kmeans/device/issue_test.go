@@ -19,9 +19,9 @@ package device
 import (
 	"fmt"
 	"math/rand/v2"
+	"runtime"
 	"sync"
 	"testing"
-	"os"
 
 	"github.com/stretchr/testify/require"
 
@@ -31,6 +31,7 @@ import (
 )
 
 func getCenters(vecs [][]float32, dim int, clusterCnt int, distanceType cuvs.Distance, maxIterations int) ([][]float32, error) {
+
 	stream, err := cuvs.NewCudaStream()
 	if err != nil {
 		return nil, err
@@ -41,6 +42,7 @@ func getCenters(vecs [][]float32, dim int, clusterCnt int, distanceType cuvs.Dis
 		return nil, err
 	}
 	defer resource.Close()
+	defer runtime.KeepAlive(resource)
 
 	indexParams, err := ivf_flat.CreateIndexParams()
 	if err != nil {
@@ -104,6 +106,8 @@ func getCenters(vecs [][]float32, dim int, clusterCnt int, distanceType cuvs.Dis
 }
 
 func Search(datasetvec [][]float32, queriesvec [][]float32, limit uint, distanceType cuvs.Distance) (retkeys any, retdistances []float64, err error) {
+
+
 	stream, err := cuvs.NewCudaStream()
 	if err != nil {
 		return
@@ -115,6 +119,7 @@ func Search(datasetvec [][]float32, queriesvec [][]float32, limit uint, distance
 		return
 	}
 	defer resource.Close()
+	defer runtime.KeepAlive(resource)
 
 	dataset, err := cuvs.NewTensor(datasetvec)
 	if err != nil {
@@ -164,34 +169,34 @@ func Search(datasetvec [][]float32, queriesvec [][]float32, limit uint, distance
 	if err = resource.Sync(); err != nil {
 		return
 	}
-	os.Stderr.WriteString("built brute force index\n")
+	//os.Stderr.WriteString("built brute force index\n")
 
 	if _, err = queries.ToDevice(&resource); err != nil {
 		return
 	}
 
-	os.Stderr.WriteString("brute force index search Runing....\n")
+	//os.Stderr.WriteString("brute force index search Runing....\n")
 	err = brute_force.SearchIndex(resource, index, &queries, &neighbors, &distances)
 	if err != nil {
 		return
 	}
-	os.Stderr.WriteString("brute force index search finished Runing....\n")
+	//os.Stderr.WriteString("brute force index search finished Runing....\n")
 
 	if _, err = neighbors.ToHost(&resource); err != nil {
 		return
 	}
-	os.Stderr.WriteString("brute force index search neighbour to host done....\n")
+	//os.Stderr.WriteString("brute force index search neighbour to host done....\n")
 
 	if _, err = distances.ToHost(&resource); err != nil {
 		return
 	}
-	os.Stderr.WriteString("brute force index search distances to host done....\n")
+	//os.Stderr.WriteString("brute force index search distances to host done....\n")
 
 	if err = resource.Sync(); err != nil {
 		return
 	}
 
-	os.Stderr.WriteString("brute force index search return result....\n")
+	//os.Stderr.WriteString("brute force index search return result....\n")
 	neighborsSlice, err := neighbors.Slice()
 	if err != nil {
 		return
@@ -217,11 +222,52 @@ func Search(datasetvec [][]float32, queriesvec [][]float32, limit uint, distance
 		}
 	}
 	retkeys = keys
-	os.Stderr.WriteString("brute force index search RETURN NOW....\n")
+	//os.Stderr.WriteString("brute force index search RETURN NOW....\n")
 	return
 }
 
-func TestIvfAndBruteForceForIssue(t *testing.T) {
+
+func TestIssueGpu(t *testing.T) {
+        runtime.LockOSThread()
+        defer runtime.UnlockOSThread()
+
+        dimension := uint(128)
+        /*
+                ncpu := uint(1)
+                elemsz := uint(4) // float32
+        */
+
+        dsize := 100000
+        nlist := 128
+        vecs := make([][]float32, dsize)
+        for i := range vecs {
+                vecs[i] = make([]float32, dimension)
+                for j := range vecs[i] {
+                        vecs[i][j] = rand.Float32()
+                }
+        }
+
+        _, err := getCenters(vecs, int(dimension), nlist, cuvs.DistanceL2, 10)
+        require.NoError(t, err)
+}
+
+func TestIssueIvfAndBruteForceForIssue(t *testing.T) {
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	mem, err := cuvs.NewCuvsPoolMemory(60, 100, false)
+	if err != nil {
+		t.Fatal("Failed to create memory resource:", err)
+	}
+
+	defer func() {
+		err = mem.Close()
+		if err != nil {
+			t.Fatal("Failed to close memory resource:", err)
+		}
+	}()
+
 
 	dimension := uint(128)
 	limit := uint(1)
@@ -243,16 +289,20 @@ func TestIvfAndBruteForceForIssue(t *testing.T) {
 
 	centers, err := getCenters(vecs, int(dimension), nlist, cuvs.DistanceL2, 10)
 	require.NoError(t, err)
-
+	
 	fmt.Println("centers DONE")
 
 	var wg sync.WaitGroup
 
-	for n := 0; n < 4; n++ {
+	for n := 0; n < 8; n++ {
 
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+
+			runtime.LockOSThread()
+			defer runtime.UnlockOSThread()
+
 			for i := 0; i < 1000; i++ {
 				_, _, err := Search(centers, queries, limit, cuvs.DistanceL2)
 				require.NoError(t, err)
