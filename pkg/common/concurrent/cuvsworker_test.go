@@ -200,7 +200,6 @@ func (m *mockResource) Close() { m.closed = true }
 func TestCuvsWorker_LifecycleAndTaskExecution(t *testing.T) {
 	skipIfNotCudaAvailable(t)
 
-
 	worker := NewCuvsWorker(5)
 	require.NotNil(t, worker)
 
@@ -406,7 +405,7 @@ func TestCuvsWorker_GracefulShutdown(t *testing.T) {
 		var submitErr error
 		taskID, submitErr := worker.Submit(func(res *cuvs.Resource) (any, error) {
 			assert.NotNil(t, res)
-			time.Sleep(10 * time.Millisecond) // Simulate work
+			time.Sleep(10 * time.Millisecond)                     // Simulate work
 			return fmt.Sprintf("final-result-%d", loopIndex), nil // Use captured loop index
 		})
 		require.NoError(t, submitErr)

@@ -54,9 +54,9 @@ type CuvsTaskResultStore struct {
 func NewCuvsTaskResultStore() *CuvsTaskResultStore {
 	s := &CuvsTaskResultStore{
 		results:   make(map[uint64]*CuvsTaskResult),
-		nextJobID: 0, // Start job IDs from 0
+		nextJobID: 0,                   // Start job IDs from 0
 		stopCh:    make(chan struct{}), // Initialize
-		stopped:   atomic.Bool{},        // Initialize
+		stopped:   atomic.Bool{},       // Initialize
 	}
 	s.resultCond = sync.NewCond(&s.mu)
 	return s
@@ -96,27 +96,27 @@ func (s *CuvsTaskResultStore) GetNextJobID() uint64 {
 
 // Stop signals the CuvsTaskResultStore to stop processing new waits.
 func (s *CuvsTaskResultStore) Stop() {
-    close(s.stopCh)
-    s.stopped.Store(true)
-    // Broadcast to unblock any waiting goroutines so they can check the stopped flag.
-    s.resultCond.Broadcast()
+	close(s.stopCh)
+	s.stopped.Store(true)
+	// Broadcast to unblock any waiting goroutines so they can check the stopped flag.
+	s.resultCond.Broadcast()
 }
 
 // CuvsWorker runs tasks in a dedicated OS thread with a CUDA context.
 type CuvsWorker struct {
-	tasks  chan *CuvsTask
-	stopCh chan struct{}
-	wg     sync.WaitGroup
-	stopped atomic.Bool // Indicates if the worker has been stopped
-	*CuvsTaskResultStore // Embed the result store
+	tasks                chan *CuvsTask
+	stopCh               chan struct{}
+	wg                   sync.WaitGroup
+	stopped              atomic.Bool // Indicates if the worker has been stopped
+	*CuvsTaskResultStore             // Embed the result store
 }
 
 // NewCuvsWorker creates a new CuvsWorker.
 func NewCuvsWorker(nthread int) *CuvsWorker {
 	return &CuvsWorker{
-		tasks:             make(chan *CuvsTask, nthread),
-		stopCh:            make(chan struct{}),
-		stopped:           atomic.Bool{}, // Initialize to false
+		tasks:               make(chan *CuvsTask, nthread),
+		stopCh:              make(chan struct{}),
+		stopped:             atomic.Bool{}, // Initialize to false
 		CuvsTaskResultStore: NewCuvsTaskResultStore(),
 	}
 }
@@ -164,15 +164,15 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
 	if err != nil {
 		logutil.Fatal("failed to create cuvs resource", zap.Error(err))
 	}
-	defer resource.Close()    // Close() is on *cuvs.Resource
+	defer resource.Close() // Close() is on *cuvs.Resource
 	defer runtime.KeepAlive(resource)
 
-    // Execute initFn after resource is ready
-    if initFn != nil {
-        if err := initFn(&resource); err != nil { // Pass pointer to resource
-            logutil.Fatal("failed to initialize cuvs resource with provided function", zap.Error(err))
-        }
-    }
+	// Execute initFn after resource is ready
+	if initFn != nil {
+		if err := initFn(&resource); err != nil { // Pass pointer to resource
+			logutil.Fatal("failed to initialize cuvs resource with provided function", zap.Error(err))
+		}
+	}
 
 	for {
 		select {
