@@ -133,9 +133,8 @@ func (w *CuvsWorker) Start(initFn func(res *cuvs.Resource) error) {
 func (w *CuvsWorker) Stop() {
 	if !w.stopped.Load() {
 		w.stopped.Store(true)
-		// close stopCh to signal run() to stop,
-		// which will then close w.tasks to signal workers.
-		close(w.stopCh)
+		close(w.stopCh) // Signal run() to stop.
+		close(w.tasks)  // Close tasks channel here.
 	}
 	w.wg.Wait()
 	w.CuvsTaskResultStore.Stop() // Signal the result store to stop
@@ -260,7 +259,6 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
 					select {
 					case task, ok := <-w.tasks:
 						if !ok { // tasks channel closed during drain
-							close(w.tasks) // Ensure close is called before return
 							return
 						}
 						result, err := task.Fn(&parentResource)
@@ -271,7 +269,6 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
 						}
 						w.CuvsTaskResultStore.Store(cuvsResult)
 					default:
-						close(w.tasks) // Ensure close is called before return
 						return
 					}
 				}
@@ -289,7 +286,6 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
 		<-w.stopCh
 
 		// Signal workers to stop and wait for them to finish.
-		close(w.tasks)
 		workerWg.Wait()
 	}
 }
