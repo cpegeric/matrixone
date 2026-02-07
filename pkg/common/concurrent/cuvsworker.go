@@ -17,9 +17,12 @@
 package concurrent
 
 import (
+	"os"
+	"os/signal"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
@@ -110,6 +113,7 @@ type CuvsWorker struct {
 	stopped              atomic.Bool // Indicates if the worker has been stopped
 	*CuvsTaskResultStore             // Embed the result store
 	nthread              int
+	sigc                 chan os.Signal // Add this field
 }
 
 // NewCuvsWorker creates a new CuvsWorker.
@@ -120,6 +124,7 @@ func NewCuvsWorker(nthread int) *CuvsWorker {
 		stopped:             atomic.Bool{}, // Initialize to false
 		CuvsTaskResultStore: NewCuvsTaskResultStore(),
 		nthread:             nthread,
+		sigc:                make(chan os.Signal, 1), // Initialize sigc
 	}
 }
 
@@ -127,6 +132,14 @@ func NewCuvsWorker(nthread int) *CuvsWorker {
 func (w *CuvsWorker) Start(initFn func(res *cuvs.Resource) error) {
 	w.wg.Add(1)
 	go w.run(initFn)
+
+	signal.Notify(w.sigc, syscall.SIGTERM, syscall.SIGINT) // Notify signals to sigc
+
+	go func() {
+		<-w.sigc // Wait for a signal
+		logutil.Info("CuvsWorker received shutdown signal, stopping...")
+		w.Stop() // Call the existing Stop method
+	}()
 }
 
 // Stop signals the worker to terminate.
