@@ -109,34 +109,51 @@ type CuvsWorker struct {
 	wg                   sync.WaitGroup
 	stopped              atomic.Bool // Indicates if the worker has been stopped
 	*CuvsTaskResultStore             // Embed the result store
+	nthread              int
+	initOnce             sync.Once
 }
 
 // NewCuvsWorker creates a new CuvsWorker.
 func NewCuvsWorker(nthread int) *CuvsWorker {
 	return &CuvsWorker{
-		tasks:               make(chan *CuvsTask, nthread),
-		stopCh:              make(chan struct{}),
-		stopped:             atomic.Bool{}, // Initialize to false
-		CuvsTaskResultStore: NewCuvsTaskResultStore(),
+		tasks:   make(chan *CuvsTask, nthread),
+		stopCh:  make(chan struct{}),
+		stopped: atomic.Bool{},
+		nthread: nthread,
 	}
+}
+
+func (w *CuvsWorker) init() {
+	w.initOnce.Do(func() {
+		if w.CuvsTaskResultStore == nil {
+			w.CuvsTaskResultStore = NewCuvsTaskResultStore()
+		}
+	})
 }
 
 // Start begins the worker's execution loop.
 func (w *CuvsWorker) Start(initFn func(res *cuvs.Resource) error) {
+	w.init()
 	w.wg.Add(1)
 	go w.run(initFn)
 }
 
 // Stop signals the worker to terminate.
 func (w *CuvsWorker) Stop() {
-	close(w.stopCh)
-	w.stopped.Store(true) // Set worker stopped flag
+	w.init()
+	if !w.stopped.Load() {
+		w.stopped.Store(true)
+		// close stopCh to signal run() to stop,
+		// which will then close w.tasks to signal workers.
+		close(w.stopCh)
+	}
 	w.wg.Wait()
 	w.CuvsTaskResultStore.Stop() // Signal the result store to stop
 }
 
 // Submit sends a task to the worker.
 func (w *CuvsWorker) Submit(fn func(res *cuvs.Resource) (any, error)) (uint64, error) {
+	w.init()
 	if w.stopped.Load() {
 		return 0, moerr.NewInternalErrorNoCtx("cannot submit task: worker is stopped")
 	}
@@ -149,34 +166,34 @@ func (w *CuvsWorker) Submit(fn func(res *cuvs.Resource) (any, error)) (uint64, e
 	return jobID, nil
 }
 
-func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
-	defer w.wg.Done()
+func (w *CuvsWorker) workerLoop(wg *sync.WaitGroup) {
+	defer wg.Done()
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
+	// Each worker gets its own stream and resource, which can be considered
+	// a "child" resource that has access to the parent's context.
 	stream, err := cuvs.NewCudaStream()
 	if err != nil {
-		logutil.Fatal("failed to create cuda stream", zap.Error(err))
+		logutil.Error("failed to create cuda stream in worker", zap.Error(err))
+		return
 	}
-	defer stream.Close() // Use Close()
+	defer stream.Close()
 
-	resource, err := cuvs.NewResource(stream) // NewResource returns a struct value
+	resource, err := cuvs.NewResource(stream)
 	if err != nil {
-		logutil.Fatal("failed to create cuvs resource", zap.Error(err))
+		logutil.Error("failed to create cuvs resource in worker", zap.Error(err))
+		return
 	}
-	defer resource.Close() // Close() is on *cuvs.Resource
+	defer resource.Close()
 	defer runtime.KeepAlive(resource)
-
-	// Execute initFn after resource is ready
-	if initFn != nil {
-		if err := initFn(&resource); err != nil { // Pass pointer to resource
-			logutil.Fatal("failed to initialize cuvs resource with provided function", zap.Error(err))
-		}
-	}
 
 	for {
 		select {
-		case task := <-w.tasks:
+		case task, ok := <-w.tasks:
+			if !ok { // tasks channel closed
+				return // No more tasks, and channel is closed. Exit.
+			}
 			result, err := task.Fn(&resource)
 			cuvsResult := &CuvsTaskResult{
 				ID:     task.ID,
@@ -185,10 +202,13 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
 			}
 			w.CuvsTaskResultStore.Store(cuvsResult)
 		case <-w.stopCh:
-			// Drain the tasks channel before exiting
+			// stopCh signaled. Drain remaining tasks from w.tasks then exit.
 			for {
 				select {
-				case task := <-w.tasks:
+				case task, ok := <-w.tasks:
+					if !ok { // tasks channel closed during drain
+						return // Channel closed, no more tasks. Exit.
+					}
 					result, err := task.Fn(&resource)
 					cuvsResult := &CuvsTaskResult{
 						ID:     task.ID,
@@ -197,15 +217,99 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
 					}
 					w.CuvsTaskResultStore.Store(cuvsResult)
 				default:
-					return
+					return // All tasks drained, or channel is empty.
 				}
 			}
 		}
 	}
 }
 
+func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
+	w.init()
+	defer w.wg.Done()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Create a parent resource to run the one-time init function.
+	// Data initialized here is available in the CUDA context for child resources.
+	parentStream, err := cuvs.NewCudaStream()
+	if err != nil {
+		logutil.Fatal("failed to create parent cuda stream", zap.Error(err))
+	}
+	defer parentStream.Close()
+
+	parentResource, err := cuvs.NewResource(parentStream)
+	if err != nil {
+		logutil.Fatal("failed to create parent cuvs resource", zap.Error(err))
+	}
+	defer parentResource.Close()
+
+	// Execute initFn once.
+	if initFn != nil {
+		if err := initFn(&parentResource); err != nil {
+			logutil.Fatal("failed to initialize cuvs resource with provided function", zap.Error(err))
+		}
+	}
+
+	if w.nthread == 1 {
+		// Special case: nthread is 1, process tasks directly in this goroutine
+		for {
+			select {
+			case task, ok := <-w.tasks:
+				if !ok { // tasks channel closed
+					return // Channel closed, no more tasks. Exit.
+				}
+				result, err := task.Fn(&parentResource)
+				cuvsResult := &CuvsTaskResult{
+					ID:     task.ID,
+					Result: result,
+					Error:  err,
+				}
+				w.CuvsTaskResultStore.Store(cuvsResult)
+			case <-w.stopCh:
+				// Drain the tasks channel before exiting
+				for {
+					select {
+					case task, ok := <-w.tasks:
+						if !ok { // tasks channel closed during drain
+							close(w.tasks) // Ensure close is called before return
+							return
+						}
+						result, err := task.Fn(&parentResource)
+						cuvsResult := &CuvsTaskResult{
+							ID:     task.ID,
+							Result: result,
+							Error:  err,
+						}
+						w.CuvsTaskResultStore.Store(cuvsResult)
+					default:
+						close(w.tasks) // Ensure close is called before return
+						return
+					}
+				}
+			}
+		}
+	} else {
+		// General case: nthread > 1, create worker goroutines
+		var workerWg sync.WaitGroup
+		workerWg.Add(w.nthread)
+		for i := 0; i < w.nthread; i++ {
+			go w.workerLoop(&workerWg)
+		}
+
+		// Wait for stop signal
+		<-w.stopCh
+
+		// Signal workers to stop and wait for them to finish.
+		close(w.tasks)
+		workerWg.Wait()
+	}
+}
+
+
 // Wait blocks until the result for the given jobID is available and returns it.
 // The result is removed from the internal map after being retrieved.
 func (w *CuvsWorker) Wait(jobID uint64) (*CuvsTaskResult, error) {
+	w.init()
 	return w.CuvsTaskResultStore.Wait(jobID)
 }
