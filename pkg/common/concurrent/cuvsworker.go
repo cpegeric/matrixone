@@ -110,37 +110,27 @@ type CuvsWorker struct {
 	stopped              atomic.Bool // Indicates if the worker has been stopped
 	*CuvsTaskResultStore             // Embed the result store
 	nthread              int
-	initOnce             sync.Once
 }
 
 // NewCuvsWorker creates a new CuvsWorker.
 func NewCuvsWorker(nthread int) *CuvsWorker {
 	return &CuvsWorker{
-		tasks:   make(chan *CuvsTask, nthread),
-		stopCh:  make(chan struct{}),
-		stopped: atomic.Bool{},
-		nthread: nthread,
+		tasks:               make(chan *CuvsTask, nthread),
+		stopCh:              make(chan struct{}),
+		stopped:             atomic.Bool{}, // Initialize to false
+		CuvsTaskResultStore: NewCuvsTaskResultStore(),
+		nthread:             nthread,
 	}
-}
-
-func (w *CuvsWorker) init() {
-	w.initOnce.Do(func() {
-		if w.CuvsTaskResultStore == nil {
-			w.CuvsTaskResultStore = NewCuvsTaskResultStore()
-		}
-	})
 }
 
 // Start begins the worker's execution loop.
 func (w *CuvsWorker) Start(initFn func(res *cuvs.Resource) error) {
-	w.init()
 	w.wg.Add(1)
 	go w.run(initFn)
 }
 
 // Stop signals the worker to terminate.
 func (w *CuvsWorker) Stop() {
-	w.init()
 	if !w.stopped.Load() {
 		w.stopped.Store(true)
 		// close stopCh to signal run() to stop,
@@ -153,7 +143,6 @@ func (w *CuvsWorker) Stop() {
 
 // Submit sends a task to the worker.
 func (w *CuvsWorker) Submit(fn func(res *cuvs.Resource) (any, error)) (uint64, error) {
-	w.init()
 	if w.stopped.Load() {
 		return 0, moerr.NewInternalErrorNoCtx("cannot submit task: worker is stopped")
 	}
@@ -225,7 +214,6 @@ func (w *CuvsWorker) workerLoop(wg *sync.WaitGroup) {
 }
 
 func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
-	w.init()
 	defer w.wg.Done()
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -310,6 +298,5 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
 // Wait blocks until the result for the given jobID is available and returns it.
 // The result is removed from the internal map after being retrieved.
 func (w *CuvsWorker) Wait(jobID uint64) (*CuvsTaskResult, error) {
-	w.init()
 	return w.CuvsTaskResultStore.Wait(jobID)
 }
