@@ -130,15 +130,22 @@ func NewCuvsWorker(nthread int) *CuvsWorker {
 
 // Start begins the worker's execution loop.
 func (w *CuvsWorker) Start(initFn func(res *cuvs.Resource) error) {
-	w.wg.Add(1)
+	w.wg.Add(1) // for w.run
 	go w.run(initFn)
 
 	signal.Notify(w.sigc, syscall.SIGTERM, syscall.SIGINT) // Notify signals to sigc
 
+	w.wg.Add(1) // for the signal handler goroutine
 	go func() {
-		<-w.sigc // Wait for a signal
-		logutil.Info("CuvsWorker received shutdown signal, stopping...")
-		w.Stop() // Call the existing Stop method
+		defer w.wg.Done() // Ensure wg.Done() is called when this goroutine exits
+		select {
+		case <-w.sigc: // Wait for a signal
+			logutil.Info("CuvsWorker received shutdown signal, stopping...")
+			w.Stop() // Call the existing Stop method
+		case <-w.stopCh: // Listen for internal stop signal from w.Stop()
+			logutil.Info("CuvsWorker signal handler received internal stop signal, exiting...")
+			// Do nothing, just exit. w.Stop() will handle the rest.
+		}
 	}()
 }
 
