@@ -310,7 +310,6 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
 	}
 }
 
-
 // Wait blocks until the result for the given jobID is available and returns it.
 // The result is removed from the internal map after being retrieved.
 func (w *CuvsWorker) Wait(jobID uint64) (*CuvsTaskResult, error) {

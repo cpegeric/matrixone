@@ -19,6 +19,7 @@ package concurrent
 import (
 	"fmt"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -438,6 +439,70 @@ func TestCuvsWorker_GracefulShutdown(t *testing.T) {
 		return "should not be processed", nil
 	})
 	assert.Error(t, err) // Expect an error
+	assert.Contains(t, err.Error(), "worker is stopped")
+}
+
+func TestCuvsWorker_SignalTermination(t *testing.T) {
+	skipIfNotCudaAvailable(t)
+
+	worker := NewCuvsWorker(1) // Use 1 thread for easier control and observation
+	require.NotNil(t, worker)
+
+	// Start the worker
+	worker.Start(nil)
+
+	// Submit a task that will complete after the signal, to ensure graceful processing
+	taskDone := make(chan struct{})
+	taskID1, err := worker.Submit(func(res *cuvs.Resource) (any, error) {
+		assert.NotNil(t, res)
+		<-taskDone // Wait for signal to complete
+		return "task1 processed", nil
+	})
+	require.NoError(t, err)
+
+	// Submit a second quick task that should complete before or around the signal
+	taskID2, err := worker.Submit(func(res *cuvs.Resource) (any, error) {
+		assert.NotNil(t, res)
+		return "task2 processed", nil
+	})
+	require.NoError(t, err)
+
+	// Give the worker a moment to pick up the tasks
+	time.Sleep(50 * time.Millisecond)
+
+	// Simulate SIGTERM by sending to the signal channel
+	t.Log("Simulating SIGTERM to CuvsWorker")
+	worker.sigc <- syscall.SIGTERM
+
+	// Allow some time for the signal handler to process and call worker.Stop()
+	time.Sleep(100 * time.Millisecond)
+
+	// Unblock the long-running task to allow it to finish and the worker to fully stop
+	close(taskDone)
+
+	// Wait for all worker goroutines to finish
+	// The worker.Stop() method, which is called by the signal handler,
+	// internally waits for worker.wg.Wait().
+	// So, we can verify by checking if new submissions fail and if old tasks results are available.
+
+	// Check if previously submitted tasks completed
+	result1, err := worker.Wait(taskID1)
+	assert.NoError(t, err)
+	assert.NotNil(t, result1)
+	assert.Equal(t, taskID1, result1.ID)
+	assert.Equal(t, "task1 processed", result1.Result)
+
+	result2, err := worker.Wait(taskID2)
+	assert.NoError(t, err)
+	assert.NotNil(t, result2)
+	assert.Equal(t, taskID2, result2.ID)
+	assert.Equal(t, "task2 processed", result2.Result)
+
+	// Attempt to submit a new task after termination. It should fail.
+	_, err = worker.Submit(func(res *cuvs.Resource) (any, error) {
+		return "should not be processed", nil
+	})
+	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "worker is stopped")
 }
 
