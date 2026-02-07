@@ -250,6 +250,7 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
 		logutil.Fatal("failed to create parent cuvs resource", zap.Error(err))
 	}
 	defer parentResource.Close()
+	defer runtime.KeepAlive(parentResource)
 
 	// Execute initFn once.
 	if initFn != nil {
