@@ -25,23 +25,24 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/cache"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/metric"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/sqlexec"
+	"github.com/matrixorigin/matrixone/pkg/common/concurrent"
+
 	cuvs "github.com/rapidsai/cuvs/go"
 	"github.com/rapidsai/cuvs/go/brute_force"
 )
 
 type GpuBruteForceIndex[T cuvs.TensorNumberType] struct {
-	Resource    *cuvs.Resource // shared resource for read-only index
 	Dataset     *cuvs.Tensor[T]
 	Index       *brute_force.BruteForceIndex
 	Metric      cuvs.Distance
 	Dimension   uint
 	Count       uint
 	ElementSize uint
+	Worker      *concurrent.CuvsWorker
 }
 
 var _ cache.VectorIndexSearchIf = &GpuBruteForceIndex[float32]{}
 
-// cuvs library has bug.  comment out the GPU version until cuvs fix the bug
 func NewBruteForceIndex[T types.RealNumbers](dataset [][]T,
 	dimension uint,
 	m metric.MetricType,
@@ -65,8 +66,10 @@ func NewGpuBruteForceIndex[T cuvs.TensorNumberType](dataset [][]T,
 	elemsz uint) (cache.VectorIndexSearchIf, error) {
 
 	idx := &GpuBruteForceIndex[T]{}
-	resource, _ := cuvs.NewResource(nil)
-	idx.Resource = &resource
+	// Create CuvsWorker
+	worker := concurrent.NewCuvsWorker(1) // Assuming 1 thread for now
+	idx.Worker = worker // Only assign, don't start here
+
 	tensor, err := cuvs.NewTensor(dataset)
 	if err != nil {
 		return nil, err
@@ -82,25 +85,45 @@ func NewGpuBruteForceIndex[T cuvs.TensorNumberType](dataset [][]T,
 }
 
 func (idx *GpuBruteForceIndex[T]) Load(sqlproc *sqlexec.SqlProcess) (err error) {
-	if _, err = idx.Dataset.ToDevice(idx.Resource); err != nil {
-		return err
+	// Define initFn
+	initFn := func(resource *cuvs.Resource) error {
+		// Transfer dataset to device
+		if _, err = idx.Dataset.ToDevice(resource); err != nil {
+			return err
+		}
+
+		idx.Index, err = brute_force.CreateIndex()
+		if err != nil {
+			return err
+		}
+
+		err = brute_force.BuildIndex[T](*resource, idx.Dataset, idx.Metric, 0, idx.Index)
+		if err != nil {
+			return err
+		}
+
+		if err = resource.Sync(); err != nil {
+			return err
+		}
+		return nil
 	}
 
-	idx.Index, err = brute_force.CreateIndex()
-	if err != nil {
-		return
+	// Define stopFn
+	stopFn := func(resource *cuvs.Resource) {
+		if idx.Index != nil {
+			idx.Index.Close()
+			idx.Index = nil // Clear to prevent double close
+		}
+		if idx.Dataset != nil {
+			idx.Dataset.Close()
+			idx.Dataset = nil // Clear to prevent double close
+		}
 	}
 
-	err = brute_force.BuildIndex[T](*idx.Resource, idx.Dataset, idx.Metric, 0, idx.Index)
-	if err != nil {
-		return
-	}
+	// Start the worker with initFn and stopFn
+	idx.Worker.Start(initFn, stopFn)
 
-	if err = idx.Resource.Sync(); err != nil {
-		return
-	}
-
-	return
+	return nil // No direct error from Load itself now, it's handled by initFn if any.
 }
 
 func (idx *GpuBruteForceIndex[T]) Search(proc *sqlexec.SqlProcess, _queries any, rt vectorindex.RuntimeConfig) (retkeys any, retdistances []float64, err error) {
@@ -109,69 +132,89 @@ func (idx *GpuBruteForceIndex[T]) Search(proc *sqlexec.SqlProcess, _queries any,
 		return nil, nil, moerr.NewInternalErrorNoCtx("queries type invalid")
 	}
 
-	stream, err := cuvs.NewCudaStream()
-	if err != nil {
-		return nil, nil, err
-	}
-	defer stream.Close()
-
-	// local resource for concurrent search
-	resource, err := cuvs.NewResource(stream)
-	if err != nil {
-		return nil, nil, err
-	}
-	defer resource.Close()
-
 	queries, err := cuvs.NewTensor(queriesvec)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer queries.Close()
+	defer queries.Close() // Close the host-side tensor
 
-	neighbors, err := cuvs.NewTensorOnDevice[int64](&resource, []int64{int64(len(queriesvec)), int64(rt.Limit)})
+	// Submit the GPU operations as a task to the CuvsWorker
+	jobID, err := idx.Worker.Submit(func(resource *cuvs.Resource) (any, error) {
+		// All GPU operations using 'resource' provided by CuvsWorker
+		neighbors, err := cuvs.NewTensorOnDevice[int64](resource, []int64{int64(len(queriesvec)), int64(rt.Limit)})
+		if err != nil {
+			return nil, err
+		}
+		defer neighbors.Close()
+
+		distances, err := cuvs.NewTensorOnDevice[float32](resource, []int64{int64(len(queriesvec)), int64(rt.Limit)})
+		if err != nil {
+			return nil, err
+		}
+		defer distances.Close()
+
+		if _, err = queries.ToDevice(resource); err != nil {
+			return nil, err
+		}
+
+		err = brute_force.SearchIndex(*resource, idx.Index, &queries, &neighbors, &distances)
+		if err != nil {
+			return nil, err
+		}
+
+		if _, err = neighbors.ToHost(resource); err != nil {
+			return nil, err
+		}
+
+		if _, err = distances.ToHost(resource); err != nil {
+			return nil, err
+		}
+
+		if err = resource.Sync(); err != nil {
+			return nil, err
+		}
+
+		// Collect results to pass back
+		neighborsSlice, err := neighbors.Slice()
+		if err != nil {
+			return nil, err
+		}
+
+		distancesSlice, err := distances.Slice()
+		if err != nil {
+			return nil, err
+		}
+
+		// Return a custom struct or map to hold both slices
+		return struct {
+			Neighbors [][]int64
+			Distances [][]float32
+		}{
+			Neighbors: neighborsSlice,
+			Distances: distancesSlice,
+		}, nil
+	})
 	if err != nil {
 		return nil, nil, err
 	}
-	defer neighbors.Close()
 
-	distances, err := cuvs.NewTensorOnDevice[float32](&resource, []int64{int64(len(queriesvec)), int64(rt.Limit)})
+	// Wait for the task to complete
+	resultCuvsTask, err := idx.Worker.Wait(jobID)
 	if err != nil {
 		return nil, nil, err
 	}
-	defer distances.Close()
-
-	if _, err = queries.ToDevice(&resource); err != nil {
-		return nil, nil, err
+	if resultCuvsTask.Error != nil {
+		return nil, nil, resultCuvsTask.Error
 	}
 
-	err = brute_force.SearchIndex(resource, idx.Index, &queries, &neighbors, &distances)
-	if err != nil {
-		return nil, nil, err
-	}
+	// Unpack the result
+	res := resultCuvsTask.Result.(struct {
+		Neighbors [][]int64
+		Distances [][]float32
+	})
+	neighborsSlice := res.Neighbors
+	distancesSlice := res.Distances
 
-	if _, err = neighbors.ToHost(&resource); err != nil {
-		return nil, nil, err
-	}
-
-	if _, err = distances.ToHost(&resource); err != nil {
-		return nil, nil, err
-	}
-
-	if err = resource.Sync(); err != nil {
-		return nil, nil, err
-	}
-
-	neighborsSlice, err := neighbors.Slice()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	distancesSlice, err := distances.Slice()
-	if err != nil {
-		return nil, nil, err
-	}
-
-	//fmt.Printf("flattened %v\n", flatten)
 	retdistances = make([]float64, len(distancesSlice)*int(rt.Limit))
 	for i := range distancesSlice {
 		for j, dist := range distancesSlice[i] {
@@ -194,13 +237,7 @@ func (idx *GpuBruteForceIndex[T]) UpdateConfig(sif cache.VectorIndexSearchIf) er
 }
 
 func (idx *GpuBruteForceIndex[T]) Destroy() {
-	if idx.Dataset != nil {
-		idx.Dataset.Close()
-	}
-	if idx.Resource != nil {
-		idx.Resource.Close()
-	}
-	if idx.Index != nil {
-		idx.Index.Close()
+	if idx.Worker != nil {
+		idx.Worker.Stop() // This will trigger the stopFn
 	}
 }
