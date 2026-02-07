@@ -128,6 +128,33 @@ func NewCuvsWorker(nthread int) *CuvsWorker {
 	}
 }
 
+// handleAndStoreTask processes a single CuvsTask and stores its result.
+func (w *CuvsWorker) handleAndStoreTask(task *CuvsTask, resource *cuvs.Resource) {
+	result, err := task.Fn(resource)
+	cuvsResult := &CuvsTaskResult{
+		ID:     task.ID,
+		Result: result,
+		Error:  err,
+	}
+	w.CuvsTaskResultStore.Store(cuvsResult)
+}
+
+// drainAndProcessTasks drains the w.tasks channel and processes each task.
+// It stops when the channel is empty or closed.
+func (w *CuvsWorker) drainAndProcessTasks(resource *cuvs.Resource) {
+	for {
+		select {
+		case task, ok := <-w.tasks:
+			if !ok {
+				return // Channel closed, no more tasks. Exit.
+			}
+			w.handleAndStoreTask(task, resource)
+		default:
+			return // All tasks drained, or channel is empty.
+		}
+	}
+}
+
 // Start begins the worker's execution loop.
 func (w *CuvsWorker) Start(initFn func(res *cuvs.Resource) error) {
 	w.wg.Add(1) // for w.run
@@ -202,32 +229,11 @@ func (w *CuvsWorker) workerLoop(wg *sync.WaitGroup) {
 			if !ok { // tasks channel closed
 				return // No more tasks, and channel is closed. Exit.
 			}
-			result, err := task.Fn(&resource)
-			cuvsResult := &CuvsTaskResult{
-				ID:     task.ID,
-				Result: result,
-				Error:  err,
-			}
-			w.CuvsTaskResultStore.Store(cuvsResult)
+			w.handleAndStoreTask(task, &resource)
 		case <-w.stopCh:
 			// stopCh signaled. Drain remaining tasks from w.tasks then exit.
-			for {
-				select {
-				case task, ok := <-w.tasks:
-					if !ok { // tasks channel closed during drain
-						return // Channel closed, no more tasks. Exit.
-					}
-					result, err := task.Fn(&resource)
-					cuvsResult := &CuvsTaskResult{
-						ID:     task.ID,
-						Result: result,
-						Error:  err,
-					}
-					w.CuvsTaskResultStore.Store(cuvsResult)
-				default:
-					return // All tasks drained, or channel is empty.
-				}
-			}
+			w.drainAndProcessTasks(&resource)
+			return
 		}
 	}
 }
@@ -267,32 +273,11 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
 				if !ok { // tasks channel closed
 					return // Channel closed, no more tasks. Exit.
 				}
-				result, err := task.Fn(&parentResource)
-				cuvsResult := &CuvsTaskResult{
-					ID:     task.ID,
-					Result: result,
-					Error:  err,
-				}
-				w.CuvsTaskResultStore.Store(cuvsResult)
+				w.handleAndStoreTask(task, &parentResource)
 			case <-w.stopCh:
 				// Drain the tasks channel before exiting
-				for {
-					select {
-					case task, ok := <-w.tasks:
-						if !ok { // tasks channel closed during drain
-							return
-						}
-						result, err := task.Fn(&parentResource)
-						cuvsResult := &CuvsTaskResult{
-							ID:     task.ID,
-							Result: result,
-							Error:  err,
-						}
-						w.CuvsTaskResultStore.Store(cuvsResult)
-					default:
-						return
-					}
-				}
+				w.drainAndProcessTasks(&parentResource)
+				return
 			}
 		}
 	} else {
