@@ -156,9 +156,9 @@ func (w *CuvsWorker) drainAndProcessTasks(resource *cuvs.Resource) {
 }
 
 // Start begins the worker's execution loop.
-func (w *CuvsWorker) Start(initFn func(res *cuvs.Resource) error) {
+func (w *CuvsWorker) Start(initFn func(res *cuvs.Resource) error, stopFn func(resource *cuvs.Resource)) {
 	w.wg.Add(1) // for w.run
-	go w.run(initFn)
+	go w.run(initFn, stopFn)
 
 	signal.Notify(w.sigc, syscall.SIGTERM, syscall.SIGINT) // Notify signals to sigc
 
@@ -238,7 +238,7 @@ func (w *CuvsWorker) workerLoop(wg *sync.WaitGroup) {
 	}
 }
 
-func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
+func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error, stopFn func(resource *cuvs.Resource)) {
 	defer w.wg.Done()
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
@@ -263,6 +263,10 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error) {
 		if err := initFn(&parentResource); err != nil {
 			logutil.Fatal("failed to initialize cuvs resource with provided function", zap.Error(err))
 		}
+	}
+
+	if stopFn != nil {
+		defer stopFn(&parentResource) // Call stopFn after resource is closed
 	}
 
 	if w.nthread == 1 {

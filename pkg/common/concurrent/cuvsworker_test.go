@@ -205,7 +205,7 @@ func TestCuvsWorker_LifecycleAndTaskExecution(t *testing.T) {
 	require.NotNil(t, worker)
 
 	// Start the worker
-	worker.Start(nil) // Pass nil initFn
+	worker.Start(nil, nil) // Pass nil initFn
 
 	// Submit a task
 	expectedTaskResult := "processed by CUDA (mocked)"
@@ -303,7 +303,7 @@ func TestCuvsWorker_StopDuringTaskProcessing(t *testing.T) {
 	skipIfNotCudaAvailable(t)
 
 	worker := NewCuvsWorker(5)
-	worker.Start(nil) // Pass nil initFn
+	worker.Start(nil, nil) // Pass nil initFn
 
 	// Submit a long-running task
 	longTaskSignal := make(chan struct{})
@@ -358,7 +358,7 @@ func TestCuvsWorker_MultipleSubmitsBeforeStart(t *testing.T) {
 	worker := NewCuvsWorker(5)
 
 	// Start the worker - now takes initFn
-	worker.Start(nil) // Pass nil initFn
+	worker.Start(nil, nil) // Pass nil initFn
 
 	// Submit multiple tasks before starting the worker
 	numTasks := 5
@@ -391,7 +391,7 @@ func TestCuvsWorker_GracefulShutdown(t *testing.T) {
 	skipIfNotCudaAvailable(t)
 
 	worker := NewCuvsWorker(5)
-	worker.Start(nil) // Pass nil initFn
+	worker.Start(nil, nil) // Pass nil initFn
 
 	var wg sync.WaitGroup
 	numTasks := 10
@@ -449,7 +449,7 @@ func TestCuvsWorker_SignalTermination(t *testing.T) {
 	require.NotNil(t, worker)
 
 	// Start the worker
-	worker.Start(nil)
+	worker.Start(nil, nil)
 
 	// Submit a task that will complete after the signal, to ensure graceful processing
 	taskDone := make(chan struct{})
