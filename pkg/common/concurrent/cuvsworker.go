@@ -326,7 +326,6 @@ func (w *CuvsWorker) Wait(jobID uint64) (*CuvsTaskResult, error) {
 	return w.CuvsTaskResultStore.Wait(jobID)
 }
 
-// Errors returns a channel that provides errors from the worker goroutines.
-func (w *CuvsWorker) Errors() <-chan error {
-	return w.errch
-}
+
+
+
