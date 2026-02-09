@@ -109,7 +109,7 @@ func (idx *GpuBruteForceIndex[T]) Load(sqlproc *sqlexec.SqlProcess) (err error) 
 	}
 
 	// Define stopFn
-	stopFn := func(resource *cuvs.Resource) {
+	stopFn := func(resource *cuvs.Resource) error {
 		if idx.Index != nil {
 			idx.Index.Close()
 			idx.Index = nil // Clear to prevent double close
@@ -118,6 +118,7 @@ func (idx *GpuBruteForceIndex[T]) Load(sqlproc *sqlexec.SqlProcess) (err error) 
 			idx.Dataset.Close()
 			idx.Dataset = nil // Clear to prevent double close
 		}
+		return nil
 	}
 
 	// Start the worker with initFn and stopFn

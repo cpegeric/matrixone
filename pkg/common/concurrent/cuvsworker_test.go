@@ -205,7 +205,7 @@ func TestCuvsWorker_LifecycleAndTaskExecution(t *testing.T) {
 	require.NotNil(t, worker)
 
 	// Start the worker
-	worker.Start(nil, nil) // Pass nil initFn
+	worker.Start(nil, func(_ *cuvs.Resource) error { return nil }) // Pass nil initFn
 
 	// Submit a task
 	expectedTaskResult := "processed by CUDA (mocked)"
@@ -303,7 +303,7 @@ func TestCuvsWorker_StopDuringTaskProcessing(t *testing.T) {
 	skipIfNotCudaAvailable(t)
 
 	worker := NewCuvsWorker(5)
-	worker.Start(nil, nil) // Pass nil initFn
+	worker.Start(nil, func(_ *cuvs.Resource) error { return nil }) // Pass nil initFn
 
 	// Submit a long-running task
 	longTaskSignal := make(chan struct{})
@@ -358,7 +358,7 @@ func TestCuvsWorker_MultipleSubmitsBeforeStart(t *testing.T) {
 	worker := NewCuvsWorker(5)
 
 	// Start the worker - now takes initFn
-	worker.Start(nil, nil) // Pass nil initFn
+	worker.Start(nil, func(_ *cuvs.Resource) error { return nil }) // Pass nil initFn
 
 	// Submit multiple tasks before starting the worker
 	numTasks := 5
@@ -391,7 +391,7 @@ func TestCuvsWorker_GracefulShutdown(t *testing.T) {
 	skipIfNotCudaAvailable(t)
 
 	worker := NewCuvsWorker(5)
-	worker.Start(nil, nil) // Pass nil initFn
+	worker.Start(nil, func(_ *cuvs.Resource) error { return nil }) // Pass nil initFn
 
 	var wg sync.WaitGroup
 	numTasks := 10
@@ -449,7 +449,7 @@ func TestCuvsWorker_SignalTermination(t *testing.T) {
 	require.NotNil(t, worker)
 
 	// Start the worker
-	worker.Start(nil, nil)
+	worker.Start(nil, func(_ *cuvs.Resource) error { return nil })
 
 	// Submit a task that will complete after the signal, to ensure graceful processing
 	taskDone := make(chan struct{})
@@ -504,6 +504,102 @@ func TestCuvsWorker_SignalTermination(t *testing.T) {
 	})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "worker is stopped")
+}
+
+func TestCuvsWorker_ErrorChannel(t *testing.T) {
+	skipIfNotCudaAvailable(t)
+
+	// Test with initFn returning an error
+	t.Run("InitFnError", func(t *testing.T) {
+		worker := NewCuvsWorker(1)
+		expectedErr := fmt.Errorf("init function failed")
+
+		initFn := func(res *cuvs.Resource) error {
+			return expectedErr
+		}
+		stopFn := func(_ *cuvs.Resource) error { return nil }
+
+		worker.Start(initFn, stopFn)
+
+		select {
+		case err := <-worker.Errors():
+			assert.Equal(t, expectedErr, err)
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("Expected error not received from worker.Errors() within timeout")
+		}
+
+		// Ensure the worker eventually stops after initFn error
+		worker.Stop()
+		_, submitErr := worker.Submit(func(res *cuvs.Resource) (any, error) { return nil, nil })
+		assert.Error(t, submitErr)
+		assert.Contains(t, submitErr.Error(), "worker is stopped")
+	})
+
+	// Test with stopFn returning an error
+	t.Run("StopFnError", func(t *testing.T) {
+		worker := NewCuvsWorker(1)
+		expectedErr := fmt.Errorf("stop function failed")
+
+		initFn := func(res *cuvs.Resource) error { return nil }
+		stopFn := func(_ *cuvs.Resource) error { return expectedErr }
+
+		worker.Start(initFn, stopFn)
+
+		// Stop the worker, which will trigger stopFn
+		worker.Stop()
+
+		select {
+		case err := <-worker.Errors():
+			assert.Equal(t, expectedErr, err)
+		case <-time.After(500 * time.Millisecond):
+			t.Fatal("Expected error not received from worker.Errors() within timeout")
+		}
+
+		_, submitErr := worker.Submit(func(res *cuvs.Resource) (any, error) { return nil, nil })
+		assert.Error(t, submitErr)
+		assert.Contains(t, submitErr.Error(), "worker is stopped")
+	})
+
+	// Test with workerLoop error (e.g., failed CudaStream creation - hard to mock directly without build tags)
+	// This test relies on cuvs.NewCudaStream or cuvs.NewResource actually failing in workerLoop.
+	// We'll simulate this by not skipping if CUDA is unavailable, but asserting on the error channel.
+	t.Run("WorkerLoopError", func(t *testing.T) {
+		// Temporarily disable skipIfNotCudaAvailable for this test run
+		// This is a hacky way to test this. A better way would be dependency injection.
+		// For now, we rely on the fact that if CUDA is not available,
+		// NewCudaStream will indeed return an error, which should be caught by errch.
+		// t.Setenv("MATRIXONE_TEST_SKIP_CUDA", "false") // A hypothetical env var to control skipping
+
+		// Ensure we don't accidentally run this if CUDA IS available,
+		// as it would then wait indefinitely.
+		// We can't actually force a cuvs.NewCudaStream() to fail if system has CUDA.
+		// So this test case is primarily for environments without CUDA.
+
+		// If CUDA is available, this test might not produce an error in errch
+		// and will timeout.
+		// If !hasCuda, then the NewCudaStream() will return error.
+		if hasCuda {
+			t.Skip("Skipping WorkerLoopError test because CUDA is available, cannot reliably simulate error.")
+		}
+
+		worker := NewCuvsWorker(1)
+		worker.Start(nil, func(_ *cuvs.Resource) error { return nil })
+
+		select {
+		case err := <-worker.Errors():
+			t.Logf("Received error from worker.Errors(): %v", err)
+			assert.Error(t, err)                           // Expect some error
+			assert.Contains(t, err.Error(), "cuda stream") // Or resource
+		case <-time.After(2 * time.Second): // Give more time for startup failures
+			t.Fatal("Expected workerLoop error not received from worker.Errors() within timeout")
+		}
+
+		// Ensure the worker eventually stops after workerLoop error
+		worker.Stop()
+		_, submitErr := worker.Submit(func(res *cuvs.Resource) (any, error) { return nil, nil })
+		assert.Error(t, submitErr)
+		assert.Contains(t, submitErr.Error(), "worker is stopped")
+	})
 }
 
 // Helper to make cuvs.NewCudaStream and cuvs.NewResource mockable.
