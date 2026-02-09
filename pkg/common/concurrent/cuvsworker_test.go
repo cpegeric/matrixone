@@ -583,11 +583,6 @@ func TestCuvsWorker_MultipleStopCalls(t *testing.T) {
 	t.Log("Successfully called Stop multiple times without panic.")
 }
 
-
-
-
-
-
 // Helper to make cuvs.NewCudaStream and cuvs.NewResource mockable.
 // This requires modifying the original cudaworker.go to introduce variables
 // that can be swapped during testing. For now, this is a placeholder.

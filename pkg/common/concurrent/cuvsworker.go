@@ -50,7 +50,7 @@ type CuvsTaskResultStore struct {
 	mu         sync.Mutex
 	nextJobID  uint64
 	stopCh     chan struct{} // New field
-	stopped    atomic.Bool   // New field
+	stopped    atomic.Bool
 }
 
 // NewCuvsTaskResultStore creates a new CuvsTaskResultStore.
@@ -99,8 +99,9 @@ func (s *CuvsTaskResultStore) GetNextJobID() uint64 {
 
 // Stop signals the CuvsTaskResultStore to stop processing new waits.
 func (s *CuvsTaskResultStore) Stop() {
-	close(s.stopCh)
-	s.stopped.Store(true)
+	if s.stopped.CompareAndSwap(false, true) {
+		close(s.stopCh)
+	}
 	// Broadcast to unblock any waiting goroutines so they can check the stopped flag.
 	s.resultCond.Broadcast()
 }
@@ -112,7 +113,7 @@ type CuvsWorker struct {
 	wg                   sync.WaitGroup
 	stopped              atomic.Bool // Indicates if the worker has been stopped
 	firstError           error
-	*CuvsTaskResultStore             // Embed the result store
+	*CuvsTaskResultStore // Embed the result store
 	nthread              int
 	sigc                 chan os.Signal // Add this field
 	errch                chan error
@@ -171,13 +172,19 @@ func (w *CuvsWorker) Start(initFn func(res *cuvs.Resource) error, stopFn func(re
 		select {
 		case <-w.sigc: // Wait for a signal
 			logutil.Info("CuvsWorker received shutdown signal, stopping...")
-			w.Stop() // Call the existing Stop method
+			if w.stopped.CompareAndSwap(false, true) {
+				close(w.stopCh) // Signal run() to stop.
+				close(w.tasks)  // Close tasks channel here.
+			}
 		case err := <-w.errch: // Listen for errors from worker goroutines
 			logutil.Error("CuvsWorker received internal error, stopping...", zap.Error(err))
 			if w.firstError == nil {
 				w.firstError = err
 			}
-			w.Stop() // Trigger stop
+			if w.stopped.CompareAndSwap(false, true) {
+				close(w.stopCh) // Signal run() to stop.
+				close(w.tasks)  // Close tasks channel here.
+			}
 		case <-w.stopCh: // Listen for internal stop signal from w.Stop()
 			logutil.Info("CuvsWorker signal handler received internal stop signal, exiting...")
 			// Do nothing, just exit. w.Stop() will handle the rest.
@@ -190,9 +197,9 @@ func (w *CuvsWorker) Stop() {
 	if w.stopped.CompareAndSwap(false, true) {
 		close(w.stopCh) // Signal run() to stop.
 		close(w.tasks)  // Close tasks channel here.
-		w.wg.Wait()
-		w.CuvsTaskResultStore.Stop() // Signal the result store to stop
 	}
+	w.wg.Wait()
+	w.CuvsTaskResultStore.Stop() // Signal the result store to stop
 }
 
 // Submit sends a task to the worker.
@@ -334,7 +341,3 @@ func (w *CuvsWorker) Wait(jobID uint64) (*CuvsTaskResult, error) {
 func (w *CuvsWorker) GetFirstError() error {
 	return w.firstError
 }
-
-
-
-
