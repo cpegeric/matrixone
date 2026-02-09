@@ -506,6 +506,83 @@ func TestCuvsWorker_SignalTermination(t *testing.T) {
 	assert.Contains(t, err.Error(), "worker is stopped")
 }
 
+func TestCuvsWorker_GetFirstError(t *testing.T) {
+	skipIfNotCudaAvailable(t)
+
+	var err error // Explicitly declare err here
+
+	worker := NewCuvsWorker(1)
+	assert.Nil(t, worker.GetFirstError(), "GetFirstError should be nil initially")
+
+	// Trigger an error in initFn, which will be pushed to w.errch
+	expectedErr1 := fmt.Errorf("simulated init error 1")
+	initFn1 := func(resource *cuvs.Resource) error {
+		return expectedErr1
+	}
+	stopFn := func(_ *cuvs.Resource) error { return nil }
+
+	worker.Start(initFn1, stopFn)
+
+	// Give the `run` goroutine and the signal handler a moment to process initFn and store the first error.
+	time.Sleep(50 * time.Millisecond)
+
+	// GetFirstError should now return the expected error
+	assert.Equal(t, expectedErr1, worker.GetFirstError(), "GetFirstError should return the first recorded error")
+
+	// Submit a task that causes an error (this error won't be saved as firstError via w.errch)
+	// This ensures that only errors propagated through w.errch are considered.
+	_, err = worker.Submit(func(res *cuvs.Resource) (any, error) { // Use = for assignment
+		assert.NotNil(t, res)
+		return nil, fmt.Errorf("task error, should not affect GetFirstError()")
+	})
+	require.Error(t, err) // Expect an error because the worker should be stopped
+	assert.Contains(t, err.Error(), "worker is stopped")
+
+	// Give some time for the task to be processed, if it affects anything
+	time.Sleep(50 * time.Millisecond)
+
+	// Ensure GetFirstError remains the same even if other errors (from tasks) occur.
+	assert.Equal(t, expectedErr1, worker.GetFirstError(), "GetFirstError should not change after the first error is set")
+
+	worker.Stop()
+
+	// After stop, GetFirstError should still be the same.
+	assert.Equal(t, expectedErr1, worker.GetFirstError(), "GetFirstError should retain the first error after stopping")
+}
+
+func TestCuvsWorker_MultipleStopCalls(t *testing.T) {
+	skipIfNotCudaAvailable(t)
+
+	worker := NewCuvsWorker(1) // Use 1 thread
+	require.NotNil(t, worker)
+
+	worker.Start(nil, func(_ *cuvs.Resource) error { return nil })
+
+	// Call Stop multiple times from the main goroutine
+	worker.Stop()
+	worker.Stop()
+	worker.Stop()
+
+	// Call Stop from another goroutine
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		worker.Stop()
+	}()
+	wg.Wait()
+
+	// Ensure no panics occurred during multiple Stop calls
+	// (Go's testing framework will catch panics)
+
+	// Optionally, try submitting a task again to ensure it's truly stopped
+	_, err := worker.Submit(func(res *cuvs.Resource) (any, error) { return nil, nil })
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "worker is stopped")
+
+	t.Log("Successfully called Stop multiple times without panic.")
+}
+
 
 
 

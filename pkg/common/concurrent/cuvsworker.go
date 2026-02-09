@@ -111,6 +111,7 @@ type CuvsWorker struct {
 	stopCh               chan struct{}
 	wg                   sync.WaitGroup
 	stopped              atomic.Bool // Indicates if the worker has been stopped
+	firstError           error
 	*CuvsTaskResultStore             // Embed the result store
 	nthread              int
 	sigc                 chan os.Signal // Add this field
@@ -173,6 +174,9 @@ func (w *CuvsWorker) Start(initFn func(res *cuvs.Resource) error, stopFn func(re
 			w.Stop() // Call the existing Stop method
 		case err := <-w.errch: // Listen for errors from worker goroutines
 			logutil.Error("CuvsWorker received internal error, stopping...", zap.Error(err))
+			if w.firstError == nil {
+				w.firstError = err
+			}
 			w.Stop() // Trigger stop
 		case <-w.stopCh: // Listen for internal stop signal from w.Stop()
 			logutil.Info("CuvsWorker signal handler received internal stop signal, exiting...")
@@ -186,9 +190,9 @@ func (w *CuvsWorker) Stop() {
 	if w.stopped.CompareAndSwap(false, true) {
 		close(w.stopCh) // Signal run() to stop.
 		close(w.tasks)  // Close tasks channel here.
+		w.wg.Wait()
+		w.CuvsTaskResultStore.Stop() // Signal the result store to stop
 	}
-	w.wg.Wait()
-	w.CuvsTaskResultStore.Stop() // Signal the result store to stop
 }
 
 // Submit sends a task to the worker.
@@ -324,6 +328,11 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error, stopFn func(reso
 // The result is removed from the internal map after being retrieved.
 func (w *CuvsWorker) Wait(jobID uint64) (*CuvsTaskResult, error) {
 	return w.CuvsTaskResultStore.Wait(jobID)
+}
+
+// GetFirstError returns the first internal error encountered by the worker.
+func (w *CuvsWorker) GetFirstError() error {
+	return w.firstError
 }
 
 
