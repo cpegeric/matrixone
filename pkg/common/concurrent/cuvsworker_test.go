@@ -61,8 +61,7 @@ func skipIfNotCudaAvailable(t *testing.T) {
 func TestNewCuvsTaskResultStore(t *testing.T) {
 	store := NewCuvsTaskResultStore()
 	assert.NotNil(t, store)
-	assert.NotNil(t, store.results)
-	assert.NotNil(t, store.resultCond)
+	assert.NotNil(t, store.states)
 	assert.Equal(t, uint64(0), store.nextJobID)
 }
 
@@ -105,7 +104,7 @@ func TestCuvsTaskResultStore_StoreAndWait(t *testing.T) {
 
 	// Verify that the result is removed after retrieval
 	store.mu.Lock()
-	_, ok := store.results[jobID]
+	_, ok := store.states[jobID]
 	store.mu.Unlock()
 	assert.False(t, ok, "Result should be removed from store after Wait")
 }
