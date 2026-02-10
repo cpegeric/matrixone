@@ -437,7 +437,7 @@ func TestCuvsWorker_GracefulShutdown(t *testing.T) {
 	_, err := worker.Submit(func(res *cuvs.Resource) (any, error) { // Use := for first declaration of err in this scope
 		return "should not be processed", nil
 	})
-	assert.Error(t, err) // Expect an error
+	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "worker is stopped")
 }
 
@@ -447,7 +447,6 @@ func TestCuvsWorker_SignalTermination(t *testing.T) {
 	worker := NewCuvsWorker(1) // Use 1 thread for easier control and observation
 	require.NotNil(t, worker)
 
-	// Start the worker
 	worker.Start(nil, func(_ *cuvs.Resource) error { return nil })
 
 	// Submit a task that will complete after the signal, to ensure graceful processing

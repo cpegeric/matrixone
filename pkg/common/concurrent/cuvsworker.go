@@ -86,10 +86,19 @@ func (s *CuvsTaskResultStore) Wait(jobID uint64) (*CuvsTaskResult, error) {
 	s.mu.Lock()
 	state, ok := s.states[jobID]
 	if !ok {
+		// If task was not submitted yet, create state and wait.
 		state = &taskState{done: make(chan struct{})}
 		s.states[jobID] = state
+		s.mu.Unlock() // Release lock before blocking
+	} else if state.result != nil {
+		// If result is already available, return it immediately without blocking.
+		delete(s.states, jobID) // Remove after retrieval
+		s.mu.Unlock()
+		return state.result, nil
+	} else {
+		// Task was submitted, but result not yet available. Release lock and wait.
+		s.mu.Unlock() // Release lock before blocking
 	}
-	s.mu.Unlock()
 
 	select {
 	case <-state.done:
@@ -326,8 +335,8 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error, stopFn func(reso
 	} else {
 		// General case: nthread > 1, create worker goroutines
 		var workerWg sync.WaitGroup
-		workerWg.Add(w.nthread)
-		for i := 0; i < w.nthread; i++ {
+		workerWg.Add(int(w.nthread))
+		for i := 0; i < int(w.nthread); i++ {
 			go w.workerLoop(&workerWg)
 		}
 
