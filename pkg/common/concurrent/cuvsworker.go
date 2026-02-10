@@ -26,7 +26,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
-	"github.com/rapidsai/cuvs/go"
+	cuvs "github.com/rapidsai/cuvs/go"
 	"go.uber.org/zap"
 )
 
@@ -122,13 +122,13 @@ type CuvsWorker struct {
 	stopped              atomic.Bool // Indicates if the worker has been stopped
 	firstError           error
 	*CuvsTaskResultStore // Embed the result store
-	nthread              int
+	nthread              uint
 	sigc                 chan os.Signal // Add this field
 	errch                chan error
 }
 
 // NewCuvsWorker creates a new CuvsWorker.
-func NewCuvsWorker(nthread int) *CuvsWorker {
+func NewCuvsWorker(nthread uint) *CuvsWorker {
 	return &CuvsWorker{
 		tasks:               make(chan *CuvsTask, nthread),
 		stopCh:              make(chan struct{}),

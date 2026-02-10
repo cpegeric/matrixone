@@ -19,13 +19,13 @@ package brute_force
 import (
 	//	"fmt"
 
+	"github.com/matrixorigin/matrixone/pkg/common/concurrent"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/cache"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/metric"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/sqlexec"
-	"github.com/matrixorigin/matrixone/pkg/common/concurrent"
 
 	cuvs "github.com/rapidsai/cuvs/go"
 	"github.com/rapidsai/cuvs/go/brute_force"
@@ -46,14 +46,15 @@ var _ cache.VectorIndexSearchIf = &GpuBruteForceIndex[float32]{}
 func NewBruteForceIndex[T types.RealNumbers](dataset [][]T,
 	dimension uint,
 	m metric.MetricType,
-	elemsz uint) (cache.VectorIndexSearchIf, error) {
+	elemsz uint,
+	nthread uint) (cache.VectorIndexSearchIf, error) {
 
 	switch dset := any(dataset).(type) {
 	case [][]float64:
 		return NewCpuBruteForceIndex[T](dataset, dimension, m, elemsz)
 	case [][]float32:
-		return NewCpuBruteForceIndex[float32](dset, dimension, m, elemsz)
-		//return NewGpuBruteForceIndex[float32](dset, dimension, m, elemsz)
+		//return NewCpuBruteForceIndex[float32](dset, dimension, m, elemsz)
+		return NewGpuBruteForceIndex[float32](dset, dimension, m, elemsz, nthread)
 	default:
 		return nil, moerr.NewInternalErrorNoCtx("type not supported for BruteForceIndex")
 	}
@@ -63,12 +64,13 @@ func NewBruteForceIndex[T types.RealNumbers](dataset [][]T,
 func NewGpuBruteForceIndex[T cuvs.TensorNumberType](dataset [][]T,
 	dimension uint,
 	m metric.MetricType,
-	elemsz uint) (cache.VectorIndexSearchIf, error) {
+	elemsz uint,
+	nthread uint) (cache.VectorIndexSearchIf, error) {
 
 	idx := &GpuBruteForceIndex[T]{}
 	// Create CuvsWorker
-	worker := concurrent.NewCuvsWorker(1) // Assuming 1 thread for now
-	idx.Worker = worker // Only assign, don't start here
+	worker := concurrent.NewCuvsWorker(nthread) // Assuming 1 thread for now
+	idx.Worker = worker                         // Only assign, don't start here
 
 	tensor, err := cuvs.NewTensor(dataset)
 	if err != nil {
