@@ -45,50 +45,60 @@ type CuvsTaskResult struct {
 
 // CuvsTaskResultStore manages the storage and retrieval of CuvsTaskResults.
 type CuvsTaskResultStore struct {
-	results    map[uint64]*CuvsTaskResult
-	resultCond *sync.Cond
-	mu         sync.Mutex
-	nextJobID  uint64
-	stopCh     chan struct{} // New field
-	stopped    atomic.Bool
+	states    map[uint64]*taskState
+	mu        sync.Mutex
+	nextJobID uint64
+	stopCh    chan struct{}
+	stopped   atomic.Bool
+}
+
+type taskState struct {
+	done   chan struct{}
+	result *CuvsTaskResult
 }
 
 // NewCuvsTaskResultStore creates a new CuvsTaskResultStore.
 func NewCuvsTaskResultStore() *CuvsTaskResultStore {
-	s := &CuvsTaskResultStore{
-		results:   make(map[uint64]*CuvsTaskResult),
-		nextJobID: 0,                   // Start job IDs from 0
-		stopCh:    make(chan struct{}), // Initialize
-		stopped:   atomic.Bool{},       // Initialize
+	return &CuvsTaskResultStore{
+		states:    make(map[uint64]*taskState),
+		nextJobID: 0,
+		stopCh:    make(chan struct{}),
+		stopped:   atomic.Bool{},
 	}
-	s.resultCond = sync.NewCond(&s.mu)
-	return s
 }
 
 // Store saves a CuvsTaskResult in the store and signals any waiting goroutines.
 func (s *CuvsTaskResultStore) Store(result *CuvsTaskResult) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.results[result.ID] = result
-	s.resultCond.Broadcast()
+	state, ok := s.states[result.ID]
+	if !ok {
+		state = &taskState{done: make(chan struct{})}
+		s.states[result.ID] = state
+	}
+	state.result = result
+	close(state.done)
 }
 
 // Wait blocks until the result for the given jobID is available and returns it.
 // The result is removed from the internal map after being retrieved.
 func (s *CuvsTaskResultStore) Wait(jobID uint64) (*CuvsTaskResult, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	state, ok := s.states[jobID]
+	if !ok {
+		state = &taskState{done: make(chan struct{})}
+		s.states[jobID] = state
+	}
+	s.mu.Unlock()
 
-	for {
-		if result, ok := s.results[jobID]; ok {
-			delete(s.results, jobID) // Clean up the map
-			return result, nil
-		}
-		// If the store is stopped and result is not found, return error
-		if s.stopped.Load() {
-			return nil, moerr.NewInternalErrorNoCtx("CuvsTaskResultStore stopped before result was available")
-		}
-		s.resultCond.Wait() // This will block and release the lock, then re-acquire
+	select {
+	case <-state.done:
+		s.mu.Lock()
+		delete(s.states, jobID)
+		s.mu.Unlock()
+		return state.result, nil
+	case <-s.stopCh:
+		return nil, moerr.NewInternalErrorNoCtx("CuvsTaskResultStore stopped before result was available")
 	}
 }
 
@@ -102,8 +112,6 @@ func (s *CuvsTaskResultStore) Stop() {
 	if s.stopped.CompareAndSwap(false, true) {
 		close(s.stopCh)
 	}
-	// Broadcast to unblock any waiting goroutines so they can check the stopped flag.
-	s.resultCond.Broadcast()
 }
 
 // CuvsWorker runs tasks in a dedicated OS thread with a CUDA context.
