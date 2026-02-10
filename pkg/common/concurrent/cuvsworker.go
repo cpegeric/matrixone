@@ -238,24 +238,12 @@ func (w *CuvsWorker) workerLoop(wg *sync.WaitGroup) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	// Each worker gets its own stream and resource, which can be considered
-	// a "child" resource that has access to the parent's context.
-	stream, err := cuvs.NewCudaStream()
+	resourcePtr, cleanup, err := w.setupResource()
 	if err != nil {
-		logutil.Error("failed to create cuda stream in worker", zap.Error(err))
-		w.errch <- err
 		return
 	}
-	defer stream.Close()
-
-	resource, err := cuvs.NewResource(stream)
-	if err != nil {
-		logutil.Error("failed to create cuvs resource in worker", zap.Error(err))
-		w.errch <- err
-		return
-	}
-	defer resource.Close()
-	defer runtime.KeepAlive(resource)
+	defer cleanup()
+	defer runtime.KeepAlive(resourcePtr) // KeepAlive the pointer
 
 	for {
 		select {
@@ -263,10 +251,10 @@ func (w *CuvsWorker) workerLoop(wg *sync.WaitGroup) {
 			if !ok { // tasks channel closed
 				return // No more tasks, and channel is closed. Exit.
 			}
-			w.handleAndStoreTask(task, &resource)
+			w.handleAndStoreTask(task, resourcePtr) // Pass resourcePtr directly
 		case <-w.stopCh:
 			// stopCh signaled. Drain remaining tasks from w.tasks then exit.
-			w.drainAndProcessTasks(&resource)
+			w.drainAndProcessTasks(resourcePtr) // Pass resourcePtr directly
 			return
 		}
 	}
@@ -277,30 +265,16 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error, stopFn func(reso
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 
-	// Create a parent resource to run the one-time init function.
-	// Data initialized here is available in the CUDA context for child resources.
-	parentStream, err := cuvs.NewCudaStream()
+	parentResource, cleanup, err := w.setupResource()
 	if err != nil {
-		logutil.Error("failed to create parent cuda stream", zap.Error(err))
-		w.errch <- err
-
 		return
 	}
-	defer parentStream.Close()
-
-	parentResource, err := cuvs.NewResource(parentStream)
-	if err != nil {
-		logutil.Error("failed to create parent cuvs resource", zap.Error(err))
-		w.errch <- err
-
-		return
-	}
-	defer parentResource.Close()
+	defer cleanup()
 	defer runtime.KeepAlive(parentResource)
 
 	// Execute initFn once.
 	if initFn != nil {
-		if err := initFn(&parentResource); err != nil {
+		if err := initFn(parentResource); err != nil {
 			logutil.Error("failed to initialize cuvs resource with provided function", zap.Error(err))
 			w.errch <- err
 
@@ -310,7 +284,7 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error, stopFn func(reso
 
 	if stopFn != nil {
 		defer func() {
-			if err := stopFn(&parentResource); err != nil {
+			if err := stopFn(parentResource); err != nil {
 				logutil.Error("error during cuvs resource stop function", zap.Error(err))
 				w.errch <- err
 			}
@@ -325,10 +299,10 @@ func (w *CuvsWorker) run(initFn func(res *cuvs.Resource) error, stopFn func(reso
 				if !ok { // tasks channel closed
 					return // Channel closed, no more tasks. Exit.
 				}
-				w.handleAndStoreTask(task, &parentResource)
+				w.handleAndStoreTask(task, parentResource)
 			case <-w.stopCh:
 				// Drain the tasks channel before exiting
-				w.drainAndProcessTasks(&parentResource)
+				w.drainAndProcessTasks(parentResource)
 				return
 			}
 		}
@@ -357,4 +331,27 @@ func (w *CuvsWorker) Wait(jobID uint64) (*CuvsTaskResult, error) {
 // GetFirstError returns the first internal error encountered by the worker.
 func (w *CuvsWorker) GetFirstError() error {
 	return w.firstError
+}
+
+func (w *CuvsWorker) setupResource() (*cuvs.Resource, func(), error) {
+	stream, err := cuvs.NewCudaStream()
+	if err != nil {
+		logutil.Error("failed to create parent cuda stream", zap.Error(err))
+		w.errch <- err
+		return nil, nil, err
+	}
+
+	resource, err := cuvs.NewResource(stream)
+	if err != nil {
+		logutil.Error("failed to create parent cuvs resource", zap.Error(err))
+		w.errch <- err
+		stream.Close() // Close stream if resource creation fails
+		return nil, nil, err
+	}
+
+	cleanup := func() {
+		resource.Close()
+		stream.Close()
+	}
+	return &resource, cleanup, nil
 }
