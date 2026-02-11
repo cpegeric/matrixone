@@ -34,10 +34,14 @@ import (
 )
 
 func TestGpu(t *testing.T) {
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
+		ctx := context.Background()
 		dim := 128
 		dsize := 1024
 		nlist := 128
@@ -52,7 +56,9 @@ func TestGpu(t *testing.T) {
 		c, err := NewKMeans[float32](vecs, nlist, 10, 0, metric.Metric_L2Distance, 0, false, 0)
 		require.NoError(t, err)
 
-		centers, err := c.Cluster(context.Background())
+		c.InitCentroids(ctx)
+
+		centers, err := c.Cluster(ctx)
 		require.NoError(t, err)
 
 		_, ok := centers.([][]float32)
@@ -64,13 +70,19 @@ func TestGpu(t *testing.T) {
 			}
 		*/
 	}()
+
+	wg.Wait()
 }
 
 func TestIVFAndBruteForce(t *testing.T) {
+	var wg1 sync.WaitGroup
+	wg1.Add(1)
 	go func() {
+		defer wg1.Done()
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 
+		ctx := context.Background()
 		m := mpool.MustNewZero()
 		proc := testutil.NewProcessWithMPool(t, "", m)
 		sqlproc := sqlexec.NewSqlProcess(proc)
@@ -92,7 +104,10 @@ func TestIVFAndBruteForce(t *testing.T) {
 		c, err := NewKMeans[float32](vecs, nlist, 10, 0, metric.Metric_L2Distance, 0, false, 0)
 		require.NoError(t, err)
 
-		centers, err := c.Cluster(context.Background())
+		defer c.Close()
+
+		c.InitCentroids(ctx)
+		centers, err := c.Cluster(ctx)
 		require.NoError(t, err)
 
 		centroids, ok := centers.([][]float32)
@@ -144,4 +159,5 @@ func TestIVFAndBruteForce(t *testing.T) {
 		wg.Wait()
 	}()
 
+	wg1.Wait()
 }

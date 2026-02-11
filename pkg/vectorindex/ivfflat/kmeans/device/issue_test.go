@@ -226,9 +226,13 @@ func Search(datasetvec [][]float32, queriesvec [][]float32, limit uint, distance
 }
 
 func TestIssueGpu(t *testing.T) {
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
+
+		defer wg.Done()
 
 		dimension := uint(128)
 		/*
@@ -249,13 +253,17 @@ func TestIssueGpu(t *testing.T) {
 		_, err := getCenters(vecs, int(dimension), nlist, cuvs.DistanceL2, 10)
 		require.NoError(t, err)
 	}()
+	wg.Wait()
 }
 
 func TestIssueIvfAndBruteForceForIssue(t *testing.T) {
+	var wg1 sync.WaitGroup
+	wg1.Add(1)
 	go func() {
-
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
+
+		defer wg1.Done()
 
 		mem, err := cuvs.NewCuvsPoolMemory(60, 100, false)
 		if err != nil {
@@ -324,4 +332,6 @@ func TestIssueIvfAndBruteForceForIssue(t *testing.T) {
 		wg.Wait()
 
 	}()
+
+	wg1.Wait()
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/ivfflat/kmeans"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/ivfflat/kmeans/elkans"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/metric"
+	"github.com/matrixorigin/matrixone/pkg/common/concurrent"
 	cuvs "github.com/rapidsai/cuvs/go"
 	"github.com/rapidsai/cuvs/go/ivf_flat"
 )
@@ -36,84 +37,79 @@ type GpuClusterer[T cuvs.TensorNumberType] struct {
 	nlist       int
 	dim         int
 	vectors     [][]T
+	worker      *concurrent.CuvsWorker
 }
 
 func (c *GpuClusterer[T]) InitCentroids(ctx context.Context) error {
-
 	return nil
 }
 
 func (c *GpuClusterer[T]) Cluster(ctx context.Context) (any, error) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	jobID, err := c.worker.Submit(func(resource *cuvs.Resource) (any, error) {
+		dataset, err := cuvs.NewTensor(c.vectors)
+		if err != nil {
+			return nil, err
+		}
+		defer dataset.Close()
 
-	stream, err := cuvs.NewCudaStream()
+		index, err := ivf_flat.CreateIndex[T](c.indexParams)
+		if err != nil {
+			return nil, err
+		}
+		defer index.Close()
+
+		if _, err := dataset.ToDevice(resource); err != nil {
+			return nil, err
+		}
+
+		centers, err := cuvs.NewTensorOnDevice[T](resource, []int64{int64(c.nlist), int64(c.dim)})
+		if err != nil {
+			return nil, err
+		}
+		defer centers.Close()
+
+		if err := ivf_flat.BuildIndex(*resource, c.indexParams, &dataset, index); err != nil {
+			return nil, err
+		}
+
+		if err := resource.Sync(); err != nil {
+			return nil, err
+		}
+
+		if err := ivf_flat.GetCenters(index, &centers); err != nil {
+			return nil, err
+		}
+
+		if _, err := centers.ToHost(resource); err != nil {
+			return nil, err
+		}
+
+		if err := resource.Sync(); err != nil {
+			return nil, err
+		}
+
+		result, err := centers.Slice()
+		if err != nil {
+			return nil, err
+		}
+
+		runtime.KeepAlive(index)
+		runtime.KeepAlive(dataset)
+		runtime.KeepAlive(centers)
+		runtime.KeepAlive(c)
+		return result, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer stream.Close()
-
-	resource, err := cuvs.NewResource(stream)
+	result, err := c.worker.Wait(jobID)
 	if err != nil {
 		return nil, err
 	}
-	defer resource.Close()
-	defer runtime.KeepAlive(resource)
-
-	dataset, err := cuvs.NewTensor(c.vectors)
-	if err != nil {
-		return nil, err
+	if result.Error != nil {
+		return nil, result.Error
 	}
-	defer dataset.Close()
-
-	index, err := ivf_flat.CreateIndex[T](c.indexParams)
-	if err != nil {
-		return nil, err
-	}
-	defer index.Close()
-
-	if _, err := dataset.ToDevice(&resource); err != nil {
-		return nil, err
-	}
-
-	centers, err := cuvs.NewTensorOnDevice[T](&resource, []int64{int64(c.nlist), int64(c.dim)})
-	if err != nil {
-		return nil, err
-	}
-	defer centers.Close()
-
-	if err := ivf_flat.BuildIndex(resource, c.indexParams, &dataset, index); err != nil {
-		return nil, err
-	}
-
-	if err := resource.Sync(); err != nil {
-		return nil, err
-	}
-
-	if err := ivf_flat.GetCenters(index, &centers); err != nil {
-		return nil, err
-	}
-
-	if _, err := centers.ToHost(&resource); err != nil {
-		return nil, err
-	}
-
-	if err := resource.Sync(); err != nil {
-		return nil, err
-	}
-
-	result, err := centers.Slice()
-	if err != nil {
-		return nil, err
-	}
-
-	runtime.KeepAlive(resource)
-	runtime.KeepAlive(stream)
-	runtime.KeepAlive(index)
-	runtime.KeepAlive(dataset)
-	runtime.KeepAlive(centers)
-	runtime.KeepAlive(c)
-	return result, nil
+	return result.Result, nil
 }
 
 func (c *GpuClusterer[T]) SSE() (float64, error) {
@@ -123,6 +119,9 @@ func (c *GpuClusterer[T]) SSE() (float64, error) {
 func (c *GpuClusterer[T]) Close() error {
 	if c.indexParams != nil {
 		c.indexParams.Close()
+	}
+	if c.worker != nil {
+		c.worker.Stop()
 	}
 	return nil
 }
@@ -161,6 +160,9 @@ func NewKMeans[T types.RealNumbers](vectors [][]T, clusterCnt,
 		c.vectors = vecs
 		c.dim = len(vecs[0])
 
+		// GPU - nworker is 1
+		c.worker = concurrent.NewCuvsWorker(uint(1))
+
 		indexParams, err := ivf_flat.CreateIndexParams()
 		if err != nil {
 			return nil, err
@@ -170,6 +172,7 @@ func NewKMeans[T types.RealNumbers](vectors [][]T, clusterCnt,
 		indexParams.SetKMeansNIters(uint32(maxIterations))
 		indexParams.SetKMeansTrainsetFraction(1) // train all sample
 		c.indexParams = indexParams
+		c.worker.Start(nil, nil)
 		return c, nil
 	default:
 		return elkans.NewKMeans(vectors, clusterCnt, maxIterations, deltaThreshold, distanceType, initType, spherical, nworker)
