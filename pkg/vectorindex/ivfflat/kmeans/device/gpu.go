@@ -22,12 +22,12 @@ import (
 	"context"
 	"runtime"
 
+	"github.com/matrixorigin/matrixone/pkg/common/concurrent"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/ivfflat/kmeans"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/ivfflat/kmeans/elkans"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/metric"
-	"github.com/matrixorigin/matrixone/pkg/common/concurrent"
 	cuvs "github.com/rapidsai/cuvs/go"
 	"github.com/rapidsai/cuvs/go/ivf_flat"
 )
