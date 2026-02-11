@@ -107,7 +107,6 @@ func getCenters(vecs [][]float32, dim int, clusterCnt int, distanceType cuvs.Dis
 
 func Search(datasetvec [][]float32, queriesvec [][]float32, limit uint, distanceType cuvs.Distance) (retkeys any, retdistances []float64, err error) {
 
-
 	stream, err := cuvs.NewCudaStream()
 	if err != nil {
 		return
@@ -226,101 +225,103 @@ func Search(datasetvec [][]float32, queriesvec [][]float32, limit uint, distance
 	return
 }
 
-
 func TestIssueGpu(t *testing.T) {
-        runtime.LockOSThread()
-        defer runtime.UnlockOSThread()
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 
-        dimension := uint(128)
-        /*
-                ncpu := uint(1)
-                elemsz := uint(4) // float32
-        */
+		dimension := uint(128)
+		/*
+		   ncpu := uint(1)
+		   elemsz := uint(4) // float32
+		*/
 
-        dsize := 100000
-        nlist := 128
-        vecs := make([][]float32, dsize)
-        for i := range vecs {
-                vecs[i] = make([]float32, dimension)
-                for j := range vecs[i] {
-                        vecs[i][j] = rand.Float32()
-                }
-        }
+		dsize := 100000
+		nlist := 128
+		vecs := make([][]float32, dsize)
+		for i := range vecs {
+			vecs[i] = make([]float32, dimension)
+			for j := range vecs[i] {
+				vecs[i][j] = rand.Float32()
+			}
+		}
 
-        _, err := getCenters(vecs, int(dimension), nlist, cuvs.DistanceL2, 10)
-        require.NoError(t, err)
+		_, err := getCenters(vecs, int(dimension), nlist, cuvs.DistanceL2, 10)
+		require.NoError(t, err)
+	}()
 }
 
 func TestIssueIvfAndBruteForceForIssue(t *testing.T) {
+	go func() {
 
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 
-	mem, err := cuvs.NewCuvsPoolMemory(60, 100, false)
-	if err != nil {
-		t.Fatal("Failed to create memory resource:", err)
-	}
-
-	defer func() {
-		err = mem.Close()
+		mem, err := cuvs.NewCuvsPoolMemory(60, 100, false)
 		if err != nil {
-			t.Fatal("Failed to close memory resource:", err)
+			t.Fatal("Failed to create memory resource:", err)
 		}
-	}()
 
-
-	dimension := uint(128)
-	limit := uint(1)
-	/*
-		ncpu := uint(1)
-		elemsz := uint(4) // float32
-	*/
-
-	dsize := 100000
-	nlist := 128
-	vecs := make([][]float32, dsize)
-	for i := range vecs {
-		vecs[i] = make([]float32, dimension)
-		for j := range vecs[i] {
-			vecs[i][j] = rand.Float32()
-		}
-	}
-	queries := vecs[:8192]
-
-	centers, err := getCenters(vecs, int(dimension), nlist, cuvs.DistanceL2, 10)
-	require.NoError(t, err)
-	
-	fmt.Println("centers DONE")
-
-	var wg sync.WaitGroup
-
-	for n := 0; n < 8; n++ {
-
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			runtime.LockOSThread()
-			defer runtime.UnlockOSThread()
-
-			for i := 0; i < 1000; i++ {
-				_, _, err := Search(centers, queries, limit, cuvs.DistanceL2)
-				require.NoError(t, err)
-
-				/*
-					keys_i64, ok := keys.([]int64)
-					require.Equal(t, ok, true)
-
-					for j, key := range keys_i64 {
-						require.Equal(t, key, int64(j))
-						require.Equal(t, distances[j], float64(0))
-					}
-				*/
-				// fmt.Printf("keys %v, dist %v\n", keys, distances)
+		defer func() {
+			err = mem.Close()
+			if err != nil {
+				t.Fatal("Failed to close memory resource:", err)
 			}
 		}()
-	}
 
-	wg.Wait()
+		dimension := uint(128)
+		limit := uint(1)
+		/*
+			ncpu := uint(1)
+			elemsz := uint(4) // float32
+		*/
 
+		dsize := 100000
+		nlist := 128
+		vecs := make([][]float32, dsize)
+		for i := range vecs {
+			vecs[i] = make([]float32, dimension)
+			for j := range vecs[i] {
+				vecs[i][j] = rand.Float32()
+			}
+		}
+		queries := vecs[:8192]
+
+		centers, err := getCenters(vecs, int(dimension), nlist, cuvs.DistanceL2, 10)
+		require.NoError(t, err)
+
+		fmt.Println("centers DONE")
+
+		var wg sync.WaitGroup
+
+		for n := 0; n < 8; n++ {
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				runtime.LockOSThread()
+				defer runtime.UnlockOSThread()
+
+				for i := 0; i < 1000; i++ {
+					_, _, err := Search(centers, queries, limit, cuvs.DistanceL2)
+					require.NoError(t, err)
+
+					/*
+						keys_i64, ok := keys.([]int64)
+						require.Equal(t, ok, true)
+
+						for j, key := range keys_i64 {
+							require.Equal(t, key, int64(j))
+							require.Equal(t, distances[j], float64(0))
+						}
+					*/
+					// fmt.Printf("keys %v, dist %v\n", keys, distances)
+				}
+			}()
+		}
+
+		wg.Wait()
+
+	}()
 }

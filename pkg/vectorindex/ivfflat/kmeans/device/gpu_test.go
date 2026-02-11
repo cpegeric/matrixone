@@ -18,11 +18,11 @@ package device
 
 import (
 	//"fmt"
+	"context"
 	"math/rand/v2"
 	"runtime"
 	"sync"
 	"testing"
-	"context"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
@@ -34,110 +34,114 @@ import (
 )
 
 func TestGpu(t *testing.T) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 
-	dim := 128
-	dsize := 1024
-	nlist := 128
-	vecs := make([][]float32, dsize)
-	for i := range vecs {
-		vecs[i] = make([]float32, dim)
-		for j := range vecs[i] {
-			vecs[i][j] = rand.Float32()
+		dim := 128
+		dsize := 1024
+		nlist := 128
+		vecs := make([][]float32, dsize)
+		for i := range vecs {
+			vecs[i] = make([]float32, dim)
+			for j := range vecs[i] {
+				vecs[i][j] = rand.Float32()
+			}
 		}
-	}
 
-	c, err := NewKMeans[float32](vecs, nlist, 10, 0, metric.Metric_L2Distance, 0, false, 0)
-	require.NoError(t, err)
+		c, err := NewKMeans[float32](vecs, nlist, 10, 0, metric.Metric_L2Distance, 0, false, 0)
+		require.NoError(t, err)
 
-	centers, err := c.Cluster(context.Background())
-	require.NoError(t, err)
+		centers, err := c.Cluster(context.Background())
+		require.NoError(t, err)
 
-	_, ok := centers.([][]float32)
-	require.True(t, ok)
+		_, ok := centers.([][]float32)
+		require.True(t, ok)
 
-	/*
-		for k, center := range centroids {
-			fmt.Printf("center[%d] = %v\n", k, center)
-		}
-	*/
+		/*
+			for k, center := range centroids {
+				fmt.Printf("center[%d] = %v\n", k, center)
+			}
+		*/
+	}()
 }
 
 func TestIVFAndBruteForce(t *testing.T) {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
+	go func() {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
 
-	m := mpool.MustNewZero()
-	proc := testutil.NewProcessWithMPool(t, "", m)
-	sqlproc := sqlexec.NewSqlProcess(proc)
-	dimension := uint(128)
-	ncpu := uint(1)
-	limit := uint(1)
-	elemsz := uint(4) // float32
+		m := mpool.MustNewZero()
+		proc := testutil.NewProcessWithMPool(t, "", m)
+		sqlproc := sqlexec.NewSqlProcess(proc)
+		dimension := uint(128)
+		ncpu := uint(1)
+		limit := uint(1)
+		elemsz := uint(4) // float32
 
-	dsize := 100000
-	nlist := 128
-	vecs := make([][]float32, dsize)
-	for i := range vecs {
-		vecs[i] = make([]float32, dimension)
-		for j := range vecs[i] {
-			vecs[i][j] = rand.Float32()
-		}
-	}
-
-	c, err := NewKMeans[float32](vecs, nlist, 10, 0, metric.Metric_L2Distance, 0, false, 0)
-	require.NoError(t, err)
-
-	centers, err := c.Cluster(context.Background())
-	require.NoError(t, err)
-
-	centroids, ok := centers.([][]float32)
-	require.True(t, ok)
-
-	/*
-		for k, center := range centroids {
-			fmt.Printf("center[%d] = %v\n", k, center)
-		}
-	*/
-
-	queries := vecs[:8192]
-	idx, err := mobf.NewBruteForceIndex[float32](centroids, dimension, metric.Metric_L2sqDistance, elemsz)
-	require.NoError(t, err)
-	defer idx.Destroy()
-
-	err = idx.Load(nil)
-	require.NoError(t, err)
-
-	rt := vectorindex.RuntimeConfig{Limit: limit, NThreads: ncpu}
-
-	var wg sync.WaitGroup
-
-	for n := 0; n < 4; n++ {
-
-		wg.Add(1)
-		go func() {
-			runtime.LockOSThread()
-			defer runtime.UnlockOSThread()
-			defer wg.Done()
-			for i := 0; i < 1000; i++ {
-				_, _, err := idx.Search(sqlproc, queries, rt)
-				require.NoError(t, err)
-				/*
-
-					keys_i64, ok := keys.([]int64)
-					require.Equal(t, ok, true)
-
-					for j, key := range keys_i64 {
-						require.Equal(t, key, int64(j))
-						require.Equal(t, distances[j], float64(0))
-					}
-				*/
-				// fmt.Printf("keys %v, dist %v\n", keys, distances)
+		dsize := 100000
+		nlist := 128
+		vecs := make([][]float32, dsize)
+		for i := range vecs {
+			vecs[i] = make([]float32, dimension)
+			for j := range vecs[i] {
+				vecs[i][j] = rand.Float32()
 			}
-		}()
-	}
+		}
 
-	wg.Wait()
+		c, err := NewKMeans[float32](vecs, nlist, 10, 0, metric.Metric_L2Distance, 0, false, 0)
+		require.NoError(t, err)
+
+		centers, err := c.Cluster(context.Background())
+		require.NoError(t, err)
+
+		centroids, ok := centers.([][]float32)
+		require.True(t, ok)
+
+		/*
+			for k, center := range centroids {
+				fmt.Printf("center[%d] = %v\n", k, center)
+			}
+		*/
+
+		queries := vecs[:8192]
+		idx, err := mobf.NewBruteForceIndex[float32](centroids, dimension, metric.Metric_L2sqDistance, elemsz, ncpu)
+		require.NoError(t, err)
+		defer idx.Destroy()
+
+		err = idx.Load(nil)
+		require.NoError(t, err)
+
+		rt := vectorindex.RuntimeConfig{Limit: limit, NThreads: ncpu}
+
+		var wg sync.WaitGroup
+
+		for n := 0; n < 4; n++ {
+
+			wg.Add(1)
+			go func() {
+				runtime.LockOSThread()
+				defer runtime.UnlockOSThread()
+				defer wg.Done()
+				for i := 0; i < 1000; i++ {
+					_, _, err := idx.Search(sqlproc, queries, rt)
+					require.NoError(t, err)
+					/*
+
+						keys_i64, ok := keys.([]int64)
+						require.Equal(t, ok, true)
+
+						for j, key := range keys_i64 {
+							require.Equal(t, key, int64(j))
+							require.Equal(t, distances[j], float64(0))
+						}
+					*/
+					// fmt.Printf("keys %v, dist %v\n", keys, distances)
+				}
+			}()
+		}
+
+		wg.Wait()
+	}()
 
 }
