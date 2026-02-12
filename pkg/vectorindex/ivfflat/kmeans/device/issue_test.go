@@ -71,7 +71,7 @@ func getCenters(vecs [][]float32, dim int, clusterCnt int, distanceType cuvs.Dis
 		return nil, err
 	}
 
-	centers, err := cuvs.NewTensorOnDevice[float32](&resource, []int64{int64(clusterCnt), int64(dim)})
+	centers, err := cuvs.NewTensorNoDataOnDevice[float32](&resource, []int64{int64(clusterCnt), int64(dim)})
 	if err != nil {
 		return nil, err
 	}
@@ -85,6 +85,10 @@ func getCenters(vecs [][]float32, dim int, clusterCnt int, distanceType cuvs.Dis
 	}
 
 	if err := ivf_flat.GetCenters(index, &centers); err != nil {
+		return nil, err
+	}
+
+	if err := resource.Sync(); err != nil {
 		return nil, err
 	}
 
