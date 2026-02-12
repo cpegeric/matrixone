@@ -62,7 +62,7 @@ func (c *GpuClusterer[T]) Cluster(ctx context.Context) (any, error) {
 			return nil, err
 		}
 
-		centers, err := cuvs.NewTensorOnDevice[T](resource, []int64{int64(c.nlist), int64(c.dim)})
+		centers, err := cuvs.NewTensorNoDataOnDevice[T](resource, []int64{int64(c.nlist), int64(c.dim)})
 		if err != nil {
 			return nil, err
 		}
@@ -77,6 +77,10 @@ func (c *GpuClusterer[T]) Cluster(ctx context.Context) (any, error) {
 		}
 
 		if err := ivf_flat.GetCenters(index, &centers); err != nil {
+			return nil, err
+		}
+
+		if err := resource.Sync(); err != nil {
 			return nil, err
 		}
 

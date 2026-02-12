@@ -17,8 +17,8 @@
 package device
 
 import (
-	//"fmt"
 	"context"
+	//"fmt"
 	"math/rand/v2"
 	"sync"
 	"testing"
@@ -123,17 +123,6 @@ func TestIVFAndBruteForce(t *testing.T) {
 			for i := 0; i < 1000; i++ {
 				_, _, err := idx.Search(sqlproc, queries, rt)
 				require.NoError(t, err)
-				/*
-
-					keys_i64, ok := keys.([]int64)
-					require.Equal(t, ok, true)
-
-					for j, key := range keys_i64 {
-						require.Equal(t, key, int64(j))
-						require.Equal(t, distances[j], float64(0))
-					}
-				*/
-				// fmt.Printf("keys %v, dist %v\n", keys, distances)
 			}
 		}()
 	}
