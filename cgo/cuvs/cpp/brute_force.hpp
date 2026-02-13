@@ -15,6 +15,10 @@
 #include <future>      // For std::promise and std::future
 #include <limits>      // For std::numeric_limits
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 // RAFT includes
 #include <raft/core/device_mdarray.hpp> // For raft::device_matrix
 #include <raft/core/device_mdspan.hpp>   // Required for device_matrix_view
@@ -26,6 +30,7 @@
 // cuVS includes
 #include <cuvs/distance/distance.hpp>    // cuVS distance API
 #include <cuvs/neighbors/brute_force.hpp> // Correct include
+#pragma GCC diagnostic pop
 
 
 namespace matrixone {
@@ -90,7 +95,7 @@ public:
             init_complete_promise.set_value(true); // Signal that initialization is complete
             return std::any();
         };
-        auto stop_fn = [&](RaftHandleWrapper& handle) -> std::any {
+        auto stop_fn = [&]([[maybe_unused]] RaftHandleWrapper& handle) -> std::any {
             if (Index) { // Check if unique_ptr holds an object
                 Index.reset();
             }

@@ -31,7 +31,7 @@ std::string to_string_for_assertion(const T& val) {
     oss << val;
     return oss.str();
 }
-inline std::string to_string_for_assertion(const std::any& val) { return "std::any"; } // Simplified
+inline std::string to_string_for_assertion(const std::any&) { return "std::any"; } // Simplified
 inline std::string to_string_for_assertion(const char* val) { return std::string(val); }
 
 // Helper to check if an exception_ptr holds a specific exception type (kept minimal)

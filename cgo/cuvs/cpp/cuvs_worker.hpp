@@ -21,9 +21,14 @@
 #include <pthread.h>
 #endif
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
 #include <raft/core/resources.hpp> // For raft::resources
 #include <raft/core/resource/cuda_stream.hpp> // For raft::cuda_stream
 #include <raft/core/handle.hpp> // For raft::handle (often embedded in resources)
+#pragma GCC diagnostic pop
 
 // Define handle_t directly in the global namespace or in matrix_origin
 // to avoid conflicts with cuvs's internal namespace resolution of raft types.
