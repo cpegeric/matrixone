@@ -28,7 +28,7 @@
 #include <cuvs/neighbors/brute_force.hpp> // Correct include
 
 
-namespace matrix_origin {
+namespace matrixone {
 
 // --- GpuBruteForceIndex Class ---
 template <typename T>
@@ -203,4 +203,4 @@ public:
     }
 };
 
-} // namespace matrix_origin
+} // namespace matrixone
