@@ -55,7 +55,7 @@ inline RaftHandleWrapper::~RaftHandleWrapper() {
     // std::cout << "DEBUG: RAFT handle destroyed." << std::endl;
 }
 
-namespace matrix_origin {
+namespace matrixone {
 
 // --- Forward Declarations for CuvsWorker related types ---
 struct CuvsTaskResult;
@@ -646,4 +646,4 @@ inline std::exception_ptr CuvsWorker::GetFirstError() {
     return first_error_;
 }
 
-} // namespace matrix_origin
+} // namespace matrixone
