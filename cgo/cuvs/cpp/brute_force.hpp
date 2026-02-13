@@ -44,6 +44,10 @@ public:
     uint32_t ElementSize;
     std::unique_ptr<CuvsWorker> Worker;
 
+    ~GpuBruteForceIndex() {
+        Destroy();
+    }
+
     GpuBruteForceIndex(const std::vector<std::vector<T>>& dataset_data, uint32_t dimension, cuvs::distance::DistanceType m,
                        uint32_t elemsz, uint32_t nthread)
         : Dimension(dimension), ElementSize(elemsz), HostDataset(dataset_data) { // Initialize HostDataset directly
