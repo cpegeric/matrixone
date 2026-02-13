@@ -46,19 +46,23 @@ public:
     cuvs::distance::DistanceType Metric;
     uint32_t Dimension;
     uint32_t Count;
-    uint32_t ElementSize;
     std::unique_ptr<CuvsWorker> Worker;
 
     ~GpuBruteForceIndex() {
         Destroy();
     }
 
-    GpuBruteForceIndex(const std::vector<std::vector<T>>& dataset_data, uint32_t dimension, cuvs::distance::DistanceType m,
-                       uint32_t elemsz, uint32_t nthread)
-        : Dimension(dimension), ElementSize(elemsz), HostDataset(dataset_data) { // Initialize HostDataset directly
+    GpuBruteForceIndex(const T* dataset_data, uint64_t count_vectors, uint32_t dimension, cuvs::distance::DistanceType m,
+                       uint32_t nthread)
+        : Dimension(dimension), Count(static_cast<uint32_t>(count_vectors)), Metric(m) {
         Worker = std::make_unique<CuvsWorker>(nthread);
-        Count = static_cast<uint32_t>(dataset_data.size());
-        Metric = m;
+
+        // Resize HostDataset and copy data from the flattened array
+        HostDataset.resize(Count);
+        for (uint32_t i = 0; i < Count; ++i) {
+            HostDataset[i].resize(Dimension);
+            std::copy(dataset_data + (i * Dimension), dataset_data + ((i + 1) * Dimension), HostDataset[i].begin());
+        }
     }
 
     void Load() {
