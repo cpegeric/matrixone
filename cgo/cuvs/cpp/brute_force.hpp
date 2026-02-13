@@ -95,7 +95,7 @@ public:
             init_complete_promise.set_value(true); // Signal that initialization is complete
             return std::any();
         };
-        auto stop_fn = [&]([[maybe_unused]] RaftHandleWrapper& handle) -> std::any {
+        auto stop_fn = [&](RaftHandleWrapper& handle) -> std::any {
             if (Index) { // Check if unique_ptr holds an object
                 Index.reset();
             }
