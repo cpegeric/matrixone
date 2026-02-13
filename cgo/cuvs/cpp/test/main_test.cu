@@ -6,7 +6,7 @@ thread_local bool current_test_failed = false;
 
 
 // Forward declare the namespace for convenience
-using namespace matrix_origin;
+using namespace matrixone;
 
 // Helper to check if an exception_ptr holds a specific exception type
 // template <typename E>

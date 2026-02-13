@@ -3,7 +3,7 @@
 #include "test_framework.hpp" // Include the custom test framework
 
 // Forward declare the namespace for convenience
-using namespace matrix_origin;
+using namespace matrixone;
 
 // --- GpuBruteForceIndex Tests ---
 
