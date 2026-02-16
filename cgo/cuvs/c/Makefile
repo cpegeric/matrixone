@@ -21,18 +21,23 @@ HOST_LDFLAGS := -lpthread -lm
 
 LDFLAGS := $(NVCC_LDFLAGS) $(addprefix -Xlinker ,$(HOST_LDFLAGS))
 
-# Output shared library name
-TARGET_LIB := libbrute_force_c.so
+# Output library names
+TARGET_SHARED_LIB := libbrute_force_c.so
+TARGET_STATIC_LIB := libbrute_force_c.a
 SOURCE_FILE := brute_force_c.cpp
 OBJECT_FILE := $(SOURCE_FILE:.cpp=.o)
 
 .PHONY: all clean
 
-all: $(TARGET_LIB)
+all: $(TARGET_SHARED_LIB) $(TARGET_STATIC_LIB)
 
-$(TARGET_LIB): $(OBJECT_FILE)
-	@echo "Linking $@"
+$(TARGET_SHARED_LIB): $(OBJECT_FILE)
+	@echo "Linking shared library $@"
 	$(NVCC) -shared $(OBJECT_FILE) $(LDFLAGS) -o $@
+
+$(TARGET_STATIC_LIB): $(OBJECT_FILE)
+	@echo "Creating static library $@"
+	ar rcs $@ $<
 
 $(OBJECT_FILE): $(SOURCE_FILE)
 	@echo "Compiling $< with NVCC (as CUDA C++)"
@@ -40,4 +45,4 @@ $(OBJECT_FILE): $(SOURCE_FILE)
 
 clean:
 	@echo "Cleaning up..."
-	rm -f $(TARGET_LIB) $(OBJECT_FILE)
+	rm -f $(TARGET_SHARED_LIB) $(TARGET_STATIC_LIB) $(OBJECT_FILE)
