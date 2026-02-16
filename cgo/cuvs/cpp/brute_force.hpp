@@ -115,55 +115,62 @@ public:
         std::vector<std::vector<float>> Distances;
     };
 
-    SearchResult Search(const std::vector<std::vector<T>>& queries_data, uint32_t limit) {
-        if (queries_data.empty() || queries_data[0].empty()) {
+    SearchResult Search(const T* queries_data, uint64_t num_queries, uint32_t query_dimension, uint32_t limit) {
+        if (!queries_data || num_queries == 0 || Dimension == 0) { // Check for invalid input
             return SearchResult{};
         }
-        if (limit == 0) { // Handle limit = 0 explicitly as cuVS requires k > 0
+        if (query_dimension != this->Dimension) {
+            throw std::runtime_error("Query dimension does not match index dimension.");
+        }
+        if (limit == 0) {
             // Return empty vectors of correct dimensions for the number of queries
-            std::vector<std::vector<int64_t>> neighbors_vec(queries_data.size());
-            std::vector<std::vector<float>> distances_vec(queries_data.size());
+            std::vector<std::vector<int64_t>> neighbors_vec(num_queries);
+            std::vector<std::vector<float>> distances_vec(num_queries);
             return SearchResult{neighbors_vec, distances_vec};
         }
         if (!Index) {
             return SearchResult{};
         }
 
-        size_t queries_rows = queries_data.size();
-        size_t queries_cols = queries_data[0].size();
+        size_t queries_rows = num_queries;
+        size_t queries_cols = Dimension; // Use the class's Dimension
 
         uint64_t jobID = Worker->Submit(
             [&](RaftHandleWrapper& handle) -> std::any {
-                // Create host_matrix from queries_data
-                auto queries_host_matrix = raft::make_host_matrix<T, int64_t, raft::layout_c_contiguous>(*handle.get_raft_resources(), static_cast<int64_t>(queries_rows), static_cast<int64_t>(queries_cols));
-                for (size_t i = 0; i < queries_rows; ++i) {
-                    if (queries_data[i].size() != queries_cols) {
-                        throw std::runtime_error("Ragged array not supported for raft::host_matrix conversion for queries.");
-                    }
-                    std::copy(queries_data[i].begin(), queries_data[i].end(), queries_host_matrix.data_handle() + i * queries_cols);
-                }
-
-                auto queries_device = raft::make_device_matrix<T, int64_t, raft::layout_c_contiguous>(*handle.get_raft_resources(), static_cast<int64_t>(queries_host_matrix.extent(0)), static_cast<int64_t>(queries_host_matrix.extent(1)));
-                RAFT_CUDA_TRY(cudaMemcpy(queries_device.data_handle(), queries_host_matrix.data_handle(), queries_host_matrix.size() * sizeof(T), cudaMemcpyHostToDevice));
-
-                auto neighbors_device = raft::make_device_matrix<int64_t, int64_t, raft::layout_c_contiguous>(*handle.get_raft_resources(), static_cast<int64_t>(queries_rows), static_cast<int64_t>(limit));
-                auto distances_device = raft::make_device_matrix<float, int64_t, raft::layout_c_contiguous>(*handle.get_raft_resources(), static_cast<int64_t>(queries_rows), static_cast<int64_t>(limit));
-
-                cuvs::neighbors::brute_force::search_params search_params; // Correct brute_force namespace
+                // Create host_matrix directly from flattened queries_data
+                // No need for intermediate std::vector<std::vector<T>>
+                auto queries_host_matrix = raft::make_host_matrix<T, int64_t, raft::layout_c_contiguous>(
+                    *handle.get_raft_resources(), static_cast<int64_t>(queries_rows), static_cast<int64_t>(queries_cols));
                 
-                // Get the index object from the unique_ptr
-                cuvs::neighbors::brute_force::index<T, float>& index_obj = *Index; // Use the actual Index member
+                // Copy the flattened data to queries_host_matrix
+                std::copy(queries_data, queries_data + (queries_rows * queries_cols), queries_host_matrix.data_handle());
 
-                cuvs::neighbors::brute_force::search(*handle.get_raft_resources(), search_params, index_obj, raft::make_const_mdspan(queries_device.view()), neighbors_device.view(), distances_device.view()); // Use raft::make_const_mdspan
+                auto queries_device = raft::make_device_matrix<T, int64_t, raft::layout_c_contiguous>(
+                    *handle.get_raft_resources(), static_cast<int64_t>(queries_host_matrix.extent(0)), static_cast<int64_t>(queries_host_matrix.extent(1)));
+                RAFT_CUDA_TRY(cudaMemcpy(queries_device.data_handle(), queries_host_matrix.data_handle(),
+                                         queries_host_matrix.size() * sizeof(T), cudaMemcpyHostToDevice));
 
-                // Synchronize the CUDA stream before copying results back to host
-                raft::resource::sync_stream(*handle.get_raft_resources()); // Corrected to use raft::resource::sync_stream with resources object
+                auto neighbors_device = raft::make_device_matrix<int64_t, int64_t, raft::layout_c_contiguous>(
+                    *handle.get_raft_resources(), static_cast<int64_t>(queries_rows), static_cast<int64_t>(limit));
+                auto distances_device = raft::make_device_matrix<float, int64_t, raft::layout_c_contiguous>(
+                    *handle.get_raft_resources(), static_cast<int64_t>(queries_rows), static_cast<int64_t>(limit));
 
-                auto neighbors_host = raft::make_host_matrix<int64_t, int64_t, raft::layout_c_contiguous>(*handle.get_raft_resources(), static_cast<int64_t>(neighbors_device.extent(0)), static_cast<int64_t>(neighbors_device.extent(1)));
-                auto distances_host = raft::make_host_matrix<float, int64_t, raft::layout_c_contiguous>(*handle.get_raft_resources(), static_cast<int64_t>(distances_device.extent(0)), static_cast<int64_t>(distances_device.extent(1)));
+                cuvs::neighbors::brute_force::search_params search_params;
+                cuvs::neighbors::brute_force::index<T, float>& index_obj = *Index;
+                cuvs::neighbors::brute_force::search(*handle.get_raft_resources(), search_params, index_obj,
+                                                     raft::make_const_mdspan(queries_device.view()), neighbors_device.view(), distances_device.view());
+
+                raft::resource::sync_stream(*handle.get_raft_resources());
+
+                auto neighbors_host = raft::make_host_matrix<int64_t, int64_t, raft::layout_c_contiguous>(
+                    *handle.get_raft_resources(), static_cast<int64_t>(neighbors_device.extent(0)), static_cast<int64_t>(neighbors_device.extent(1)));
+                auto distances_host = raft::make_host_matrix<float, int64_t, raft::layout_c_contiguous>(
+                    *handle.get_raft_resources(), static_cast<int64_t>(distances_device.extent(0)), static_cast<int64_t>(distances_device.extent(1)));
                 
-                RAFT_CUDA_TRY(cudaMemcpy(neighbors_host.data_handle(), neighbors_device.data_handle(), neighbors_host.size() * sizeof(int64_t), cudaMemcpyDeviceToHost));
-                RAFT_CUDA_TRY(cudaMemcpy(distances_host.data_handle(), distances_device.data_handle(), distances_host.size() * sizeof(float), cudaMemcpyDeviceToHost));
+                RAFT_CUDA_TRY(cudaMemcpy(neighbors_host.data_handle(), neighbors_device.data_handle(),
+                                         neighbors_host.size() * sizeof(int64_t), cudaMemcpyDeviceToHost));
+                RAFT_CUDA_TRY(cudaMemcpy(distances_host.data_handle(), distances_device.data_handle(),
+                                         distances_host.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
                 std::vector<std::vector<int64_t>> neighbors_vec;
                 std::vector<std::vector<float>> distances_vec;
@@ -180,10 +187,8 @@ public:
                         int64_t neighbor_idx = neighbors_host(i, j);
                         float distance_val = distances_host(i, j);
 
-                        // Filter out invalid neighbors (UINT_MAX and FLT_MAX)
-                        // cuVS uses numeric_limits<int64_t>::max() for invalid indices and numeric_limits<float>::max() for invalid distances
                         if (neighbor_idx != std::numeric_limits<int64_t>::max() &&
-                            !std::isinf(distance_val) && // Check for infinity
+                            !std::isinf(distance_val) &&
                             distance_val != std::numeric_limits<float>::max()) {
                             current_neighbors.push_back(neighbor_idx);
                             current_distances.push_back(distance_val);
