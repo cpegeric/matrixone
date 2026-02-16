@@ -41,7 +41,7 @@ class GpuBruteForceIndex {
     static_assert(std::is_floating_point<T>::value, "T must be a floating-point type.");
 
 public:
-    std::vector<std::vector<T>> HostDataset; // Store raw data as std::vector
+    std::vector<T> flattened_host_dataset; // Store flattened data as std::vector
     std::unique_ptr<cuvs::neighbors::brute_force::index<T, float>> Index; // Corrected Index type to float
     cuvs::distance::DistanceType Metric;
     uint32_t Dimension;
@@ -57,12 +57,9 @@ public:
         : Dimension(dimension), Count(static_cast<uint32_t>(count_vectors)), Metric(m) {
         Worker = std::make_unique<CuvsWorker>(nthread);
 
-        // Resize HostDataset and copy data from the flattened array
-        HostDataset.resize(Count);
-        for (uint32_t i = 0; i < Count; ++i) {
-            HostDataset[i].resize(Dimension);
-            std::copy(dataset_data + (i * Dimension), dataset_data + ((i + 1) * Dimension), HostDataset[i].begin());
-        }
+        // Resize flattened_host_dataset and copy data from the flattened array
+        flattened_host_dataset.resize(Count * Dimension); // Total elements
+        std::copy(dataset_data, dataset_data + (Count * Dimension), flattened_host_dataset.begin());
     }
 
     void Load() {
@@ -70,23 +67,24 @@ public:
         std::future<bool> init_complete_future = init_complete_promise.get_future();
 
         auto init_fn = [&](RaftHandleWrapper& handle) -> std::any {
-            if (HostDataset.empty()) {
+            if (flattened_host_dataset.empty()) { // Use new member
                 Index = nullptr; // Ensure Index is null if no data
                 init_complete_promise.set_value(true); // Signal completion even if empty
                 return std::any();
             }
 
-            // Create host_matrix from HostDataset
-            auto dataset_host_matrix = raft::make_host_matrix<T, int64_t, raft::layout_c_contiguous>(*handle.get_raft_resources(), static_cast<int64_t>(HostDataset.size()), static_cast<int64_t>(HostDataset[0].size()));
-            for (size_t i = 0; i < HostDataset.size(); ++i) {
-                if (HostDataset[i].size() != HostDataset[0].size()) {
-                    throw std::runtime_error("Ragged array not supported for raft::host_matrix conversion.");
-                }
-                std::copy(HostDataset[i].begin(), HostDataset[i].end(), dataset_host_matrix.data_handle() + i * HostDataset[0].size());
-            }
+            // Create host_matrix from flattened_host_dataset
+            // HostDataset.size() is Count, HostDataset[0].size() is Dimension
+            auto dataset_host_matrix = raft::make_host_matrix<T, int64_t, raft::layout_c_contiguous>(
+                *handle.get_raft_resources(), static_cast<int64_t>(Count), static_cast<int64_t>(Dimension));
+            
+            // Single std::copy from flattened_host_dataset to dataset_host_matrix
+            std::copy(flattened_host_dataset.begin(), flattened_host_dataset.end(), dataset_host_matrix.data_handle());
 
-            auto dataset_device = raft::make_device_matrix<T, int64_t, raft::layout_c_contiguous>(*handle.get_raft_resources(), static_cast<int64_t>(dataset_host_matrix.extent(0)), static_cast<int64_t>(dataset_host_matrix.extent(1)));
-            RAFT_CUDA_TRY(cudaMemcpy(dataset_device.data_handle(), dataset_host_matrix.data_handle(), dataset_host_matrix.size() * sizeof(T), cudaMemcpyHostToDevice));
+            auto dataset_device = raft::make_device_matrix<T, int64_t, raft::layout_c_contiguous>(
+                *handle.get_raft_resources(), static_cast<int64_t>(dataset_host_matrix.extent(0)), static_cast<int64_t>(dataset_host_matrix.extent(1)));
+            RAFT_CUDA_TRY(cudaMemcpy(dataset_device.data_handle(), dataset_host_matrix.data_handle(),
+                                     dataset_host_matrix.size() * sizeof(T), cudaMemcpyHostToDevice));
 
             cuvs::neighbors::brute_force::index_params index_params; // Correct brute_force namespace
             index_params.metric = Metric;
