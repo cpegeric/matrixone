@@ -14,6 +14,7 @@
 #include <vector>
 #include <future>      // For std::promise and std::future
 #include <limits>      // For std::numeric_limits
+#include <shared_mutex> // For std::shared_mutex
 
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-parameter"
@@ -47,6 +48,7 @@ public:
     uint32_t Dimension;
     uint32_t Count;
     std::unique_ptr<CuvsWorker> Worker;
+    std::shared_mutex mutex_; // Mutex to protect Load() and Search()
 
     ~GpuBruteForceIndex() {
         Destroy();
@@ -63,6 +65,7 @@ public:
     }
 
     void Load() {
+        std::unique_lock<std::shared_mutex> lock(mutex_); // Acquire exclusive lock
         std::promise<bool> init_complete_promise;
         std::future<bool> init_complete_future = init_complete_promise.get_future();
 
@@ -114,6 +117,7 @@ public:
     };
 
     SearchResult Search(const T* queries_data, uint64_t num_queries, uint32_t query_dimension, uint32_t limit) {
+        std::shared_lock<std::shared_mutex> lock(mutex_); // Acquire shared read-only lock
         if (!queries_data || num_queries == 0 || Dimension == 0) { // Check for invalid input
             return SearchResult{};
         }
