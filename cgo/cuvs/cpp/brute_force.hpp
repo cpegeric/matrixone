@@ -117,7 +117,6 @@ public:
     };
 
     SearchResult Search(const T* queries_data, uint64_t num_queries, uint32_t query_dimension, uint32_t limit) {
-        std::shared_lock<std::shared_mutex> lock(mutex_); // Acquire shared read-only lock
         if (!queries_data || num_queries == 0 || Dimension == 0) { // Check for invalid input
             return SearchResult{};
         }
@@ -139,6 +138,7 @@ public:
 
         uint64_t jobID = Worker->Submit(
             [&](RaftHandleWrapper& handle) -> std::any {
+                std::shared_lock<std::shared_mutex> lock(mutex_); // Acquire shared read-only lock inside worker thread
                 // Create host_matrix directly from flattened queries_data
                 // No need for intermediate std::vector<std::vector<T>>
                 auto queries_host_matrix = raft::make_host_matrix<T, int64_t, raft::layout_c_contiguous>(
