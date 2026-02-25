@@ -22,10 +22,12 @@ import (
 
 	"github.com/bytedance/sonic"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/common/async"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/ivfflat"
@@ -68,6 +70,8 @@ type ivfCreateState struct {
 
 	// holding one call batch, tokenizedState owns it.
 	batch *batch.Batch
+
+	clusterFuture *async.Future
 }
 
 func clustering[T types.RealNumbers](u *ivfCreateState, tf *TableFunction, proc *process.Process, data [][]T) error {
@@ -144,10 +148,18 @@ func (u *ivfCreateState) end(tf *TableFunction, proc *process.Process) error {
 		return nil
 	}
 
-	if u.data32 != nil {
-		return clustering(u, tf, proc, u.data32)
+	if u.clusterFuture != nil {
+		_, err := u.clusterFuture.Get()
+		if err == nil {
+			logutil.Infof("kmeans clustering finished")
+		}
+		return err
 	} else {
-		return clustering(u, tf, proc, u.data64)
+		if u.data32 != nil {
+			return clustering(u, tf, proc, u.data32)
+		} else {
+			return clustering(u, tf, proc, u.data64)
+		}
 	}
 }
 
@@ -305,6 +317,18 @@ func (u *ivfCreateState) start(tf *TableFunction, proc *process.Process, nthRow 
 	}
 	if uint(datasz) >= u.nsample {
 		// enough sample data
+		if u.clusterFuture == nil {
+			logutil.Infof(fmt.Sprintf("kmeans clustering started. nsample = %d, datasz = %d", datasz, u.tblcfg.DataSize))
+			u.clusterFuture = async.AsyncCall(func(args ...interface{}) (interface{}, error) {
+				u := args[0].(*ivfCreateState)
+				tf := args[1].(*TableFunction)
+				proc := args[2].(*process.Process)
+				if u.data32 != nil {
+					return nil, clustering(u, tf, proc, u.data32)
+				}
+				return nil, clustering(u, tf, proc, u.data64)
+			}, u, tf, proc)
+		}
 		return nil
 	}
 
