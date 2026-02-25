@@ -75,6 +75,8 @@ type ivfCreateState struct {
 }
 
 func clustering[T types.RealNumbers](u *ivfCreateState, tf *TableFunction, proc *process.Process, data [][]T) error {
+	logutil.Infof("kmeans clustering started. nsample = %d, datasz = %d", len(data), u.tblcfg.DataSize)
+	defer logutil.Infof("kmeans clustering finished")
 
 	var clusterer kmeans.Clusterer
 	var err error
@@ -150,9 +152,6 @@ func (u *ivfCreateState) end(tf *TableFunction, proc *process.Process) error {
 
 	if u.clusterFuture != nil {
 		_, err := u.clusterFuture.Get()
-		if err == nil {
-			logutil.Infof("kmeans clustering finished")
-		}
 		return err
 	} else {
 		if u.data32 != nil {
@@ -318,7 +317,6 @@ func (u *ivfCreateState) start(tf *TableFunction, proc *process.Process, nthRow 
 	if uint(datasz) >= u.nsample {
 		// enough sample data
 		if u.clusterFuture == nil {
-			logutil.Infof(fmt.Sprintf("kmeans clustering started. nsample = %d, datasz = %d", datasz, u.tblcfg.DataSize))
 			u.clusterFuture = async.AsyncCall(func(args ...interface{}) (interface{}, error) {
 				u := args[0].(*ivfCreateState)
 				tf := args[1].(*TableFunction)
