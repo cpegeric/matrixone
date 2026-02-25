@@ -64,6 +64,16 @@ func (tableFunction *TableFunction) Call(proc *process.Process) (vm.CallResult, 
 				tableFunction.ctr.inputBatch = batch.EmptyForConstFoldBatch
 				tableFunction.ctr.isDone = true
 			} else {
+				// call() may set tableFunction.ctr.isDone to true and we should stop the table function
+				if tableFunction.ctr.isDone {
+					// End of Input
+					err := tableFunction.ctr.state.end(tableFunction, proc)
+					if err != nil {
+						return vm.CancelResult, err
+					}
+					return vm.NewCallResult(), nil
+				}
+
 				input, err := vm.ChildrenCall(tableFunction.GetChildren(0), proc, analyzer)
 				if err != nil {
 					return input, err
@@ -98,16 +108,6 @@ func (tableFunction *TableFunction) Call(proc *process.Process) (vm.CallResult, 
 		res, err := tableFunction.ctr.state.call(tableFunction, proc)
 		if err != nil {
 			return vm.CancelResult, err
-		}
-
-		// call may set tableFunction.ctr.isDone to true and we should stop the table function
-		if tableFunction.ctr.isDone {
-			// End of Input
-			err := tableFunction.ctr.state.end(tableFunction, proc)
-			if err != nil {
-				return vm.CancelResult, err
-			}
-			return vm.NewCallResult(), nil
 		}
 
 		if res.Batch.IsDone() {
