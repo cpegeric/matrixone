@@ -100,6 +100,16 @@ func (tableFunction *TableFunction) Call(proc *process.Process) (vm.CallResult, 
 			return vm.CancelResult, err
 		}
 
+		// call may set tableFunction.ctr.isDone to true and we should stop the table function
+		if tableFunction.ctr.isDone {
+			// End of Input
+			err := tableFunction.ctr.state.end(tableFunction, proc)
+			if err != nil {
+				return vm.CancelResult, err
+			}
+			return vm.NewCallResult(), nil
+		}
+
 		if res.Batch.IsDone() {
 			tableFunction.ctr.nextRow++
 			if tableFunction.ctr.nextRow < tableFunction.ctr.inputBatch.RowCount() {

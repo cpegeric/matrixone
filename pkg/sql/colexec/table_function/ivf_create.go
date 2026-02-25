@@ -80,6 +80,9 @@ func clustering[T types.RealNumbers](u *ivfCreateState, tf *TableFunction, proc 
 	var err error
 	var ok bool
 
+	logutil.Infof("kmeans clustering start. nsample = %d, datasz = %d", len(data), u.tblcfg.DataSize)
+	defer logutil.Infof("kmeans clustering finished")
+
 	version, err := ivfflat.GetVersion(sqlexec.NewSqlProcess(proc), u.tblcfg)
 	if err != nil {
 		return err
@@ -170,6 +173,11 @@ func (u *ivfCreateState) reset(tf *TableFunction, proc *process.Process) {
 }
 
 func (u *ivfCreateState) call(tf *TableFunction, proc *process.Process) (vm.CallResult, error) {
+
+	if u.clusterFuture != nil && u.clusterFuture.IsReady() {
+		tf.ctr.isDone = true
+		logutil.Infof("kmeans clustering result is ready. Stop table function")
+	}
 
 	u.batch.CleanOnlyData()
 
@@ -318,7 +326,6 @@ func (u *ivfCreateState) start(tf *TableFunction, proc *process.Process, nthRow 
 	if uint(datasz) >= u.nsample {
 		// enough sample data
 		if u.clusterFuture == nil {
-			logutil.Infof(fmt.Sprintf("kmeans clustering started. nsample = %d, datasz = %d", datasz, u.tblcfg.DataSize))
 			u.clusterFuture = async.AsyncCall(func(args ...interface{}) (interface{}, error) {
 				u := args[0].(*ivfCreateState)
 				tf := args[1].(*TableFunction)
