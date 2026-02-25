@@ -97,6 +97,13 @@ func (tableFunction *TableFunction) Call(proc *process.Process) (vm.CallResult, 
 		// call the table function
 		res, err := tableFunction.ctr.state.call(tableFunction, proc)
 		if err != nil {
+			if moerr.IsMoErrCode(err, moerr.OkExpectedEOF) {
+				err := tableFunction.ctr.state.end(tableFunction, proc)
+				if err != nil {
+					return vm.CancelResult, err
+				}
+				return vm.CancelResult, nil
+			}
 			return vm.CancelResult, err
 		}
 

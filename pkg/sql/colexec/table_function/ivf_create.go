@@ -173,6 +173,10 @@ func (u *ivfCreateState) call(tf *TableFunction, proc *process.Process) (vm.Call
 
 	u.batch.CleanOnlyData()
 
+	if u.clusterFuture != nil && u.clusterFuture.IsReady() {
+		return vm.CancelResult, moerr.GetOkExpectedEOF()
+	}
+
 	if u.batch.RowCount() == 0 {
 		return vm.CancelResult, nil
 	}
@@ -316,6 +320,7 @@ func (u *ivfCreateState) start(tf *TableFunction, proc *process.Process, nthRow 
 		datasz = len(u.data64)
 	}
 	if uint(datasz) >= u.nsample {
+
 		// enough sample data
 		if u.clusterFuture == nil {
 			logutil.Infof(fmt.Sprintf("kmeans clustering started. nsample = %d, datasz = %d", datasz, u.tblcfg.DataSize))
