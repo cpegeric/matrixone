@@ -369,7 +369,10 @@ public:
             bool is_mg = (this->dist_mode == DistributionMode_REPLICATED || this->dist_mode == DistributionMode_SHARDED);
             std::cout << "[DEBUG] CAGRA search: num_queries=" << num_queries << " mode=" << (int)this->dist_mode << " is_mg=" << is_mg << std::endl;
 
-            uint64_t job_id = is_mg ? this->worker->submit_mg(task) : this->worker->submit(task);
+            // IMPORTANT: For collective SNMG search, we MUST use submit_main (single-threaded orchestration).
+            // The cuVS library internally parallelizes across GPUs using OpenMP. 
+            // Calling it from multiple worker threads simultaneously causes a segfault.
+            uint64_t job_id = is_mg ? this->worker->submit_main(task) : this->worker->submit(task);
             auto result_wait = this->worker->wait(job_id).get();
             if (result_wait.error) std::rethrow_exception(result_wait.error);
             return std::any_cast<search_result_t>(result_wait.result);
@@ -420,33 +423,35 @@ public:
         std::shared_lock<std::shared_mutex> lock(this->mutex_);
         auto res = handle.get_raft_resources();
 
-        std::cout << "[DEBUG] CAGRA search_internal: rank=" << handle.get_rank() << " device=" << handle.get_device_id() << " snmg=" << is_snmg_handle(*res) << std::endl;
-
-        search_result_t search_res;
-        if (handle.get_rank() == 0) {
-            search_res.neighbors.resize(num_queries * limit);
-            search_res.distances.resize(num_queries * limit);
+        {
+            std::stringstream ss;
+            ss << "[DEBUG] CAGRA search_internal: rank=" << handle.get_rank() << " device=" << handle.get_device_id() << " snmg=" << is_snmg_handle(*res) << " queries=" << num_queries << std::endl;
+            std::cout << ss.str();
         }
 
+        search_result_t search_res;
+        
         cuvs::neighbors::cagra::search_params search_params;
         search_params.itopk_size = sp.itopk_size;
 
         if ((this->dist_mode == DistributionMode_SHARDED || this->dist_mode == DistributionMode_REPLICATED) && is_snmg_handle(*res) && mg_index_) {
-            // SNMG Search API requires host matrices for coordination
+            // SNMG Search API requires PINNED host matrices for all ranks to coordination
             auto q_host = raft::make_host_matrix<T, int64_t, raft::row_major>(*res, (int64_t)num_queries, (int64_t)this->dimension);
             raft::copy(*res, q_host.view(), raft::make_host_matrix_view<const T, int64_t, raft::row_major>(queries_data, num_queries, this->dimension));
             
-            // Output matrices must use int64_t for neighbors in SNMG API
+            // ALL ranks must allocate pinned output matrices
             auto n_host = raft::make_host_matrix<int64_t, int64_t, raft::row_major>(*res, (int64_t)num_queries, (int64_t)limit);
             auto d_host = raft::make_host_matrix<float, int64_t, raft::row_major>(*res, (int64_t)num_queries, (int64_t)limit);
 
             cuvs::neighbors::mg_search_params<cuvs::neighbors::cagra::search_params> mg_search_params(search_params);
-            auto mg_res = this->worker->get_mg_resources();
             
-            cuvs::neighbors::cagra::search(*mg_res, *mg_index_, mg_search_params, q_host.view(), n_host.view(), d_host.view());
+            // Collective search call
+            cuvs::neighbors::cagra::search(*res, *mg_index_, mg_search_params, q_host.view(), n_host.view(), d_host.view());
             
+            // Only rank 0 captures the final results into our vector
             if (handle.get_rank() == 0) {
-                // Copy back to final uint32_t results
+                search_res.neighbors.resize(num_queries * limit);
+                search_res.distances.resize(num_queries * limit);
                 for (size_t i = 0; i < num_queries * limit; ++i) {
                     search_res.neighbors[i] = static_cast<uint32_t>(n_host.data_handle()[i]);
                     search_res.distances[i] = d_host.data_handle()[i];
@@ -497,7 +502,7 @@ public:
             bool is_mg = (this->dist_mode == DistributionMode_REPLICATED || this->dist_mode == DistributionMode_SHARDED);
             std::cout << "[DEBUG] CAGRA search_float: num_queries=" << num_queries << " mode=" << (int)this->dist_mode << " is_mg=" << is_mg << std::endl;
 
-            uint64_t job_id = is_mg ? this->worker->submit_mg(task) : this->worker->submit(task);
+            uint64_t job_id = is_mg ? this->worker->submit_main(task) : this->worker->submit(task);
             auto result_wait = this->worker->wait(job_id).get();
             if (result_wait.error) std::rethrow_exception(result_wait.error);
             return std::any_cast<search_result_t>(result_wait.result);
@@ -549,7 +554,11 @@ public:
         std::shared_lock<std::shared_mutex> lock(this->mutex_);
         auto res = handle.get_raft_resources();
 
-        std::cout << "[DEBUG] CAGRA search_float_internal: rank=" << handle.get_rank() << " device=" << handle.get_device_id() << " snmg=" << is_snmg_handle(*res) << std::endl;
+        {
+            std::stringstream ss;
+            ss << "[DEBUG] CAGRA search_float_internal: rank=" << handle.get_rank() << " device=" << handle.get_device_id() << " snmg=" << is_snmg_handle(*res) << " queries=" << num_queries << std::endl;
+            std::cout << ss.str();
+        }
 
         auto q_dev_t = raft::make_device_matrix<T, int64_t>(*res, num_queries, this->dimension);
         
@@ -568,10 +577,8 @@ public:
         raft::resource::sync_stream(*res);
 
         search_result_t search_res;
-        if (handle.get_rank() == 0) {
-            search_res.neighbors.resize(num_queries * limit);
-            search_res.distances.resize(num_queries * limit);
-        }
+        search_res.neighbors.resize(num_queries * limit);
+        search_res.distances.resize(num_queries * limit);
 
         cuvs::neighbors::cagra::search_params search_params;
         search_params.itopk_size = sp.itopk_size;
@@ -586,9 +593,9 @@ public:
             auto d_host = raft::make_host_matrix<float, int64_t, raft::row_major>(*res, (int64_t)num_queries, (int64_t)limit);
 
             cuvs::neighbors::mg_search_params<cuvs::neighbors::cagra::search_params> mg_search_params(search_params);
-            auto mg_res = this->worker->get_mg_resources();
             
-            cuvs::neighbors::cagra::search(*mg_res, *mg_index_, mg_search_params, q_host.view(), n_host.view(), d_host.view());
+            // Use the local 'res' which has the specific rank's NCCL communicator
+            cuvs::neighbors::cagra::search(*res, *mg_index_, mg_search_params, q_host.view(), n_host.view(), d_host.view());
             
             if (handle.get_rank() == 0) {
                 // Copy back to final uint32_t results

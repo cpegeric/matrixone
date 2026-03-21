@@ -35,6 +35,7 @@
 #include <vector>
 #include <map>
 #include <iostream>
+#include <sstream>
 
 namespace matrixone {
 
@@ -252,6 +253,9 @@ public:
             int rank = i % devices_.size(); 
 
             workers_.emplace_back([this, device_id, rank, init_fn, stop_fn, i] {
+                // IMPORTANT: For collective operations to "organize and distribute loading",
+                // we must ensure that exactly one thread per GPU participating in the communicator
+                // executes the collective call. 
                 bool is_primary_for_rank = (i < devices_.size());
                 bool give_mg = (mg_resources_ != nullptr) && is_primary_for_rank;
                 
@@ -487,9 +491,16 @@ private:
             uint32_t left = --(*remaining);
             if (left == 0) {
                 results_store_.store(task_id, std::move(*shared_result));
-                std::lock_guard<std::mutex> lock(mg_mu_);
-                if (!mg_tasks_.empty() && mg_tasks_.front().id == task_id) {
-                    mg_tasks_.erase(mg_tasks_.begin());
+                {
+                    std::lock_guard<std::mutex> lock(mg_mu_);
+                    if (!mg_tasks_.empty() && mg_tasks_.front().id == task_id) {
+                        mg_tasks_.erase(mg_tasks_.begin());
+                    }
+                }
+                // Notify other threads that a task was popped and a new one might be at the front
+                {
+                    std::lock_guard<std::mutex> lock(shared_cv_mu_);
+                    shared_cv_.notify_all();
                 }
             }
             last_seq++;

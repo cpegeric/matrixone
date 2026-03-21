@@ -252,7 +252,9 @@ public:
                 return this->search_internal(handle, queries_data, num_queries, limit, sp);
             };
             if (!this->worker) throw std::runtime_error("Worker not initialized");
-            uint64_t job_id = (this->dist_mode == DistributionMode_REPLICATED) ? this->worker->submit_mg(task) : this->worker->submit(task);
+            
+            bool is_mg = (this->dist_mode == DistributionMode_REPLICATED || this->dist_mode == DistributionMode_SHARDED);
+            uint64_t job_id = is_mg ? this->worker->submit_main(task) : this->worker->submit(task);
             auto result_wait = this->worker->wait(job_id).get();
             if (result_wait.error) std::rethrow_exception(result_wait.error);
             return std::any_cast<search_result_t>(result_wait.result);
@@ -301,19 +303,16 @@ public:
 
     search_result_t search_internal(raft_handle_wrapper_t& handle, const T* queries_data, uint64_t num_queries, uint32_t limit, const ivf_flat_search_params_t& sp) {
         std::shared_lock<std::shared_mutex> lock(this->mutex_);
+        auto res = handle.get_raft_resources();
         
-        std::cout << "[DEBUG] IVF-Flat search_internal: rank=" << handle.get_rank() << " device=" << handle.get_device_id() << " snmg=" << is_snmg_handle(*(handle.get_raft_resources())) << std::endl;
+        std::cout << "[DEBUG] IVF-Flat search_internal: rank=" << handle.get_rank() << " device=" << handle.get_device_id() << " snmg=" << is_snmg_handle(*res) << " queries=" << num_queries << std::endl;
 
         search_result_t search_res;
-        if (handle.get_rank() == 0) {
-            search_res.neighbors.resize(num_queries * limit);
-            search_res.distances.resize(num_queries * limit);
-        }
+        search_res.neighbors.resize(num_queries * limit);
+        search_res.distances.resize(num_queries * limit);
 
         cuvs::neighbors::ivf_flat::search_params search_params;
         search_params.n_probes = sp.n_probes;
-
-        auto res = handle.get_raft_resources();
 
         if ((this->dist_mode == DistributionMode_SHARDED || this->dist_mode == DistributionMode_REPLICATED) && is_snmg_handle(*res) && mg_index_) {
             // SNMG Search API requires host matrices for coordination
@@ -325,9 +324,9 @@ public:
             auto d_host = raft::make_host_matrix<float, int64_t, raft::row_major>(*res, (int64_t)num_queries, (int64_t)limit);
 
             cuvs::neighbors::mg_search_params<cuvs::neighbors::ivf_flat::search_params> mg_search_params(search_params);
-            auto mg_res = this->worker->get_mg_resources();
             
-            cuvs::neighbors::ivf_flat::search(*mg_res, *mg_index_, mg_search_params, q_host.view(), n_host.view(), d_host.view());
+            // Use the local 'res' which has the specific rank's NCCL communicator
+            cuvs::neighbors::ivf_flat::search(*res, *mg_index_, mg_search_params, q_host.view(), n_host.view(), d_host.view());
             
             if (handle.get_rank() == 0) {
                 // Copy back to final uint32_t/int64_t results
@@ -379,7 +378,9 @@ public:
                 return this->search_float_internal(handle, queries_data, num_queries, query_dimension, limit, sp);
             };
             if (!this->worker) throw std::runtime_error("Worker not initialized");
-            uint64_t job_id = (this->dist_mode == DistributionMode_REPLICATED) ? this->worker->submit_mg(task) : this->worker->submit(task);
+            
+            bool is_mg = (this->dist_mode == DistributionMode_REPLICATED || this->dist_mode == DistributionMode_SHARDED);
+            uint64_t job_id = is_mg ? this->worker->submit_main(task) : this->worker->submit(task);
             auto result_wait = this->worker->wait(job_id).get();
             if (result_wait.error) std::rethrow_exception(result_wait.error);
             return std::any_cast<search_result_t>(result_wait.result);
@@ -446,10 +447,8 @@ public:
         raft::resource::sync_stream(*res);
 
         search_result_t search_res;
-        if (handle.get_rank() == 0) {
-            search_res.neighbors.resize(num_queries * limit);
-            search_res.distances.resize(num_queries * limit);
-        }
+        search_res.neighbors.resize(num_queries * limit);
+        search_res.distances.resize(num_queries * limit);
 
         cuvs::neighbors::ivf_flat::search_params search_params;
         search_params.n_probes = sp.n_probes;
@@ -464,9 +463,9 @@ public:
             auto d_host = raft::make_host_matrix<float, int64_t, raft::row_major>(*res, (int64_t)num_queries, (int64_t)limit);
 
             cuvs::neighbors::mg_search_params<cuvs::neighbors::ivf_flat::search_params> mg_search_params(search_params);
-            auto mg_res = this->worker->get_mg_resources();
             
-            cuvs::neighbors::ivf_flat::search(*mg_res, *mg_index_, mg_search_params, q_host.view(), n_host.view(), d_host.view());
+            // Use the local 'res' which has the specific rank's NCCL communicator
+            cuvs::neighbors::ivf_flat::search(*res, *mg_index_, mg_search_params, q_host.view(), n_host.view(), d_host.view());
             
             if (handle.get_rank() == 0) {
                 // Copy back to final results
