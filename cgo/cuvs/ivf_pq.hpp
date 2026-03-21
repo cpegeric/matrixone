@@ -283,7 +283,7 @@ public:
                 return this->search_internal(handle, queries_data, num_queries, limit, sp);
             };
             if (!this->worker) throw std::runtime_error("Worker not initialized");
-            uint64_t job_id = this->worker->submit(task);
+            uint64_t job_id = (this->dist_mode == DistributionMode_REPLICATED) ? this->worker->submit_mg(task) : this->worker->submit(task);
             auto result_wait = this->worker->wait(job_id).get();
             if (result_wait.error) std::rethrow_exception(result_wait.error);
             return std::any_cast<search_result_t>(result_wait.result);
@@ -310,16 +310,18 @@ public:
 
             auto results = this->search_internal(handle, aggregated_queries.data(), total_queries, limit, sp);
 
-            offset = 0;
-            for (size_t i = 0; i < reqs.size(); ++i) {
-                auto req = std::any_cast<search_req_t>(reqs[i]);
-                search_result_t individual_res;
-                individual_res.neighbors.resize(req.n * limit);
-                individual_res.distances.resize(req.n * limit);
-                std::copy(results.neighbors.begin() + (offset * limit), results.neighbors.begin() + ((offset + req.n) * limit), individual_res.neighbors.begin());
-                std::copy(results.distances.begin() + (offset * limit), results.distances.begin() + ((offset + req.n) * limit), individual_res.distances.begin());
-                setters[i](individual_res);
-                offset += req.n;
+            if (handle.get_rank() == 0) {
+                offset = 0;
+                for (size_t i = 0; i < reqs.size(); ++i) {
+                    auto req = std::any_cast<search_req_t>(reqs[i]);
+                    search_result_t individual_res;
+                    individual_res.neighbors.resize(req.n * limit);
+                    individual_res.distances.resize(req.n * limit);
+                    std::copy(results.neighbors.begin() + (offset * limit), results.neighbors.begin() + ((offset + req.n) * limit), individual_res.neighbors.begin());
+                    std::copy(results.distances.begin() + (offset * limit), results.distances.begin() + ((offset + req.n) * limit), individual_res.distances.begin());
+                    setters[i](individual_res);
+                    offset += req.n;
+                }
             }
         };
 
@@ -342,21 +344,27 @@ public:
 
         auto res = handle.get_raft_resources();
 
-        if (this->dist_mode == DistributionMode_SHARDED && is_snmg_handle(*res) && mg_index_) {
+        if ((this->dist_mode == DistributionMode_SHARDED || this->dist_mode == DistributionMode_REPLICATED) && is_snmg_handle(*res) && mg_index_) {
+            // SNMG Search API requires host matrices for coordination
             auto q_host = raft::make_host_matrix<T, int64_t, raft::row_major>(*res, (int64_t)num_queries, (int64_t)this->dimension);
             raft::copy(*res, q_host.view(), raft::make_host_matrix_view<const T, int64_t, raft::row_major>(queries_data, num_queries, this->dimension));
+            
+            // Output matrices must use int64_t for neighbors in SNMG API
             auto n_host = raft::make_host_matrix<int64_t, int64_t, raft::row_major>(*res, (int64_t)num_queries, (int64_t)limit);
             auto d_host = raft::make_host_matrix<float, int64_t, raft::row_major>(*res, (int64_t)num_queries, (int64_t)limit);
 
             cuvs::neighbors::mg_search_params<cuvs::neighbors::ivf_pq::search_params> mg_search_params(search_params);
-            
             auto mg_res = this->worker->get_mg_resources();
+            
             cuvs::neighbors::ivf_pq::search(*mg_res, *mg_index_, mg_search_params, q_host.view(), n_host.view(), d_host.view());
             
-            handle.sync(true);
-
-            std::copy(n_host.data_handle(), n_host.data_handle() + (num_queries * limit), search_res.neighbors.begin());
-            std::copy(d_host.data_handle(), d_host.data_handle() + (num_queries * limit), search_res.distances.begin());
+            if (handle.get_rank() == 0) {
+                // Copy back to final int64_t results
+                for (size_t i = 0; i < num_queries * limit; ++i) {
+                    search_res.neighbors[i] = n_host.data_handle()[i];
+                    search_res.distances[i] = d_host.data_handle()[i];
+                }
+            }
         } else {
             const ivf_pq_index* local_index = index_.get();
             if (!local_index && mg_index_) {
@@ -400,7 +408,7 @@ public:
                 return this->search_float_internal(handle, queries_data, num_queries, query_dimension, limit, sp);
             };
             if (!this->worker) throw std::runtime_error("Worker not initialized");
-            uint64_t job_id = this->worker->submit(task);
+            uint64_t job_id = (this->dist_mode == DistributionMode_REPLICATED) ? this->worker->submit_mg(task) : this->worker->submit(task);
             auto result_wait = this->worker->wait(job_id).get();
             if (result_wait.error) std::rethrow_exception(result_wait.error);
             return std::any_cast<search_result_t>(result_wait.result);
@@ -427,16 +435,18 @@ public:
 
             auto results = this->search_float_internal(handle, aggregated_queries.data(), total_queries, this->dimension, limit, sp);
 
-            offset = 0;
-            for (size_t i = 0; i < reqs.size(); ++i) {
-                auto req = std::any_cast<search_req_t>(reqs[i]);
-                search_result_t individual_res;
-                individual_res.neighbors.resize(req.n * limit);
-                individual_res.distances.resize(req.n * limit);
-                std::copy(results.neighbors.begin() + (offset * limit), results.neighbors.begin() + ((offset + req.n) * limit), individual_res.neighbors.begin());
-                std::copy(results.distances.begin() + (offset * limit), results.distances.begin() + ((offset + req.n) * limit), individual_res.distances.begin());
-                setters[i](individual_res);
-                offset += req.n;
+            if (handle.get_rank() == 0) {
+                offset = 0;
+                for (size_t i = 0; i < reqs.size(); ++i) {
+                    auto req = std::any_cast<search_req_t>(reqs[i]);
+                    search_result_t individual_res;
+                    individual_res.neighbors.resize(req.n * limit);
+                    individual_res.distances.resize(req.n * limit);
+                    std::copy(results.neighbors.begin() + (offset * limit), results.neighbors.begin() + ((offset + req.n) * limit), individual_res.neighbors.begin());
+                    std::copy(results.distances.begin() + (offset * limit), results.distances.begin() + ((offset + req.n) * limit), individual_res.distances.begin());
+                    setters[i](individual_res);
+                    offset += req.n;
+                }
             }
         };
 
@@ -445,19 +455,18 @@ public:
         return future.get();
     }
 
-    search_result_t search_float_internal(raft_handle_wrapper_t& handle, const float* queries_data, uint64_t num_queries, uint32_t query_dimension, 
-                        uint32_t limit, const ivf_pq_search_params_t& sp) {
+    search_result_t search_float_internal(raft_handle_wrapper_t& handle, const float* queries_data, uint64_t num_queries, uint32_t query_dimension, uint32_t limit, const ivf_pq_search_params_t& sp) {
         std::shared_lock<std::shared_mutex> lock(this->mutex_);
         auto res = handle.get_raft_resources();
 
-        std::cout << "[DEBUG] IVF-PQ search_float_internal: num_queries=" << num_queries << " limit=" << limit << " device=" << handle.get_device_id() << std::endl;
+        std::cout << "[DEBUG] IVF-PQ search_float_internal: rank=" << handle.get_rank() << " device=" << handle.get_device_id() << " snmg=" << is_snmg_handle(*res) << std::endl;
 
         auto q_dev_t = raft::make_device_matrix<T, int64_t>(*res, num_queries, this->dimension);
-        
+
         if constexpr (sizeof(T) == 1) {
             auto q_dev_f = raft::make_device_matrix<float, int64_t>(*res, num_queries, this->dimension);
             raft::copy(*res, q_dev_f.view(), raft::make_host_matrix_view<const float, int64_t>(queries_data, num_queries, this->dimension));
-            
+
             if (!this->quantizer_.is_trained()) throw std::runtime_error("Quantizer not trained");
             this->quantizer_.template transform<T>(*res, q_dev_f.view(), q_dev_t.data_handle(), true);
         } else {
@@ -466,27 +475,35 @@ public:
         raft::resource::sync_stream(*res);
 
         search_result_t search_res;
-        search_res.neighbors.resize(num_queries * limit);
-        search_res.distances.resize(num_queries * limit);
+        if (handle.get_rank() == 0) {
+            search_res.neighbors.resize(num_queries * limit);
+            search_res.distances.resize(num_queries * limit);
+        }
 
         cuvs::neighbors::ivf_pq::search_params search_params;
         search_params.n_probes = sp.n_probes;
 
-        if (this->dist_mode == DistributionMode_SHARDED && is_snmg_handle(*res) && mg_index_) {
+        if ((this->dist_mode == DistributionMode_SHARDED || this->dist_mode == DistributionMode_REPLICATED) && is_snmg_handle(*res) && mg_index_) {
+            // SNMG Search API requires host matrices for coordination
             auto q_host = raft::make_host_matrix<T, int64_t, raft::row_major>(*res, (int64_t)num_queries, (int64_t)this->dimension);
             raft::copy(*res, q_host.view(), q_dev_t.view());
+            
+            // Output matrices must use int64_t for neighbors in SNMG API
             auto n_host = raft::make_host_matrix<int64_t, int64_t, raft::row_major>(*res, (int64_t)num_queries, (int64_t)limit);
             auto d_host = raft::make_host_matrix<float, int64_t, raft::row_major>(*res, (int64_t)num_queries, (int64_t)limit);
 
             cuvs::neighbors::mg_search_params<cuvs::neighbors::ivf_pq::search_params> mg_search_params(search_params);
-            
             auto mg_res = this->worker->get_mg_resources();
+            
             cuvs::neighbors::ivf_pq::search(*mg_res, *mg_index_, mg_search_params, q_host.view(), n_host.view(), d_host.view());
             
-            handle.sync(true);
-
-            std::copy(n_host.data_handle(), n_host.data_handle() + (num_queries * limit), search_res.neighbors.begin());
-            std::copy(d_host.data_handle(), d_host.data_handle() + (num_queries * limit), search_res.distances.begin());
+            if (handle.get_rank() == 0) {
+                // Copy back to final int64_t results
+                for (size_t i = 0; i < num_queries * limit; ++i) {
+                    search_res.neighbors[i] = n_host.data_handle()[i];
+                    search_res.distances[i] = d_host.data_handle()[i];
+                }
+            }
         } else {
             const ivf_pq_index* local_index = index_.get();
             if (!local_index && mg_index_) {
