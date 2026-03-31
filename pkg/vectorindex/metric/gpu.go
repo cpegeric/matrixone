@@ -75,7 +75,7 @@ func PairWiseDistance[T types.RealNumbers](
 	var zero T
 	if _, isF32 := any(zero).(float32); isF32 {
 		res := make([]float32, nX*nY)
-		handle, err := PairwiseDistanceLaunch(x, y, metric, res, GPUThresholdSync)
+		handle, err := PairwiseDistanceLaunch(x, y, metric, res, minWorkSize)
 		if err != nil {
 			return nil, err
 		}
