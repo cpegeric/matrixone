@@ -722,6 +722,13 @@ func fillOutputBatchBySelectedRows(
 			loadedColumnPos++
 			continue
 		}
+		// The vector column used for distance computation is not written to the
+		// output batch — the distance values are stored in distVec instead.
+		if orderByLimit != nil && loadedColumnPos == int(orderByLimit.ColPos) {
+			outputBat.Vecs[outputColPos].CleanOnlyData()
+			loadedColumnPos++
+			continue
+		}
 		outputBat.Vecs[outputColPos].CleanOnlyData()
 		if err = outputBat.Vecs[outputColPos].PreExtendWithArea(
 			len(selectRows), 0, mp,
