@@ -30,6 +30,7 @@ func PairWiseDistance[T types.RealNumbers](
 	x [][]T,
 	y [][]T,
 	metric MetricType,
+	_ uint64,
 ) ([]float32, error) {
 	return GoPairWiseDistance(x, y, metric)
 }

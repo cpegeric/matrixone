@@ -57,6 +57,7 @@ func PairWiseDistance[T types.RealNumbers](
 	x [][]T,
 	y [][]T,
 	metric MetricType,
+	minWorkSize uit64,
 ) ([]float32, error) {
 	nX := len(x)
 	nY := len(y)
@@ -67,7 +68,7 @@ func PairWiseDistance[T types.RealNumbers](
 
 	_, ok := MetricTypeToCuvsMetric[metric]
 	// Use GPU only for large enough workloads where overhead is justified
-	if !ok || uint64(nX)*uint64(nY)*uint64(dim) < GPUThresholdSync {
+	if !ok || uint64(nX)*uint64(nY)*uint64(dim) < minWorkSize {
 		return GoPairWiseDistance(x, y, metric)
 	}
 

@@ -664,7 +664,7 @@ func (r *reader) Read(
 	}
 	if state == engine.InMem {
 		if r.orderByLimit != nil {
-			sels, dists, err := blockio.HandleOrderByLimitOnIVFFlatIndex(ctx, nil, outBatch.Vecs[r.orderByLimit.ColPos], r.orderByLimit)
+			sels, dists, err := blockio.HandleOrderByLimitOnIVFFlatIndex(ctx, nil, outBatch.Vecs[r.orderByLimit.ColPos], r.orderByLimit, metric.GPUThresholdSync)
 			if err != nil {
 				return false, err
 			}
