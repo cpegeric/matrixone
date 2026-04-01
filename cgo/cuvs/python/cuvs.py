@@ -174,9 +174,12 @@ if _lib:
     # IVF-PQ
     _lib.gpu_ivf_pq_new.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_int, IvfPqBuildParams, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_uint32, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int64), ctypes.c_void_p]
     _lib.gpu_ivf_pq_new.restype = ctypes.c_void_p
+    _lib.gpu_ivf_pq_new_empty.argtypes = [ctypes.c_uint64, ctypes.c_uint32, ctypes.c_int, IvfPqBuildParams, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_uint32, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int64), ctypes.c_void_p]
+    _lib.gpu_ivf_pq_new_empty.restype = ctypes.c_void_p
     _lib.gpu_ivf_pq_destroy.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     _lib.gpu_ivf_pq_start.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     _lib.gpu_ivf_pq_build.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _lib.gpu_ivf_pq_add_chunk_float.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint64, ctypes.c_void_p]
     _lib.gpu_ivf_pq_search_float.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, IvfPqSearchParams, ctypes.c_void_p]
     _lib.gpu_ivf_pq_search_float.restype = IvfPqSearchRes
     _lib.gpu_ivf_pq_get_neighbors.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_int64)]
@@ -310,6 +313,15 @@ class IvfFlatIndex:
         h = _lib.gpu_ivf_flat_new(dataset.ctypes.data_as(ctypes.c_void_p), count, dim, int(metric), build_params, dev_arr, len(devices), nthread, int(dist_mode), int(qtype), id_ptr, ctypes.byref(errmsg))
         _check_error(errmsg); return cls(h)
 
+    @classmethod
+    def create_empty(cls, total_count, dimension, metric=DistanceType.L2Expanded, build_params=None, devices=[0], nthread=4, dist_mode=DistributionMode.SINGLE_GPU, qtype=Quantization.F32, ids=None):
+        if build_params is None: build_params = IvfFlatBuildParams.default()
+        dev_arr = (ctypes.c_int * len(devices))(*devices)
+        id_ptr = ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)) if ids is not None else None
+        errmsg = ctypes.c_char_p()
+        h = _lib.gpu_ivf_flat_new_empty(total_count, dimension, int(metric), build_params, dev_arr, len(devices), nthread, int(dist_mode), int(qtype), id_ptr, ctypes.byref(errmsg))
+        _check_error(errmsg); return cls(h)
+
     def start(self):
         errmsg = ctypes.c_char_p(); _lib.gpu_ivf_flat_start(self.handle, ctypes.byref(errmsg)); _check_error(errmsg)
     def build(self):
@@ -356,10 +368,22 @@ class IvfPqIndex:
         h = _lib.gpu_ivf_pq_new(dataset.ctypes.data_as(ctypes.c_void_p), count, dim, int(metric), build_params, dev_arr, len(devices), nthread, int(dist_mode), int(qtype), id_ptr, ctypes.byref(errmsg))
         _check_error(errmsg); return cls(h)
 
+    @classmethod
+    def create_empty(cls, total_count, dimension, metric=DistanceType.L2Expanded, build_params=None, devices=[0], nthread=4, dist_mode=DistributionMode.SINGLE_GPU, qtype=Quantization.F32, ids=None):
+        if build_params is None: build_params = IvfPqBuildParams.default()
+        dev_arr = (ctypes.c_int * len(devices))(*devices)
+        id_ptr = ids.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)) if ids is not None else None
+        errmsg = ctypes.c_char_p()
+        h = _lib.gpu_ivf_pq_new_empty(total_count, dimension, int(metric), build_params, dev_arr, len(devices), nthread, int(dist_mode), int(qtype), id_ptr, ctypes.byref(errmsg))
+        _check_error(errmsg); return cls(h)
+
     def start(self):
         errmsg = ctypes.c_char_p(); _lib.gpu_ivf_pq_start(self.handle, ctypes.byref(errmsg)); _check_error(errmsg)
     def build(self):
         errmsg = ctypes.c_char_p(); _lib.gpu_ivf_pq_build(self.handle, ctypes.byref(errmsg)); _check_error(errmsg)
+    def add_chunk(self, chunk):
+        chunk = np.ascontiguousarray(chunk, dtype=np.float32)
+        errmsg = ctypes.c_char_p(); _lib.gpu_ivf_pq_add_chunk_float(self.handle, chunk.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(chunk), ctypes.byref(errmsg)); _check_error(errmsg)
 
     def search(self, queries, k, search_params=None):
         if search_params is None: search_params = IvfPqSearchParams.default()
