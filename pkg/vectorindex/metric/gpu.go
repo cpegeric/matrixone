@@ -57,7 +57,7 @@ func PairWiseDistance[T types.RealNumbers](
 	x [][]T,
 	y [][]T,
 	metric MetricType,
-	minWorkSize uit64,
+	minWorkSize uint64,
 ) ([]float32, error) {
 	nX := len(x)
 	nY := len(y)
