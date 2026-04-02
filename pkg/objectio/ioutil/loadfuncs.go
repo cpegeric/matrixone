@@ -37,7 +37,7 @@ func LoadColumnsData(
 	cacheVectors containers.Vectors, // cacheVectors.Allocated() must be 0
 	m *mpool.MPool,
 	policy fileservice.Policy,
-) (dataMeta objectio.ObjectDataMeta, release func(), fromCache bool, err error) {
+) (dataMeta objectio.ObjectDataMeta, release func(), err error) {
 	name := location.Name().UnsafeString()
 	var meta objectio.ObjectMeta
 	var vectors fileservice.IOVector
@@ -57,14 +57,6 @@ func LoadColumnsData(
 		policy,
 	); err != nil {
 		return
-	}
-	// fromCache is true only when every entry was served from cache.
-	fromCache = len(vectors.Entries) > 0
-	for _, entry := range vectors.Entries {
-		if !entry.WasFromCache() {
-			fromCache = false
-			break
-		}
 	}
 	release = func() {
 		objectio.ReleaseIOVector(&vectors)
@@ -156,10 +148,9 @@ func LoadTombstoneColumns(
 	m *mpool.MPool,
 	policy fileservice.Policy,
 ) (meta objectio.ObjectDataMeta, release func(), err error) {
-	meta, release, _, err = LoadColumnsData(
+	return LoadColumnsData(
 		ctx, cols, typs, fs, location, cacheVectors, m, policy,
 	)
-	return
 }
 
 func LoadColumns(
@@ -171,8 +162,8 @@ func LoadColumns(
 	cacheVectors containers.Vectors, // Allocated() must be 0
 	m *mpool.MPool,
 	policy fileservice.Policy,
-) (release func(), fromCache bool, err error) {
-	_, release, fromCache, err = LoadColumnsData(
+) (release func(), err error) {
+	_, release, err = LoadColumnsData(
 		ctx, cols, typs, fs, location, cacheVectors, m, policy,
 	)
 	return

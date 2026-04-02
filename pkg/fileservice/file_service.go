@@ -145,10 +145,6 @@ type IOEntry struct {
 	fromCache IOVectorCache
 }
 
-// WasFromCache reports whether this entry was filled from a cache rather than
-// read directly from storage.
-func (i IOEntry) WasFromCache() bool { return i.fromCache != nil }
-
 func (i IOEntry) String() string {
 	buf := new(strings.Builder)
 	buf.WriteString("IOEntry(")
