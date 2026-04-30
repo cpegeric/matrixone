@@ -203,6 +203,7 @@ void gpu_ivf_pq_destroy(gpu_ivf_pq_c index_c, void* errmsg) {
 
 void gpu_ivf_pq_start(gpu_ivf_pq_c index_c, void* errmsg) {
     if (errmsg) *(static_cast<char**>(errmsg)) = nullptr;
+    std::cerr << "[" << matrixone::get_timestamp() << "][IVFPQ C.start] ENTRY" << std::endl;
     try {
         auto* any = static_cast<gpu_ivf_pq_any_t*>(index_c);
         switch (any->qtype) {
@@ -212,8 +213,10 @@ void gpu_ivf_pq_start(gpu_ivf_pq_c index_c, void* errmsg) {
             case Quantization_UINT8: static_cast<gpu_ivf_pq_t<uint8_t>*>(any->ptr)->start(); break;
             default: break;
         }
+        std::cerr << "[" << matrixone::get_timestamp() << "][IVFPQ C.start] EXIT ok" << std::endl;
     } catch (const std::exception& e) {
-        matrixone::set_errmsg(errmsg, 
+        std::cerr << "[" << matrixone::get_timestamp() << "][IVFPQ C.start] EXIT err=" << e.what() << std::endl;
+        matrixone::set_errmsg(errmsg,
  "Error in gpu_ivf_pq_start", e.what());
     }
 }
@@ -440,6 +443,8 @@ void gpu_ivf_pq_delete_id(gpu_ivf_pq_c index_c, int64_t id, void* errmsg) {
 void gpu_ivf_pq_load_dir(gpu_ivf_pq_c index_c, const char* dir,
                           distribution_mode_t target_mode, void* errmsg) {
     if (errmsg) *(static_cast<char**>(errmsg)) = nullptr;
+    std::cerr << "[" << matrixone::get_timestamp() << "][IVFPQ C.load_dir] ENTRY dir=" << (dir ? dir : "(null)")
+              << " target_mode=" << (int)target_mode << std::endl;
     try {
         auto* any = static_cast<gpu_ivf_pq_any_t*>(index_c);
         switch (any->qtype) {
@@ -449,7 +454,9 @@ void gpu_ivf_pq_load_dir(gpu_ivf_pq_c index_c, const char* dir,
             case Quantization_UINT8: static_cast<gpu_ivf_pq_t<uint8_t>*>(any->ptr)->load_dir(dir, target_mode); break;
             default: break;
         }
+        std::cerr << "[" << matrixone::get_timestamp() << "][IVFPQ C.load_dir] EXIT ok" << std::endl;
     } catch (const std::exception& e) {
+        std::cerr << "[" << matrixone::get_timestamp() << "][IVFPQ C.load_dir] EXIT err=" << e.what() << std::endl;
         matrixone::set_errmsg(errmsg, "Error in gpu_ivf_pq_load_dir", e.what());
     }
 }

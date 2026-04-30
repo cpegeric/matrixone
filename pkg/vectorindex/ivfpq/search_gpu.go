@@ -19,6 +19,7 @@ package ivfpq
 import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/cuvs"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/cache"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/metric"
@@ -122,19 +123,42 @@ func (s *IvfpqSearch[T]) SearchFloat32(proc *sqlexec.SqlProcess, query any, rt v
 }
 
 // Load implements cache.VectorIndexSearchIf.
-func (s *IvfpqSearch[T]) Load(sqlproc *sqlexec.SqlProcess) error {
+func (s *IvfpqSearch[T]) Load(sqlproc *sqlexec.SqlProcess) (err error) {
+	logutil.Infof("[IVFPQ Search.Load] ENTRY db=%s metatbl=%s indextbl=%s devices=%v nthread=%d",
+		s.Tblcfg.DbName, s.Tblcfg.MetadataTable, s.Tblcfg.IndexTable, s.Devices, s.ThreadsSearch)
+	defer func() {
+		if err != nil {
+			logutil.Infof("[IVFPQ Search.Load] EXIT err=%v", err)
+		} else {
+			n := 0
+			if s.Indexes != nil {
+				n = len(s.Indexes)
+			}
+			logutil.Infof("[IVFPQ Search.Load] EXIT ok segments=%d", n)
+		}
+	}()
+
+	logutil.Infof("[IVFPQ Search.Load] LoadMetadata begin")
 	indexes, err := LoadMetadata[T](sqlproc, s.Tblcfg.DbName, s.Tblcfg.MetadataTable)
 	if err != nil {
+		logutil.Infof("[IVFPQ Search.Load] LoadMetadata failed: %v", err)
 		return err
 	}
+	logutil.Infof("[IVFPQ Search.Load] LoadMetadata done segments=%d", len(indexes))
+
 	if len(indexes) > 0 {
+		logutil.Infof("[IVFPQ Search.Load] loadIndexes begin segments=%d", len(indexes))
 		indexes, err = s.loadIndexes(sqlproc, indexes)
 		if err != nil {
+			logutil.Infof("[IVFPQ Search.Load] loadIndexes failed: %v", err)
 			return err
 		}
+		logutil.Infof("[IVFPQ Search.Load] loadIndexes done segments=%d", len(indexes))
 	}
 	s.Indexes = indexes
+	logutil.Infof("[IVFPQ Search.Load] buildMultiIndex begin")
 	s.MultiIndex = s.buildMultiIndex()
+	logutil.Infof("[IVFPQ Search.Load] buildMultiIndex done multiIndex_nil=%v", s.MultiIndex == nil)
 	return nil
 }
 
@@ -159,14 +183,17 @@ func (s *IvfpqSearch[T]) buildMultiIndex() *cuvs.MultiGpuIvfPq[T] {
 
 // loadIndexes loads each model's index data from the database.
 func (s *IvfpqSearch[T]) loadIndexes(sqlproc *sqlexec.SqlProcess, indexes []*IvfpqModel[T]) ([]*IvfpqModel[T], error) {
-	for _, idx := range indexes {
+	for i, idx := range indexes {
 		idx.Devices = s.Devices
+		logutil.Infof("[IVFPQ Search.loadIndexes] LoadIndex begin %d/%d id=%s", i+1, len(indexes), idx.Id)
 		if err := idx.LoadIndex(sqlproc, s.Idxcfg, s.Tblcfg, s.ThreadsSearch, true); err != nil {
+			logutil.Infof("[IVFPQ Search.loadIndexes] LoadIndex failed %d/%d id=%s err=%v", i+1, len(indexes), idx.Id, err)
 			for _, idx2 := range indexes {
 				idx2.Destroy()
 			}
 			return nil, err
 		}
+		logutil.Infof("[IVFPQ Search.loadIndexes] LoadIndex done %d/%d id=%s", i+1, len(indexes), idx.Id)
 	}
 	return indexes, nil
 }

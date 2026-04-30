@@ -29,6 +29,7 @@ import (
 	"unsafe"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 )
 
 // GpuIvfPq represents the C++ gpu_ivf_pq_t object.
@@ -520,6 +521,8 @@ func (gi *GpuIvfPq[T]) Start() error {
 		return moerr.NewInternalErrorNoCtx("GpuIvfPq is not initialized")
 	}
 
+	logutil.Infof("[IVFPQ Go.Start] ENTRY mode=%v nthread=%d batchWindowUs=%d", gi.distMode, gi.nthread, gi.batchWindowUs)
+
 	if gi.distMode == Replicated && gi.nthread > 1 {
 		var errmsg *C.char
 		C.gpu_ivf_pq_set_per_thread_device(gi.cIvfPq, C.bool(true), unsafe.Pointer(&errmsg))
@@ -536,13 +539,16 @@ func (gi *GpuIvfPq[T]) Start() error {
 		}
 	}
 
+	logutil.Infof("[IVFPQ Go.Start] calling C.gpu_ivf_pq_start")
 	var errmsg *C.char
 	C.gpu_ivf_pq_start(gi.cIvfPq, unsafe.Pointer(&errmsg))
 	if errmsg != nil {
 		errStr := C.GoString(errmsg)
 		C.free(unsafe.Pointer(errmsg))
+		logutil.Infof("[IVFPQ Go.Start] C.gpu_ivf_pq_start failed: %s", errStr)
 		return moerr.NewInternalErrorNoCtx(errStr)
 	}
+	logutil.Infof("[IVFPQ Go.Start] EXIT ok")
 	return nil
 }
 
@@ -614,26 +620,34 @@ func (gi *GpuIvfPq[T]) Unpack(filename string, mode DistributionMode) error {
 		return moerr.NewInternalErrorNoCtx("GpuIvfPq is not initialized")
 	}
 
+	logutil.Infof("[IVFPQ Go.Unpack] ENTRY filename=%s mode=%v", filename, mode)
+
 	tmpDir, err := os.MkdirTemp("", "ivf-pq-unpack-*")
 	if err != nil {
 		return moerr.NewInternalErrorNoCtx(fmt.Sprintf("failed to create temp dir: %v", err))
 	}
 	defer os.RemoveAll(tmpDir)
 
+	logutil.Infof("[IVFPQ Go.Unpack] untar -> %s", tmpDir)
 	if _, err := Unpack(filename, tmpDir); err != nil {
+		logutil.Infof("[IVFPQ Go.Unpack] untar failed: %v", err)
 		return err
 	}
+	logutil.Infof("[IVFPQ Go.Unpack] untar done")
 
 	var errmsg *C.char
 	cDir := C.CString(tmpDir)
 	defer C.free(unsafe.Pointer(cDir))
 
+	logutil.Infof("[IVFPQ Go.Unpack] calling C.gpu_ivf_pq_load_dir")
 	C.gpu_ivf_pq_load_dir(gi.cIvfPq, cDir, C.distribution_mode_t(mode), unsafe.Pointer(&errmsg))
 	if errmsg != nil {
 		errStr := C.GoString(errmsg)
 		C.free(unsafe.Pointer(errmsg))
+		logutil.Infof("[IVFPQ Go.Unpack] C.gpu_ivf_pq_load_dir failed: %s", errStr)
 		return moerr.NewInternalErrorNoCtx(errStr)
 	}
+	logutil.Infof("[IVFPQ Go.Unpack] EXIT ok")
 	return nil
 }
 

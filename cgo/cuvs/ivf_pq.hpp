@@ -1631,6 +1631,9 @@ public:
     // target_mode overrides this->dist_mode, allowing a SINGLE_GPU .tar to be
     // loaded as REPLICATED (broadcasts index.bin to all GPUs) without rebuilding.
     void load_dir(const std::string& dir, distribution_mode_t target_mode) {
+        std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir] ENTRY dir=" << dir
+                  << " current_mode=" << (int)this->dist_mode
+                  << " target_mode=" << (int)target_mode << std::endl;
         auto m = this->read_manifest(dir, "ivf_pq");
         if (this->dist_mode == DistributionMode_SHARDED && target_mode != DistributionMode_SHARDED)
             throw std::invalid_argument("cannot change dist_mode: index was built as SHARDED");
@@ -1660,48 +1663,77 @@ public:
 
         if (!idx_file.empty() && this->dist_mode == DistributionMode_SINGLE_GPU) {
             std::string full_path = dir + "/" + idx_file;
+            std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir] SINGLE_GPU path=" << full_path << std::endl;
             auto task = [&, full_path](raft_handle_wrapper_t& handle) -> std::any {
+                std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir.task] BEGIN rank=" << handle.get_rank()
+                          << " device=" << handle.get_device_id() << std::endl;
                 auto res = handle.get_raft_resources();
                 auto local_idx = std::make_unique<ivf_pq_index>(*res);
+                std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir.task] deserialize begin" << std::endl;
                 cuvs::neighbors::ivf_pq::deserialize(*res, full_path, local_idx.get());
+                std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir.task] deserialize done" << std::endl;
+                std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir.task] mutex_ acquire" << std::endl;
                 std::unique_lock<std::shared_mutex> lock(this->mutex_);
+                std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir.task] mutex_ acquired" << std::endl;
                 index_ = std::move(local_idx);
+                std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir.task] END" << std::endl;
                 return std::any();
             };
+            std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir] submit_main begin" << std::endl;
             uint64_t job_id = this->worker->submit_main(task);
+            std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir] submit_main job_id=" << job_id
+                      << " waiting..." << std::endl;
             auto wait_res = this->worker->wait(job_id).get();
+            std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir] wait returned has_error="
+                      << (wait_res.error ? "true" : "false") << std::endl;
             if (wait_res.error) std::rethrow_exception(wait_res.error);
 
         } else if (!idx_file.empty() && this->dist_mode == DistributionMode_REPLICATED) {
             std::string full_path = dir + "/" + idx_file;
+            std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir] REPLICATED path=" << full_path << std::endl;
+            std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir] submit_all_devices begin" << std::endl;
             this->worker->submit_all_devices(
                 [&, full_path](raft_handle_wrapper_t& handle) -> std::any {
+                    std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir.task] BEGIN rank=" << handle.get_rank()
+                              << " device=" << handle.get_device_id() << std::endl;
                     auto res = handle.get_raft_resources();
                     auto local_idx = std::make_unique<ivf_pq_index>(*res);
+                    std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir.task] deserialize begin rank="
+                              << handle.get_rank() << std::endl;
                     cuvs::neighbors::ivf_pq::deserialize(*res, full_path, local_idx.get());
+                    std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir.task] deserialize done rank="
+                              << handle.get_rank() << std::endl;
                     std::unique_lock<std::shared_mutex> lock(this->mutex_);
                     this->replicated_indices_[handle.get_device_id()] =
                         std::shared_ptr<ivf_pq_index>(std::move(local_idx));
+                    std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir.task] END rank=" << handle.get_rank() << std::endl;
                     return std::any();
                 }
             );
+            std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir] submit_all_devices done" << std::endl;
 
         } else if (!shard_files.empty()) {
+            std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir] SHARDED shards=" << shard_files.size() << std::endl;
+            std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir] submit_all_devices begin" << std::endl;
             this->worker->submit_all_devices(
                 [&, shard_files, dir](raft_handle_wrapper_t& handle) -> std::any {
                     int rank = handle.get_rank();
                     if (rank >= static_cast<int>(shard_files.size()))
                         return std::any();
                     std::string shard_path = dir + "/" + shard_files[rank];
+                    std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir.task] BEGIN rank=" << rank
+                              << " shard=" << shard_path << std::endl;
                     auto res = handle.get_raft_resources();
                     auto local_idx = std::make_unique<ivf_pq_index>(*res);
                     cuvs::neighbors::ivf_pq::deserialize(*res, shard_path, local_idx.get());
                     std::unique_lock<std::shared_mutex> lock(this->mutex_);
                     this->replicated_indices_[handle.get_device_id()] =
                         std::shared_ptr<ivf_pq_index>(std::move(local_idx));
+                    std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir.task] END rank=" << rank << std::endl;
                     return std::any();
                 }
             );
+            std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir] submit_all_devices done" << std::endl;
             this->count           = static_cast<uint32_t>(json_int(m.raw, "capacity"));
             this->current_offset_ = static_cast<uint64_t>(json_int(m.raw, "length"));
 
@@ -1711,6 +1743,7 @@ public:
 
         this->load_common_components(dir, m);
         this->is_loaded_ = true;
+        std::cerr << "[" << get_timestamp() << "][IVFPQ load_dir] EXIT ok" << std::endl;
     }
 
     search_result_t merge_sharded_results(const std::vector<search_result_t>& shard_results, uint64_t num_queries, uint32_t limit) {

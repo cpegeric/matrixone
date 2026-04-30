@@ -458,38 +458,63 @@ public:
 
     void start(std::function<std::any(raft_handle&)> init_fn = nullptr,
                std::function<std::any(raft_handle&)> stop_fn = nullptr) {
-        if (running_) return;
+        if (running_) {
+            std::cerr << "[" << get_timestamp() << "][Worker.start] already running, skipping" << std::endl;
+            return;
+        }
+        std::cerr << "[" << get_timestamp() << "][Worker.start] ENTRY nthread=" << nthread_
+                  << " devices=" << devices_.size() << " mode=" << (int)mode_ << std::endl;
         stopping_.store(false);
         running_ = true;
 
         // Start Main Thread (only for main_tasks_)
-        main_thread_ = std::thread([this, init_fn, stop_fn] {
-            int device_id = devices_.empty() ? -1 : devices_[0];
-            if (device_id >= 0) cudaSetDevice(device_id);
-            raft_handle handle(device_id, 0, mode_);
-            if (init_fn) init_fn(handle);
-            this->run_main_loop(handle, stop_fn);
-        });
+        try {
+            std::cerr << "[" << get_timestamp() << "][Worker.start] launching main_thread" << std::endl;
+            main_thread_ = std::thread([this, init_fn, stop_fn] {
+                int device_id = devices_.empty() ? -1 : devices_[0];
+                std::cerr << "[" << get_timestamp() << "][Worker.main_thread] STARTED device_id=" << device_id << std::endl;
+                if (device_id >= 0) cudaSetDevice(device_id);
+                raft_handle handle(device_id, 0, mode_);
+                if (init_fn) init_fn(handle);
+                std::cerr << "[" << get_timestamp() << "][Worker.main_thread] entering run_main_loop" << std::endl;
+                this->run_main_loop(handle, stop_fn);
+                std::cerr << "[" << get_timestamp() << "][Worker.main_thread] EXITED" << std::endl;
+            });
+        } catch (const std::exception& e) {
+            std::cerr << "[" << get_timestamp() << "][Worker.start] FAILED to launch main_thread: " << e.what() << std::endl;
+            throw;
+        }
 
         // Start Pool of Device Worker Threads
         for (uint32_t i = 0; i < nthread_; ++i) {
             if (devices_.empty()) break;
-            
-            // Shared Pool with Device Affinity
-            int device_idx = i % devices_.size(); 
-            int device_id = devices_[device_idx];
-            int rank = device_idx; 
 
-            device_threads_.emplace_back([this, device_id, device_idx, rank, init_fn, stop_fn] {
-                cudaSetDevice(device_id);
-                
-                // Each thread in the pool gets its own raft::resources (so separate CUDA streams)
-                raft_handle handle(device_id, rank, mode_);
-                
-		// only main thread will run init_fn and stop_fn
-                this->run_device_loop(handle, nullptr, device_idx);
-            });
+            // Shared Pool with Device Affinity
+            int device_idx = i % devices_.size();
+            int device_id = devices_[device_idx];
+            int rank = device_idx;
+
+            try {
+                device_threads_.emplace_back([this, i, device_id, device_idx, rank, init_fn, stop_fn] {
+                    cudaSetDevice(device_id);
+                    std::cerr << "[" << get_timestamp() << "][Worker.dev_thread] STARTED i=" << i
+                              << " device=" << device_id << " rank=" << rank << std::endl;
+
+                    // Each thread in the pool gets its own raft::resources (so separate CUDA streams)
+                    raft_handle handle(device_id, rank, mode_);
+
+                    // only main thread will run init_fn and stop_fn
+                    this->run_device_loop(handle, nullptr, device_idx);
+                    std::cerr << "[" << get_timestamp() << "][Worker.dev_thread] EXITED i=" << i << std::endl;
+                });
+            } catch (const std::exception& e) {
+                std::cerr << "[" << get_timestamp() << "][Worker.start] FAILED to launch device_thread i=" << i
+                          << ": " << e.what() << " (already_started=" << device_threads_.size() << ")" << std::endl;
+                throw;
+            }
         }
+        std::cerr << "[" << get_timestamp() << "][Worker.start] EXIT ok main+device_threads="
+                  << (1 + device_threads_.size()) << std::endl;
     }
 
     void stop() {
@@ -779,7 +804,10 @@ private:
     void run_device_loop(raft_handle& handle, std::function<std::any(raft_handle&)> stop_fn, uint32_t d_idx) {
         cuvs_task_t task;
         while (device_queues_[d_idx]->pop(task)) {
+            std::cerr << "[" << get_timestamp() << "][Worker.run_device_loop] popped task id=" << task.id
+                      << " d_idx=" << d_idx << " rank=" << handle.get_rank() << std::endl;
             execute_task(task, handle);
+            std::cerr << "[" << get_timestamp() << "][Worker.run_device_loop] task done id=" << task.id << std::endl;
         }
         if (stop_fn) stop_fn(handle);
     }
@@ -787,7 +815,9 @@ private:
     void run_main_loop(raft_handle& handle, std::function<std::any(raft_handle&)> stop_fn) {
         cuvs_task_t task;
         while (main_tasks_.pop(task)) {
+            std::cerr << "[" << get_timestamp() << "][Worker.run_main_loop] popped task id=" << task.id << std::endl;
             execute_task(task, handle);
+            std::cerr << "[" << get_timestamp() << "][Worker.run_main_loop] task done id=" << task.id << std::endl;
         }
         if (stop_fn) stop_fn(handle);
     }

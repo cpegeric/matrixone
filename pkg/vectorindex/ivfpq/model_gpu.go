@@ -368,6 +368,16 @@ func (idx *IvfpqModel[T]) LoadIndex(
 	nthread int64,
 	view bool) (err error) {
 
+	logutil.Infof("[IVFPQ LoadIndex] ENTRY id=%s path=%q filesize=%d view=%v devices=%v nthread=%d capacity=%d",
+		idx.Id, idx.Path, idx.FileSize, view, idx.Devices, nthread, tblcfg.IndexCapacity)
+	defer func() {
+		if err != nil {
+			logutil.Infof("[IVFPQ LoadIndex] EXIT id=%s err=%v", idx.Id, err)
+		} else {
+			logutil.Infof("[IVFPQ LoadIndex] EXIT id=%s ok len=%d cap=%d", idx.Id, idx.Len, idx.MaxCapacity)
+		}
+	}()
+
 	var (
 		fp         *os.File
 		streamChan = make(chan executor.Result, 2)
@@ -377,6 +387,7 @@ func (idx *IvfpqModel[T]) LoadIndex(
 	)
 
 	if idx.Index != nil {
+		logutil.Infof("[IVFPQ LoadIndex] id=%s already loaded, skip", idx.Id)
 		return nil
 	}
 
@@ -389,6 +400,7 @@ func (idx *IvfpqModel[T]) LoadIndex(
 	}
 
 	if len(idx.Path) == 0 {
+		logutil.Infof("[IVFPQ LoadIndex] id=%s streaming from DB filesize=%d", idx.Id, idx.FileSize)
 		fp, err = os.CreateTemp("", "ivfpq")
 		if err != nil {
 			return err
@@ -417,33 +429,45 @@ func (idx *IvfpqModel[T]) LoadIndex(
 		ctx, cancel := context.WithCancelCause(sqlproc.GetTopContext())
 		defer cancel(nil)
 
+		logutil.Infof("[IVFPQ LoadIndex] id=%s starting streaming SQL goroutine", idx.Id)
 		wg.Add(1)
 		go func() {
 			defer func() {
 				close(streamChan)
 				wg.Done()
+				logutil.Infof("[IVFPQ LoadIndex] id=%s streaming SQL goroutine exit", idx.Id)
 			}()
+			logutil.Infof("[IVFPQ LoadIndex] id=%s runSql_streaming begin", idx.Id)
 			_, err2 := runSql_streaming(ctx, sqlproc, sql, streamChan, errorChan)
+			logutil.Infof("[IVFPQ LoadIndex] id=%s runSql_streaming returned err=%v", idx.Id, err2)
 			if err2 != nil {
 				errorChan <- err2
 			}
 		}()
 
 		sql_closed := false
+		chunkCount := 0
 		for !sql_closed {
 			sql_closed, err = idx.loadChunk(ctx, sqlproc, streamChan, errorChan, fp)
 			if err != nil {
+				logutil.Infof("[IVFPQ LoadIndex] id=%s loadChunk err after %d chunks: %v", idx.Id, chunkCount, err)
 				cancel(err)
 				break
 			}
+			chunkCount++
 		}
+		logutil.Infof("[IVFPQ LoadIndex] id=%s loadChunk loop done chunks=%d sql_closed=%v err=%v", idx.Id, chunkCount, sql_closed, err)
 
 		if !sql_closed {
+			logutil.Infof("[IVFPQ LoadIndex] id=%s draining streamChan", idx.Id)
 			for res := range streamChan {
 				res.Close()
 			}
+			logutil.Infof("[IVFPQ LoadIndex] id=%s drain streamChan done", idx.Id)
 		}
+		logutil.Infof("[IVFPQ LoadIndex] id=%s waiting on streaming goroutine", idx.Id)
 		wg.Wait()
+		logutil.Infof("[IVFPQ LoadIndex] id=%s streaming goroutine joined", idx.Id)
 
 		if err == nil {
 			select {
@@ -458,12 +482,16 @@ func (idx *IvfpqModel[T]) LoadIndex(
 		idx.Path = fp.Name()
 		fp.Close()
 		fp = nil
+		logutil.Infof("[IVFPQ LoadIndex] id=%s streaming -> tmpfile %s", idx.Id, idx.Path)
 	}
 
+	logutil.Infof("[IVFPQ LoadIndex] id=%s CheckSum begin path=%s", idx.Id, idx.Path)
 	chksum, err := vectorindex.CheckSum(idx.Path)
 	if err != nil {
+		logutil.Infof("[IVFPQ LoadIndex] id=%s CheckSum failed: %v", idx.Id, err)
 		return err
 	}
+	logutil.Infof("[IVFPQ LoadIndex] id=%s CheckSum done", idx.Id)
 	if chksum != idx.Checksum {
 		return moerr.NewInternalError(sqlproc.GetContext(), "IvfpqModel: checksum mismatch")
 	}
@@ -476,6 +504,8 @@ func (idx *IvfpqModel[T]) LoadIndex(
 		return err
 	}
 
+	logutil.Infof("[IVFPQ LoadIndex] id=%s NewGpuIvfPqEmpty begin cap=%d dim=%d devices=%v nthread=%d mode=%v",
+		idx.Id, tblcfg.IndexCapacity, idxcfg.CuvsIvfpq.Dimensions, idx.Devices, nthread, mode)
 	gi, err := cuvs.NewGpuIvfPqEmpty[T](
 		uint64(tblcfg.IndexCapacity),
 		uint32(idxcfg.CuvsIvfpq.Dimensions),
@@ -486,27 +516,36 @@ func (idx *IvfpqModel[T]) LoadIndex(
 		mode,
 	)
 	if err != nil {
+		logutil.Infof("[IVFPQ LoadIndex] id=%s NewGpuIvfPqEmpty failed: %v", idx.Id, err)
 		return err
 	}
+	logutil.Infof("[IVFPQ LoadIndex] id=%s NewGpuIvfPqEmpty done", idx.Id)
 
+	logutil.Infof("[IVFPQ LoadIndex] id=%s SetBatchWindow %d", idx.Id, tblcfg.BatchWindow)
 	gi.SetBatchWindow(tblcfg.BatchWindow)
 
+	logutil.Infof("[IVFPQ LoadIndex] id=%s gi.Start() begin", idx.Id)
 	if err = gi.Start(); err != nil {
+		logutil.Infof("[IVFPQ LoadIndex] id=%s gi.Start() failed: %v", idx.Id, err)
 		gi.Destroy()
 		return err
 	}
+	logutil.Infof("[IVFPQ LoadIndex] id=%s gi.Start() done", idx.Id)
 
+	logutil.Infof("[IVFPQ LoadIndex] id=%s gi.Unpack() begin path=%s mode=%v", idx.Id, idx.Path, mode)
 	if err = gi.Unpack(idx.Path, mode); err != nil {
+		logutil.Infof("[IVFPQ LoadIndex] id=%s gi.Unpack() failed: %v", idx.Id, err)
 		gi.Destroy()
 		return err
 	}
+	logutil.Infof("[IVFPQ LoadIndex] id=%s gi.Unpack() done", idx.Id)
 
 	idx.Index = gi
 	idx.View = view
 	idx.Len = int64(gi.Len())
 	idx.MaxCapacity = uint64(gi.Cap())
 
-	logutil.Debugf("IvfpqModel.LoadIndex idx %s, len = %d\n", idx.Id, idx.Len)
+	logutil.Infof("[IVFPQ LoadIndex] id=%s loaded len=%d cap=%d", idx.Id, idx.Len, idx.MaxCapacity)
 
 	if view {
 		if len(idx.Path) > 0 {
