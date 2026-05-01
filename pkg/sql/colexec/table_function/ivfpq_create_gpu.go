@@ -220,13 +220,24 @@ func (u *ivfpqCreateState) start(tf *TableFunction, proc *process.Process, nthRo
 			return err
 		}
 		if u.tblcfg.IndexCapacity <= 0 {
-			return moerr.NewInvalidInput(proc.Ctx, "index capacity must be greater than 0")
+			cnt, err := fetchSrcTableRowCount(proc, ivfpq_runSql, u.tblcfg.DbName, u.tblcfg.SrcTable)
+			if err != nil {
+				return err
+			}
+			if cnt <= 0 {
+				return moerr.NewInvalidInput(proc.Ctx, "source table is empty; cannot determine index capacity")
+			}
+			u.tblcfg.IndexCapacity = cnt
+			logutil.Infof("IVFPQ create: auto-detected index capacity = %d from `%s`.`%s`",
+				u.tblcfg.IndexCapacity, u.tblcfg.DbName, u.tblcfg.SrcTable)
 		}
 
 		// kmeans training fraction: read from session variable (0-100 percent → 0-1 fraction)
-		if val, err2 := proc.GetResolveVariableFunc()("kmeans_train_percent", true, false); err2 == nil && val != nil {
-			if pct := val.(float64); pct > 0 {
-				u.idxcfg.CuvsIvfpq.KmeansTrainsetFraction = pct / 100.0
+		if resolve := proc.GetResolveVariableFunc(); resolve != nil {
+			if val, err2 := resolve("kmeans_train_percent", true, false); err2 == nil && val != nil {
+				if pct := val.(float64); pct > 0 {
+					u.idxcfg.CuvsIvfpq.KmeansTrainsetFraction = pct / 100.0
+				}
 			}
 		}
 
