@@ -158,7 +158,7 @@ if _lib:
     _lib.gpu_cagra_get_quantizer.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_void_p]
     _lib.gpu_cagra_save.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
     _lib.gpu_cagra_save_dir.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-    _lib.gpu_cagra_load_dir.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+    _lib.gpu_cagra_load_dir.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
     _lib.gpu_cagra_delete_id.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p]
     _lib.gpu_cagra_search.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, CagraSearchParams, ctypes.c_void_p]
     _lib.gpu_cagra_search.restype = CagraSearchRes
@@ -181,6 +181,12 @@ if _lib:
     _lib.gpu_cagra_info.restype = ctypes.c_char_p
     _lib.gpu_cagra_merge.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_void_p]
     _lib.gpu_cagra_merge.restype = ctypes.c_void_p
+    _lib.gpu_cagra_set_filter_columns.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_void_p]
+    _lib.gpu_cagra_add_filter_chunk.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64, ctypes.c_void_p]
+    _lib.gpu_cagra_search_with_filter.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, CagraSearchParams, ctypes.c_char_p, ctypes.c_void_p]
+    _lib.gpu_cagra_search_with_filter.restype = CagraSearchRes
+    _lib.gpu_cagra_search_float_with_filter.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, CagraSearchParams, ctypes.c_char_p, ctypes.c_void_p]
+    _lib.gpu_cagra_search_float_with_filter.restype = CagraSearchRes
 
     # IVF-Flat
     _lib.gpu_ivf_flat_new.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_int, IvfFlatBuildParams, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_uint32, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int64), ctypes.c_void_p]
@@ -203,7 +209,7 @@ if _lib:
     _lib.gpu_ivf_flat_get_quantizer.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_void_p]
     _lib.gpu_ivf_flat_save.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
     _lib.gpu_ivf_flat_save_dir.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-    _lib.gpu_ivf_flat_load_dir.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+    _lib.gpu_ivf_flat_load_dir.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
     _lib.gpu_ivf_flat_delete_id.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p]
     _lib.gpu_ivf_flat_search.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, IvfFlatSearchParams, ctypes.c_void_p]
     _lib.gpu_ivf_flat_search.restype = IvfFlatSearchRes
@@ -227,6 +233,12 @@ if _lib:
     _lib.gpu_ivf_flat_get_centers.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
     _lib.gpu_ivf_flat_get_n_list.argtypes = [ctypes.c_void_p]
     _lib.gpu_ivf_flat_get_n_list.restype = ctypes.c_uint32
+    _lib.gpu_ivf_flat_set_filter_columns.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_void_p]
+    _lib.gpu_ivf_flat_add_filter_chunk.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64, ctypes.c_void_p]
+    _lib.gpu_ivf_flat_search_with_filter.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, IvfFlatSearchParams, ctypes.c_char_p, ctypes.c_void_p]
+    _lib.gpu_ivf_flat_search_with_filter.restype = IvfFlatSearchRes
+    _lib.gpu_ivf_flat_search_float_with_filter.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, IvfFlatSearchParams, ctypes.c_char_p, ctypes.c_void_p]
+    _lib.gpu_ivf_flat_search_float_with_filter.restype = IvfFlatSearchRes
 
     # IVF-PQ
     _lib.gpu_ivf_pq_new.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_int, IvfPqBuildParams, ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_uint32, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int64), ctypes.c_void_p]
@@ -251,7 +263,7 @@ if _lib:
     _lib.gpu_ivf_pq_get_quantizer.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float), ctypes.c_void_p]
     _lib.gpu_ivf_pq_save.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
     _lib.gpu_ivf_pq_save_dir.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
-    _lib.gpu_ivf_pq_load_dir.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+    _lib.gpu_ivf_pq_load_dir.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p]
     _lib.gpu_ivf_pq_delete_id.argtypes = [ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p]
     _lib.gpu_ivf_pq_search.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, IvfPqSearchParams, ctypes.c_void_p]
     _lib.gpu_ivf_pq_search.restype = IvfPqSearchRes
@@ -282,6 +294,12 @@ if _lib:
     _lib.gpu_ivf_pq_get_dim_ext.argtypes = [ctypes.c_void_p]
     _lib.gpu_ivf_pq_get_dim_ext.restype = ctypes.c_uint32
     _lib.gpu_ivf_pq_get_dataset.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _lib.gpu_ivf_pq_set_filter_columns.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_void_p]
+    _lib.gpu_ivf_pq_add_filter_chunk.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint64, ctypes.c_void_p]
+    _lib.gpu_ivf_pq_search_with_filter.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, IvfPqSearchParams, ctypes.c_char_p, ctypes.c_void_p]
+    _lib.gpu_ivf_pq_search_with_filter.restype = IvfPqSearchRes
+    _lib.gpu_ivf_pq_search_float_with_filter.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint64, ctypes.c_uint32, ctypes.c_uint32, IvfPqSearchParams, ctypes.c_char_p, ctypes.c_void_p]
+    _lib.gpu_ivf_pq_search_float_with_filter.restype = IvfPqSearchRes
 
     # Brute Force
     _lib.gpu_brute_force_new.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32, ctypes.c_int, ctypes.c_int, ctypes.POINTER(ctypes.c_int64), ctypes.c_void_p]
@@ -459,8 +477,8 @@ class CagraIndex:
         errmsg = ctypes.c_char_p(); _lib.gpu_cagra_save(self.handle, filename.encode('utf-8'), ctypes.byref(errmsg)); _check_error(errmsg)
     def save_dir(self, directory):
         errmsg = ctypes.c_char_p(); _lib.gpu_cagra_save_dir(self.handle, directory.encode('utf-8'), ctypes.byref(errmsg)); _check_error(errmsg)
-    def load_dir(self, directory):
-        errmsg = ctypes.c_char_p(); _lib.gpu_cagra_load_dir(self.handle, directory.encode('utf-8'), ctypes.byref(errmsg)); _check_error(errmsg)
+    def load_dir(self, directory, target_mode=DistributionMode.SINGLE_GPU):
+        errmsg = ctypes.c_char_p(); _lib.gpu_cagra_load_dir(self.handle, directory.encode('utf-8'), int(target_mode), ctypes.byref(errmsg)); _check_error(errmsg)
 
     def search(self, queries, k, search_params=None):
         if search_params is None: search_params = CagraSearchParams.default()
@@ -487,6 +505,32 @@ class CagraIndex:
     def search_wait(self, job_id, num_q, k):
         errmsg = ctypes.c_char_p()
         res = _lib.gpu_cagra_search_wait(self.handle, job_id, ctypes.byref(errmsg))
+        _check_error(errmsg)
+        neighbors = np.zeros((num_q, k), dtype=np.int64)
+        distances = np.zeros((num_q, k), dtype=np.float32)
+        _lib.gpu_cagra_get_neighbors(res.result_ptr, num_q * k, neighbors.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)))
+        _lib.gpu_cagra_get_distances(res.result_ptr, num_q * k, distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        _lib.gpu_cagra_free_result(res.result_ptr); return neighbors, distances
+
+    def set_filter_columns(self, col_meta_json, total_count):
+        errmsg = ctypes.c_char_p()
+        _lib.gpu_cagra_set_filter_columns(self.handle, col_meta_json.encode('utf-8'), int(total_count), ctypes.byref(errmsg))
+        _check_error(errmsg)
+
+    def add_filter_chunk(self, col_idx, data, nrows, null_bitmap=None):
+        data = np.ascontiguousarray(data)
+        nb_ptr = null_bitmap.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)) if null_bitmap is not None else None
+        errmsg = ctypes.c_char_p()
+        _lib.gpu_cagra_add_filter_chunk(self.handle, int(col_idx), data.ctypes.data_as(ctypes.c_void_p), nb_ptr, int(nrows), ctypes.byref(errmsg))
+        _check_error(errmsg)
+
+    def search_with_filter(self, queries, k, preds_json, search_params=None):
+        if search_params is None: search_params = CagraSearchParams.default()
+        queries = np.ascontiguousarray(queries, dtype=np.float32)
+        num_q, dim = queries.shape
+        preds = preds_json.encode('utf-8') if preds_json else None
+        errmsg = ctypes.c_char_p()
+        res = _lib.gpu_cagra_search_float_with_filter(self.handle, queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), num_q, dim, k, search_params, preds, ctypes.byref(errmsg))
         _check_error(errmsg)
         neighbors = np.zeros((num_q, k), dtype=np.int64)
         distances = np.zeros((num_q, k), dtype=np.float32)
@@ -596,8 +640,8 @@ class IvfFlatIndex:
         errmsg = ctypes.c_char_p(); _lib.gpu_ivf_flat_save(self.handle, filename.encode('utf-8'), ctypes.byref(errmsg)); _check_error(errmsg)
     def save_dir(self, directory):
         errmsg = ctypes.c_char_p(); _lib.gpu_ivf_flat_save_dir(self.handle, directory.encode('utf-8'), ctypes.byref(errmsg)); _check_error(errmsg)
-    def load_dir(self, directory):
-        errmsg = ctypes.c_char_p(); _lib.gpu_ivf_flat_load_dir(self.handle, directory.encode('utf-8'), ctypes.byref(errmsg)); _check_error(errmsg)
+    def load_dir(self, directory, target_mode=DistributionMode.SINGLE_GPU):
+        errmsg = ctypes.c_char_p(); _lib.gpu_ivf_flat_load_dir(self.handle, directory.encode('utf-8'), int(target_mode), ctypes.byref(errmsg)); _check_error(errmsg)
 
     def search(self, queries, k, search_params=None):
         if search_params is None: search_params = IvfFlatSearchParams.default()
@@ -624,6 +668,32 @@ class IvfFlatIndex:
     def search_wait(self, job_id, num_q, k):
         errmsg = ctypes.c_char_p()
         res = _lib.gpu_ivf_flat_search_wait(self.handle, job_id, ctypes.byref(errmsg))
+        _check_error(errmsg)
+        neighbors = np.zeros((num_q, k), dtype=np.int64)
+        distances = np.zeros((num_q, k), dtype=np.float32)
+        _lib.gpu_ivf_flat_get_neighbors(res.result_ptr, num_q * k, neighbors.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)))
+        _lib.gpu_ivf_flat_get_distances(res.result_ptr, num_q * k, distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        _lib.gpu_ivf_flat_free_result(res.result_ptr); return neighbors, distances
+
+    def set_filter_columns(self, col_meta_json, total_count):
+        errmsg = ctypes.c_char_p()
+        _lib.gpu_ivf_flat_set_filter_columns(self.handle, col_meta_json.encode('utf-8'), int(total_count), ctypes.byref(errmsg))
+        _check_error(errmsg)
+
+    def add_filter_chunk(self, col_idx, data, nrows, null_bitmap=None):
+        data = np.ascontiguousarray(data)
+        nb_ptr = null_bitmap.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)) if null_bitmap is not None else None
+        errmsg = ctypes.c_char_p()
+        _lib.gpu_ivf_flat_add_filter_chunk(self.handle, int(col_idx), data.ctypes.data_as(ctypes.c_void_p), nb_ptr, int(nrows), ctypes.byref(errmsg))
+        _check_error(errmsg)
+
+    def search_with_filter(self, queries, k, preds_json, search_params=None):
+        if search_params is None: search_params = IvfFlatSearchParams.default()
+        queries = np.ascontiguousarray(queries, dtype=np.float32)
+        num_q, dim = queries.shape
+        preds = preds_json.encode('utf-8') if preds_json else None
+        errmsg = ctypes.c_char_p()
+        res = _lib.gpu_ivf_flat_search_float_with_filter(self.handle, queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), num_q, dim, k, search_params, preds, ctypes.byref(errmsg))
         _check_error(errmsg)
         neighbors = np.zeros((num_q, k), dtype=np.int64)
         distances = np.zeros((num_q, k), dtype=np.float32)
@@ -753,8 +823,8 @@ class IvfPqIndex:
         errmsg = ctypes.c_char_p(); _lib.gpu_ivf_pq_save(self.handle, filename.encode('utf-8'), ctypes.byref(errmsg)); _check_error(errmsg)
     def save_dir(self, directory):
         errmsg = ctypes.c_char_p(); _lib.gpu_ivf_pq_save_dir(self.handle, directory.encode('utf-8'), ctypes.byref(errmsg)); _check_error(errmsg)
-    def load_dir(self, directory):
-        errmsg = ctypes.c_char_p(); _lib.gpu_ivf_pq_load_dir(self.handle, directory.encode('utf-8'), ctypes.byref(errmsg)); _check_error(errmsg)
+    def load_dir(self, directory, target_mode=DistributionMode.SINGLE_GPU):
+        errmsg = ctypes.c_char_p(); _lib.gpu_ivf_pq_load_dir(self.handle, directory.encode('utf-8'), int(target_mode), ctypes.byref(errmsg)); _check_error(errmsg)
 
     def search(self, queries, k, search_params=None):
         if search_params is None: search_params = IvfPqSearchParams.default()
@@ -781,6 +851,32 @@ class IvfPqIndex:
     def search_wait(self, job_id, num_q, k):
         errmsg = ctypes.c_char_p()
         res = _lib.gpu_ivf_pq_search_wait(self.handle, job_id, ctypes.byref(errmsg))
+        _check_error(errmsg)
+        neighbors = np.zeros((num_q, k), dtype=np.int64)
+        distances = np.zeros((num_q, k), dtype=np.float32)
+        _lib.gpu_ivf_pq_get_neighbors(res.result_ptr, num_q * k, neighbors.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)))
+        _lib.gpu_ivf_pq_get_distances(res.result_ptr, num_q * k, distances.ctypes.data_as(ctypes.POINTER(ctypes.c_float)))
+        _lib.gpu_ivf_pq_free_result(res.result_ptr); return neighbors, distances
+
+    def set_filter_columns(self, col_meta_json, total_count):
+        errmsg = ctypes.c_char_p()
+        _lib.gpu_ivf_pq_set_filter_columns(self.handle, col_meta_json.encode('utf-8'), int(total_count), ctypes.byref(errmsg))
+        _check_error(errmsg)
+
+    def add_filter_chunk(self, col_idx, data, nrows, null_bitmap=None):
+        data = np.ascontiguousarray(data)
+        nb_ptr = null_bitmap.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)) if null_bitmap is not None else None
+        errmsg = ctypes.c_char_p()
+        _lib.gpu_ivf_pq_add_filter_chunk(self.handle, int(col_idx), data.ctypes.data_as(ctypes.c_void_p), nb_ptr, int(nrows), ctypes.byref(errmsg))
+        _check_error(errmsg)
+
+    def search_with_filter(self, queries, k, preds_json, search_params=None):
+        if search_params is None: search_params = IvfPqSearchParams.default()
+        queries = np.ascontiguousarray(queries, dtype=np.float32)
+        num_q, dim = queries.shape
+        preds = preds_json.encode('utf-8') if preds_json else None
+        errmsg = ctypes.c_char_p()
+        res = _lib.gpu_ivf_pq_search_float_with_filter(self.handle, queries.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), num_q, dim, k, search_params, preds, ctypes.byref(errmsg))
         _check_error(errmsg)
         neighbors = np.zeros((num_q, k), dtype=np.int64)
         distances = np.zeros((num_q, k), dtype=np.float32)

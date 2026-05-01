@@ -16,6 +16,7 @@ import unittest
 import numpy as np
 import os
 import sys
+import tempfile
 
 # Add the parent directory to sys.path so we can import cuvs
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -111,6 +112,86 @@ class TestCuvs(unittest.TestCase):
         neighbors, distances = cuvs.adhoc_brute_force_search(self.dataset, self.queries, self.k)
         self.assertEqual(neighbors.shape, (5, self.k))
         self.assertEqual(distances.shape, (5, self.k))
+
+    # ---- Pre-filter (INCLUDE-columns) coverage ----
+    #
+    # Predicate JSON uses integer column indices (not names): e.g.
+    #   [{"col":0,"op":">=","val":0.5}]
+    # See cgo/cuvs/filter.hpp parse_preds() / parse_filter_col_meta().
+
+    def _build_filter_index(self, factory, ids, prices, **kwargs):
+        # Common create_empty -> set_filter_columns -> add_filter_chunk ->
+        # add_chunk -> build flow. set_filter_columns must precede build().
+        idx = factory.create_empty(self.n_rows, self.dim, ids=ids, **kwargs)
+        idx.start()
+        idx.set_filter_columns('[{"name":"price","type":2}]', self.n_rows)
+        idx.add_filter_chunk(0, prices, self.n_rows)
+        idx.add_chunk(self.dataset, ids=ids)
+        idx.build()
+        return idx
+
+    def _check_filtered(self, neighbors, distances, prices, threshold):
+        self.assertEqual(neighbors.shape, (5, self.k))
+        self.assertEqual(distances.shape, (5, self.k))
+        # Every non-sentinel neighbor must satisfy the predicate (price >= threshold).
+        valid = neighbors[neighbors >= 0]
+        if valid.size:
+            self.assertTrue(np.all(prices[valid] >= threshold))
+
+    def test_cagra_filter(self):
+        ids = np.arange(self.n_rows, dtype=np.int64)
+        prices = np.random.random(self.n_rows).astype(np.float32)
+        idx = self._build_filter_index(cuvs.CagraIndex, ids, prices)
+        nbrs, dists = idx.search_with_filter(
+            self.queries, self.k, '[{"col":0,"op":">=","val":0.5}]')
+        self._check_filtered(nbrs, dists, prices, 0.5)
+
+    def test_ivf_flat_filter(self):
+        ids = np.arange(self.n_rows, dtype=np.int64)
+        prices = np.random.random(self.n_rows).astype(np.float32)
+        bp = cuvs.IvfFlatBuildParams(n_lists=32, add_data_on_build=True, kmeans_trainset_fraction=1.0)
+        idx = self._build_filter_index(cuvs.IvfFlatIndex, ids, prices, build_params=bp)
+        nbrs, dists = idx.search_with_filter(
+            self.queries, self.k, '[{"col":0,"op":">=","val":0.5}]')
+        self._check_filtered(nbrs, dists, prices, 0.5)
+
+    def test_ivf_pq_filter(self):
+        ids = np.arange(self.n_rows, dtype=np.int64)
+        prices = np.random.random(self.n_rows).astype(np.float32)
+        bp = cuvs.IvfPqBuildParams(n_lists=32, m=8, bits_per_code=8, add_data_on_build=True, kmeans_trainset_fraction=1.0)
+        idx = self._build_filter_index(cuvs.IvfPqIndex, ids, prices, build_params=bp)
+        nbrs, dists = idx.search_with_filter(
+            self.queries, self.k, '[{"col":0,"op":">=","val":0.5}]')
+        self._check_filtered(nbrs, dists, prices, 0.5)
+
+    def test_filter_empty_predicate_matches_unfiltered(self):
+        # Empty preds_json must yield unfiltered behavior — sanity-checks the
+        # NULL-propagation path through ctypes.
+        ids = np.arange(self.n_rows, dtype=np.int64)
+        prices = np.random.random(self.n_rows).astype(np.float32)
+        bp = cuvs.IvfFlatBuildParams(n_lists=32, add_data_on_build=True, kmeans_trainset_fraction=1.0)
+        idx = self._build_filter_index(cuvs.IvfFlatIndex, ids, prices, build_params=bp)
+        nbrs, _ = idx.search_with_filter(self.queries, self.k, None)
+        self.assertEqual(nbrs.shape, (5, self.k))
+        self.assertTrue(np.all(nbrs >= 0))
+
+    # ---- load_dir with target_mode ----
+
+    def test_ivf_flat_save_load_dir(self):
+        bp = cuvs.IvfFlatBuildParams(n_lists=32, add_data_on_build=True, kmeans_trainset_fraction=1.0)
+        idx = cuvs.IvfFlatIndex.create(self.dataset, build_params=bp)
+        idx.start()
+        idx.build()
+        original_len = len(idx)
+
+        with tempfile.TemporaryDirectory() as d:
+            idx.save_dir(d)
+            loaded = cuvs.IvfFlatIndex.create_empty(self.n_rows, self.dim, build_params=bp)
+            loaded.start()
+            loaded.load_dir(d, target_mode=cuvs.DistributionMode.SINGLE_GPU)
+            self.assertEqual(len(loaded), original_len)
+            nbrs, _ = loaded.search(self.queries, self.k)
+            self.assertEqual(nbrs.shape, (5, self.k))
 
 if __name__ == '__main__':
     unittest.main()
