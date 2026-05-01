@@ -212,7 +212,16 @@ func (u *cagraCreateState) start(tf *TableFunction, proc *process.Process, nthRo
 			return err
 		}
 		if u.tblcfg.IndexCapacity <= 0 {
-			return moerr.NewInvalidInput(proc.Ctx, "index capacity must be greater than 0")
+			cnt, err := fetchSrcTableRowCount(proc, cagra_runSql, u.tblcfg.DbName, u.tblcfg.SrcTable)
+			if err != nil {
+				return err
+			}
+			if cnt <= 0 {
+				return moerr.NewInvalidInput(proc.Ctx, "source table is empty; cannot determine index capacity")
+			}
+			u.tblcfg.IndexCapacity = cnt
+			logutil.Infof("CAGRA create: auto-detected index capacity = %d from `%s`.`%s`",
+				u.tblcfg.IndexCapacity, u.tblcfg.DbName, u.tblcfg.SrcTable)
 		}
 
 		// ---- validate argument types ----
