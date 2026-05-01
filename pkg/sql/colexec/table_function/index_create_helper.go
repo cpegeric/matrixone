@@ -28,7 +28,7 @@ import (
 // own per-algorithm mockable variable (ivfpq_runSql / cagra_runSql / …).
 type runSqlFunc func(*sqlexec.SqlProcess, string) (executor.Result, error)
 
-// fetchSrcTableRowCount runs `SELECT count(*) FROM `db`.`src`` and returns the
+// fetchSrcTableRowCount runs `SELECT count(*) FROM `db`.`src“ and returns the
 // row count. Used by index create paths to auto-populate IndexCapacity when
 // the user did not set it upfront.
 func fetchSrcTableRowCount(proc *process.Process, runSql runSqlFunc, db, src string) (int64, error) {
