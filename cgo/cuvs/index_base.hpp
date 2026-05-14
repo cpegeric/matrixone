@@ -118,15 +118,22 @@ using ::distribution_mode_t;
 //              and must be reset immediately under unique_lock.
 //
 // SHARDED
-//   - N GPUs, each holds a disjoint slice of the index.
-//   - build: submit_all_devices() — each GPU builds its shard.
-//   - search: submit_all_devices_no_wait() — all shards searched in parallel,
-//             results merged via merge_sharded_results().
-//   - extend: routes new rows to the last shard via submit_to_rank(last_rank).
+//   - n_shards GPUs (n_shards <= len(devices)), each holds a disjoint slice
+//     of the index. Shards land on devices_[0..n_shards); devices_[n_shards..]
+//     are not used for SHARDED build/search/extend (their worker threads sit
+//     idle for SHARDED ops — submit() round-robin is undefined here).
+//   - n_shards is set by the constructor (defaulting to len(devices) when 0)
+//     or derived from len(shard_sizes) on load_dir. Always read it via
+//     this->effective_n_shards() — never devices_.size() — in SHARDED-only code.
+//   - build: submit_first_n(n_shards, ...) — each shard builds on devices_[rank].
+//   - search: submit_first_n_no_wait(n_shards, ...) — all shards searched in
+//             parallel, results merged via merge_sharded_results().
+//   - extend: routes new rows to the last shard via submit_to_rank(n_shards - 1).
 //             shard-local seq_ids = [old_last_shard_size .. old_last_shard_size+n_rows).
-//             replicated_datasets_[last_dev_id] erased (stale); other shards' entries untouched.
+//             replicated_datasets_[devices_[n_shards-1]] erased (stale);
+//             other shards' entries untouched.
 //   - SHARDED shard sizing: rows_per_shard is rounded DOWN to a multiple of 32
-//     (i.e., (count / num_shards) & ~31). The last shard absorbs the remainder.
+//     (i.e., (count / n_shards) & ~31). The last shard absorbs the remainder.
 //     This is required for word-aligned bitset slicing in sync_shard_bitset().
 //     The same rounded value must be used in both build_internal and search_internal.
 //
@@ -287,6 +294,18 @@ public:
     bool is_loaded_ = false;                ///< True once build() has completed successfully
     int build_device_id_ = 0;              ///< Primary GPU used for SINGLE_GPU mode
     std::vector<uint64_t> shard_sizes_;    ///< Per-shard row counts established at build time (SHARDED mode)
+    uint32_t n_shards_ = 0;                ///< SHARDED only. 0 = use devices_.size(). Set by constructor or load_dir.
+
+    // Authoritative shard count for SHARDED-only computations. Returns 1 for
+    // non-SHARDED so callers without a SHARDED branch don't need to special-case.
+    // Use this — not `devices_.size()` — whenever you need "how many shards"
+    // (loop bounds, manifest entries, last_rank, build_filter_shard_masks, etc).
+    // Continue using `devices_.size()` for things keyed on physical GPUs
+    // (worker thread count, info() / debug strings, "devices" manifest field).
+    size_t effective_n_shards() const {
+        if (this->dist_mode != DistributionMode_SHARDED) return 1;
+        return n_shards_ ? static_cast<size_t>(n_shards_) : devices_.size();
+    }
 
     // SINGLE_GPU: points to the device copy of the build dataset (stale after extend, reset then).
     std::shared_ptr<void> dataset_device_ptr_;
@@ -677,7 +696,7 @@ public:
     // SHARDED: one bundle per shard, sized [start_row(rank), shard_sizes_[rank]).
     std::vector<std::shared_ptr<host_mask_bundle_t>>
     build_filter_shard_masks(const std::string& preds_json) {
-        const int num_shards = static_cast<int>(this->devices_.size());
+        const int num_shards = static_cast<int>(this->effective_n_shards());
         std::vector<std::shared_ptr<host_mask_bundle_t>> shard_masks(num_shards);
         for (int rank = 0; rank < num_shards; ++rank) {
             uint64_t shard_sz  = this->shard_sizes_[rank];
@@ -762,10 +781,16 @@ public:
     // servicing one device queue (≈ ThreadsSearch / numGPU). Used as the cuVS
     // dynamic_batching max_batch_size hint so a batch fills as fast as the
     // threads committing to it (dynb_cache_t clamps it to kDynBMaxBatchSize).
+    // For SHARDED with an explicit n_shards_ < devices_.size(), each shard
+    // owns one device so the per-shard concurrency is nthread / n_shards
+    // (not nthread / devices_.size()).
     int64_t dynb_concurrency_hint() const {
-        const size_t ndev = std::max<size_t>(1, devices_.size());
+        const size_t denom =
+            (this->dist_mode == DistributionMode_SHARDED && this->n_shards_)
+                ? static_cast<size_t>(this->n_shards_)
+                : std::max<size_t>(1, devices_.size());
         const int64_t nthr = worker ? static_cast<int64_t>(worker->nthread()) : 1;
-        return std::max<int64_t>(1, nthr / static_cast<int64_t>(ndev));
+        return std::max<int64_t>(1, nthr / static_cast<int64_t>(denom));
     }
 
     uint64_t cap() const {
@@ -803,7 +828,7 @@ public:
         if (this->dist_mode == DistributionMode_SHARDED) {
             // Pre-calculate shard distribution if we're in sharded mode.
             // Note: This will be re-calculated/finalized in build().
-            int num_shards = static_cast<int>(this->devices_.size());
+            int num_shards = static_cast<int>(this->effective_n_shards());
             if (this->shard_sizes_.size() != (size_t)num_shards) {
                 this->shard_sizes_.assign(num_shards, 0);
             }
@@ -987,7 +1012,7 @@ public:
                       flattened_host_dataset.begin() + target_offset * dimension);
 
             if (this->dist_mode == DistributionMode_SHARDED) {
-                int num_shards = static_cast<int>(this->devices_.size());
+                int num_shards = static_cast<int>(this->effective_n_shards());
                 if (this->shard_sizes_.size() != (size_t)num_shards) {
                     this->shard_sizes_.assign(num_shards, 0);
                 }
@@ -1096,7 +1121,7 @@ public:
                     std::copy(chunk_host_target.begin(), chunk_host_target.end(), flattened_host_dataset.begin() + (target_offset * dimension));
 
                     if (this->dist_mode == DistributionMode_SHARDED) {
-                        int num_shards = static_cast<int>(this->devices_.size());
+                        int num_shards = static_cast<int>(this->effective_n_shards());
                         if (this->shard_sizes_.size() != (size_t)num_shards) {
                             this->shard_sizes_.assign(num_shards, 0);
                         }
@@ -1132,7 +1157,7 @@ public:
                     std::copy(chunk_data, chunk_data + chunk_count * dimension, flattened_host_dataset.begin() + (target_offset * dimension));
 
                     if (this->dist_mode == DistributionMode_SHARDED) {
-                        int num_shards = static_cast<int>(this->devices_.size());
+                        int num_shards = static_cast<int>(this->effective_n_shards());
                         if (this->shard_sizes_.size() != (size_t)num_shards) {
                             this->shard_sizes_.assign(num_shards, 0);
                         }
@@ -1389,10 +1414,11 @@ public:
 
     // Returns the JSON component entry for sharded index files.
     std::string shards_comp_entry() const {
+        const int num_shards = static_cast<int>(this->effective_n_shards());
         std::string s = "    \"shards\": [";
-        for (int i = 0; i < static_cast<int>(this->devices_.size()); ++i) {
+        for (int i = 0; i < num_shards; ++i) {
             s += "\"shard_" + std::to_string(i) + ".bin\"";
-            if (i + 1 < static_cast<int>(this->devices_.size())) s += ", ";
+            if (i + 1 < num_shards) s += ", ";
         }
         s += "]";
         return s;
@@ -1519,7 +1545,7 @@ public:
         for (size_t i = 0; i < devices_.size(); ++i) {
             json += std::to_string(devices_[i]) + (i == devices_.size() - 1 ? "" : ", ");
         }
-        json += "]";
+        json += "], \"n_shards\": " + std::to_string(n_shards_);
         return json; // Caller will close the object or add more fields
     }
 
@@ -1583,7 +1609,7 @@ protected:
                                          ": SHARDED mode not supported");
             }
             // Extend the last shard only. Compute shard-local seq_ids.
-            const int num_shards = static_cast<int>(this->devices_.size());
+            const int num_shards = static_cast<int>(this->effective_n_shards());
             uint64_t last_shard_offset = 0;
             for (int r = 0; r < num_shards - 1; ++r) {
                 last_shard_offset += this->shard_sizes_[r];

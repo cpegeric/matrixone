@@ -435,7 +435,7 @@ public:
         // submitting to worker threads. submit_all_devices() propagates
         // exceptions, but validation here provides faster feedback and better error messages.
         if (this->dist_mode == DistributionMode_SHARDED) {
-            int num_shards = static_cast<int>(this->devices_.size());
+            int num_shards = static_cast<int>(this->effective_n_shards());
             uint64_t rows_per_shard = (this->count / num_shards) & ~static_cast<uint64_t>(31);
             uint64_t last_shard_rows = this->count - rows_per_shard * (num_shards - 1);
             // The smallest shard (worst case) is the minimum of uniform and last shard.
@@ -538,7 +538,7 @@ public:
             handle.sync();
         } else if (this->dist_mode == DistributionMode_SHARDED) {
             auto res = handle.get_raft_resources();
-            int num_shards = this->devices_.size();
+            int num_shards = static_cast<int>(this->effective_n_shards());
             int rank = handle.get_rank();
             
             // Round down to a multiple of 32 so every shard offset is word-aligned in

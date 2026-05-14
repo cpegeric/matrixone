@@ -220,10 +220,13 @@ inline rmm::mr::cuda_memory_resource* raw_device_mr() {
 //     search   → submit (round-robin across GPU replicas)
 //
 //   SHARDED:
-//     build    → submit_all_devices (each GPU builds its shard)
-//     extend   → submit_to_rank (only extend to last shard)
-//     search   → submit_all_devices_no_wait (all shards search concurrently)
+//     build    → submit_first_n(n_shards, ...) (each shard builds on devices_[rank])
+//     extend   → submit_to_rank(n_shards - 1, ...) (only extend to last shard)
+//     search   → submit_first_n_no_wait(n_shards, ...) (all shards search concurrently)
 //                → results collected and merged by merge_sharded_results()
+//     NOTE: n_shards == effective_n_shards() (gpu_index_base_t), <= devices_.size().
+//     Worker threads bound to devices_[n_shards..] are idle for SHARDED ops;
+//     `submit()` round-robin is undefined for SHARDED indexes.
 //
 // THREAD SAFETY
 // -------------

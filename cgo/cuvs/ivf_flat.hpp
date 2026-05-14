@@ -274,7 +274,7 @@ public:
         if (!this->worker) throw std::runtime_error("Worker not initialized");
 
         if (this->dist_mode == DistributionMode_SHARDED) {
-            int num_shards = static_cast<int>(this->devices_.size());
+            int num_shards = static_cast<int>(this->effective_n_shards());
             uint64_t rows_per_shard = (this->count / num_shards) & ~static_cast<uint64_t>(31);
             uint64_t last_shard_rows = this->count - rows_per_shard * (num_shards - 1);
             uint64_t min_shard_rows = std::min(rows_per_shard, last_shard_rows);
@@ -296,7 +296,7 @@ public:
         } else {
             // Collective build (SHARDED or REPLICATED)
             if (this->dist_mode == DistributionMode_SHARDED)
-                this->shard_sizes_.assign(this->devices_.size(), 0);
+                this->shard_sizes_.assign(this->effective_n_shards(), 0);
             this->worker->submit_all_devices([&](raft_handle_wrapper_t& handle) -> std::any {
                 this->build_internal(handle);
                 return std::any();
@@ -348,7 +348,7 @@ public:
             handle.sync();
         } else if (this->dist_mode == DistributionMode_SHARDED) {
             auto res = handle.get_raft_resources();
-            int num_shards = this->devices_.size();
+            int num_shards = static_cast<int>(this->effective_n_shards());
             int rank = handle.get_rank();
             
             // Round down to a multiple of 32 so every shard offset is word-aligned in
