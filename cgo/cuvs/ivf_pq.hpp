@@ -404,13 +404,19 @@ public:
                 auto result_wait = this->worker->wait(job_id).get();
                 if (result_wait.error) std::rethrow_exception(result_wait.error);
             } else {
-                // Collective build requires participation from all GPUs (REPLICATED or SHARDED)
-                if (this->dist_mode == DistributionMode_SHARDED)
-                    this->shard_sizes_.assign(this->effective_n_shards(), 0);
-                this->worker->submit_all_devices([&](raft_handle_wrapper_t& handle) -> std::any {
+                // Collective build (SHARDED or REPLICATED). REPLICATED fans
+                // out to all devices; SHARDED fans out to only the first
+                // n_shards.
+                auto build_task = [&](raft_handle_wrapper_t& handle) -> std::any {
                     this->build_internal(handle);
                     return std::any();
-                });
+                };
+                if (this->dist_mode == DistributionMode_SHARDED) {
+                    this->shard_sizes_.assign(this->effective_n_shards(), 0);
+                    this->worker->submit_first_n(this->effective_n_shards(), build_task);
+                } else {
+                    this->worker->submit_all_devices(build_task);
+                }
             }
         } catch (const std::exception& e) {
             std::cerr << "[IVFPQ build ERROR] during GPU build dispatch mode=" << mode_str
@@ -767,7 +773,7 @@ public:
                 int rank = gpu_handle.get_rank();
                 return this->search_internal(gpu_handle, queries_copy->data(), num_queries, limit, sp, /*preds_json=*/"", shard_masks[rank].get());
             };
-            auto job_ids = this->worker->submit_all_devices_no_wait(shard_search_task);
+            auto job_ids = this->worker->submit_first_n_no_wait(this->effective_n_shards(), shard_search_task);
             return this->worker->submit_composite_pending(std::move(job_ids), num_queries, limit);
         }
 
@@ -797,7 +803,7 @@ public:
             auto shard_search_task = [this, num_queries, limit, sp, queries_copy](raft_handle_wrapper_t& gpu_handle) -> std::any {
                 return this->search_internal(gpu_handle, queries_copy->data(), num_queries, limit, sp);
             };
-            auto job_ids = this->worker->submit_all_devices_no_wait(shard_search_task);
+            auto job_ids = this->worker->submit_first_n_no_wait(this->effective_n_shards(), shard_search_task);
             return this->worker->submit_composite_pending(std::move(job_ids), num_queries, limit);
         }
 
@@ -1175,7 +1181,7 @@ public:
                 int rank = gpu_handle.get_rank();
                 return this->search_float_internal(gpu_handle, queries_copy->data(), num_queries, query_dimension, limit, sp, /*preds_json=*/"", shard_masks[rank].get());
             };
-            auto job_ids = this->worker->submit_all_devices_no_wait(shard_search_task);
+            auto job_ids = this->worker->submit_first_n_no_wait(this->effective_n_shards(), shard_search_task);
             return this->worker->submit_composite_pending(std::move(job_ids), num_queries, limit);
         }
 
@@ -1207,7 +1213,7 @@ public:
             auto shard_search_task = [this, num_queries, query_dimension, limit, sp, queries_copy](raft_handle_wrapper_t& gpu_handle) -> std::any {
                 return this->search_float_internal(gpu_handle, queries_copy->data(), num_queries, query_dimension, limit, sp);
             };
-            auto job_ids = this->worker->submit_all_devices_no_wait(shard_search_task);
+            auto job_ids = this->worker->submit_first_n_no_wait(this->effective_n_shards(), shard_search_task);
             return this->worker->submit_composite_pending(std::move(job_ids), num_queries, limit);
         }
 
@@ -1611,7 +1617,7 @@ public:
             comp_entries.push_back("    \"index\": \"index.bin\"");
 
         } else { // SHARDED
-            this->worker->submit_all_devices(
+            this->worker->submit_first_n(this->effective_n_shards(),
                 [&](raft_handle_wrapper_t& handle) -> std::any {
                     int rank = handle.get_rank();
                     std::string shard_file = dir + "/shard_" + std::to_string(rank) + ".bin";
@@ -1710,7 +1716,7 @@ public:
             );
 
         } else if (!shard_files.empty()) {
-            this->worker->submit_all_devices(
+            this->worker->submit_first_n(this->effective_n_shards(),
                 [&, shard_files, dir](raft_handle_wrapper_t& handle) -> std::any {
                     int rank = handle.get_rank();
                     if (rank >= static_cast<int>(shard_files.size()))

@@ -770,14 +770,26 @@ public:
         return enqueue_(*device_queues_[rank], cuvs_task_t::ordinary(std::move(fn)));
     }
 
-    std::vector<uint64_t> submit_all_devices_no_wait(task_fn_t fn) {
+    // Fan out one copy of `fn` to each of the first `n` device queues
+    // (devices_[0..n)). Used by SHARDED build / search / save_dir / load_dir
+    // when n_shards < devices_.size() so device queues [n, devices_.size())
+    // stay untouched. For n == devices_.size() this is identical to the
+    // legacy submit_all_devices_no_wait behaviour.
+    std::vector<uint64_t> submit_first_n_no_wait(size_t n, task_fn_t fn) {
         if (!running_ || stopping_) throw std::runtime_error("Worker is not running");
+        if (n > device_queues_.size())
+            throw std::runtime_error("submit_first_n_no_wait: n exceeds device count");
         std::vector<uint64_t> ids;
-        ids.reserve(devices_.size());
-        for (size_t i = 0; i < devices_.size(); ++i) {
-            ids.push_back(enqueue_(*device_queues_[i], cuvs_task_t::ordinary(fn)));  // copy fn per device
+        ids.reserve(n);
+        for (size_t i = 0; i < n; ++i) {
+            ids.push_back(enqueue_(*device_queues_[i], cuvs_task_t::ordinary(fn)));  // copy fn per queue
         }
         return ids;
+    }
+
+    // Legacy wrapper: fan out to every device queue.
+    std::vector<uint64_t> submit_all_devices_no_wait(task_fn_t fn) {
+        return submit_first_n_no_wait(devices_.size(), std::move(fn));
     }
 
     // Used by the SHARDED async search path. After fanning out per-shard
@@ -799,8 +811,11 @@ public:
         return id;
     }
 
-    void submit_all_devices(task_fn_t fn) {
-        auto ids = submit_all_devices_no_wait(fn);
+    // Fan out to devices_[0..n), wait for all, and rethrow the first failure
+    // (logging every failure first). Counterpart of submit_first_n_no_wait
+    // for the sync build / save_dir / load_dir paths.
+    void submit_first_n(size_t n, task_fn_t fn) {
+        auto ids = submit_first_n_no_wait(n, std::move(fn));
         std::exception_ptr first_error;
         int err_count = 0;
         for (size_t i = 0; i < ids.size(); ++i) {
@@ -810,18 +825,23 @@ public:
             if (!first_error) first_error = res.error;
             try { std::rethrow_exception(res.error); }
             catch (const std::exception& e) {
-                std::cerr << "[submit_all_devices ERROR] rank=" << i
+                std::cerr << "[submit_first_n ERROR] rank=" << i
                           << " what=" << e.what() << std::endl;
             } catch (...) {
-                std::cerr << "[submit_all_devices ERROR] rank=" << i
+                std::cerr << "[submit_first_n ERROR] rank=" << i
                           << " unknown exception" << std::endl;
             }
         }
         if (first_error) {
-            std::cerr << "[submit_all_devices] " << err_count << "/" << ids.size()
+            std::cerr << "[submit_first_n] " << err_count << "/" << ids.size()
                       << " device tasks failed; rethrowing first" << std::endl;
             std::rethrow_exception(first_error);
         }
+    }
+
+    // Legacy wrapper: sync fan-out to every device queue.
+    void submit_all_devices(task_fn_t fn) {
+        submit_first_n(devices_.size(), std::move(fn));
     }
 
 
