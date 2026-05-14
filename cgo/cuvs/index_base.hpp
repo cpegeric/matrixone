@@ -307,6 +307,45 @@ public:
         return n_shards_ ? static_cast<size_t>(n_shards_) : devices_.size();
     }
 
+    // Validate a user-supplied n_shards against dist_mode and devices.size(),
+    // then set n_shards_. Called by every derived constructor (gpu_ivf_flat_t,
+    // gpu_ivf_pq_t, gpu_cagra_t) after this->devices_ has been populated.
+    //   - non-SHARDED: ignores n_shards, sets n_shards_ = 0
+    //   - SHARDED + 0:  defaults to devices_count (legacy "shards == GPUs")
+    //   - SHARDED + > devices_count or < 1: throws std::invalid_argument
+    void init_n_shards(uint32_t n_shards, size_t devices_count) {
+        if (this->dist_mode != DistributionMode_SHARDED) {
+            this->n_shards_ = 0;
+            return;
+        }
+        if (n_shards == 0) n_shards = static_cast<uint32_t>(devices_count);
+        if (n_shards < 1)
+            throw std::invalid_argument("n_shards must be >= 1");
+        if (n_shards > devices_count)
+            throw std::invalid_argument("n_shards (" + std::to_string(n_shards) +
+                ") exceeds devices.size() (" + std::to_string(devices_count) + ")");
+        this->n_shards_ = n_shards;
+    }
+
+    // Called by derived load_dir() after parsing the manifest's `shard_sizes`
+    // array into this->shard_sizes_. The manifest is the source of truth for
+    // shard count; validate it against any constructor-supplied n_shards
+    // (PR3) and against devices_.size(), then set n_shards_ = len(shard_sizes).
+    void validate_loaded_n_shards() {
+        if (this->dist_mode != DistributionMode_SHARDED) return;
+        if (this->shard_sizes_.empty()) return;
+        uint32_t loaded_n = static_cast<uint32_t>(this->shard_sizes_.size());
+        if (loaded_n > this->devices_.size())
+            throw std::runtime_error("Saved index has " + std::to_string(loaded_n) +
+                " shards but only " + std::to_string(this->devices_.size()) +
+                " devices are configured");
+        if (this->n_shards_ != 0 && this->n_shards_ != loaded_n)
+            throw std::invalid_argument("n_shards mismatch: requested " +
+                std::to_string(this->n_shards_) + ", saved index has " +
+                std::to_string(loaded_n));
+        this->n_shards_ = loaded_n;
+    }
+
     // SINGLE_GPU: points to the device copy of the build dataset (stale after extend, reset then).
     std::shared_ptr<void> dataset_device_ptr_;
 

@@ -69,30 +69,29 @@ gpu_cagra_c gpu_cagra_new(const void* dataset_data, uint64_t count_vectors, uint
                             distance_type_t metric_c, cagra_build_params_t build_params,
                             const int* devices, int device_count, uint32_t nthread,
                             distribution_mode_t dist_mode, quantization_t qtype,
-                            const int64_t* ids, void* errmsg) {
+                            const int64_t* ids, uint32_t n_shards, void* errmsg) {
     if (errmsg) *(static_cast<char**>(errmsg)) = nullptr;
     try {
         std::vector<int> devs(devices, devices + device_count);
         void* ptr = nullptr;
         switch (qtype) {
             case Quantization_F32:
-                ptr = new gpu_cagra_t<float>(static_cast<const float*>(dataset_data), count_vectors, dimension, metric_c, build_params, devs, nthread, dist_mode, ids);
+                ptr = new gpu_cagra_t<float>(static_cast<const float*>(dataset_data), count_vectors, dimension, metric_c, build_params, devs, nthread, dist_mode, ids, n_shards);
                 break;
             case Quantization_F16:
-                ptr = new gpu_cagra_t<half>(static_cast<const half*>(dataset_data), count_vectors, dimension, metric_c, build_params, devs, nthread, dist_mode, ids);
+                ptr = new gpu_cagra_t<half>(static_cast<const half*>(dataset_data), count_vectors, dimension, metric_c, build_params, devs, nthread, dist_mode, ids, n_shards);
                 break;
             case Quantization_INT8:
-                ptr = new gpu_cagra_t<int8_t>(static_cast<const int8_t*>(dataset_data), count_vectors, dimension, metric_c, build_params, devs, nthread, dist_mode, ids);
+                ptr = new gpu_cagra_t<int8_t>(static_cast<const int8_t*>(dataset_data), count_vectors, dimension, metric_c, build_params, devs, nthread, dist_mode, ids, n_shards);
                 break;
             case Quantization_UINT8:
-                ptr = new gpu_cagra_t<uint8_t>(static_cast<const uint8_t*>(dataset_data), count_vectors, dimension, metric_c, build_params, devs, nthread, dist_mode, ids);
+                ptr = new gpu_cagra_t<uint8_t>(static_cast<const uint8_t*>(dataset_data), count_vectors, dimension, metric_c, build_params, devs, nthread, dist_mode, ids, n_shards);
                 break;
             default: return nullptr;
         }
         return static_cast<gpu_cagra_c>(new gpu_cagra_any_t(qtype, ptr));
     } catch (const std::exception& e) {
-        matrixone::set_errmsg(errmsg, 
- "Error in gpu_cagra_new", e.what());
+        matrixone::set_errmsg(errmsg, "Error in gpu_cagra_new", e.what());
     }
     return nullptr;
 }
@@ -101,30 +100,29 @@ gpu_cagra_c gpu_cagra_new_empty(uint64_t total_count, uint32_t dimension, distan
                                      cagra_build_params_t build_params,
                                      const int* devices, int device_count, uint32_t nthread,
                                      distribution_mode_t dist_mode, quantization_t qtype,
-                                     const int64_t* ids, void* errmsg) {
+                                     const int64_t* ids, uint32_t n_shards, void* errmsg) {
     if (errmsg) *(static_cast<char**>(errmsg)) = nullptr;
     try {
         std::vector<int> devs(devices, devices + device_count);
         void* ptr = nullptr;
         switch (qtype) {
             case Quantization_F32:
-                ptr = new gpu_cagra_t<float>(total_count, dimension, metric_c, build_params, devs, nthread, dist_mode, ids);
+                ptr = new gpu_cagra_t<float>(total_count, dimension, metric_c, build_params, devs, nthread, dist_mode, ids, n_shards);
                 break;
             case Quantization_F16:
-                ptr = new gpu_cagra_t<half>(total_count, dimension, metric_c, build_params, devs, nthread, dist_mode, ids);
+                ptr = new gpu_cagra_t<half>(total_count, dimension, metric_c, build_params, devs, nthread, dist_mode, ids, n_shards);
                 break;
             case Quantization_INT8:
-                ptr = new gpu_cagra_t<int8_t>(total_count, dimension, metric_c, build_params, devs, nthread, dist_mode, ids);
+                ptr = new gpu_cagra_t<int8_t>(total_count, dimension, metric_c, build_params, devs, nthread, dist_mode, ids, n_shards);
                 break;
             case Quantization_UINT8:
-                ptr = new gpu_cagra_t<uint8_t>(total_count, dimension, metric_c, build_params, devs, nthread, dist_mode, ids);
+                ptr = new gpu_cagra_t<uint8_t>(total_count, dimension, metric_c, build_params, devs, nthread, dist_mode, ids, n_shards);
                 break;
             default: return nullptr;
         }
         return static_cast<gpu_cagra_c>(new gpu_cagra_any_t(qtype, ptr));
     } catch (const std::exception& e) {
-        matrixone::set_errmsg(errmsg, 
- "Error in gpu_cagra_new_empty", e.what());
+        matrixone::set_errmsg(errmsg, "Error in gpu_cagra_new_empty", e.what());
     }
     return nullptr;
 }

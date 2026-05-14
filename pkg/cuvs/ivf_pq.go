@@ -77,8 +77,19 @@ func (gi *GpuIvfPq[T]) SetDynbConservativeDispatch(enable bool) error {
 
 // NewGpuIvfPq creates a new GpuIvfPq instance from a dataset.
 // ids may be nil to use internal sequential IDs (0..count-1).
+// Shard count defaults to len(devices) when mode == Sharded; use
+// NewGpuIvfPqWithShards to request fewer shards than GPUs.
 func NewGpuIvfPq[T VectorType](dataset []T, count uint64, dimension uint32, metric DistanceType,
 	bp IvfPqBuildParams, devices []int, nthread uint32, mode DistributionMode, ids []int64) (*GpuIvfPq[T], error) {
+	return NewGpuIvfPqWithShards(dataset, count, dimension, metric, bp, devices, nthread, mode, ids, 0)
+}
+
+// NewGpuIvfPqWithShards is like NewGpuIvfPq but lets the caller pick the
+// shard count for Sharded mode independently of len(devices). nShards must
+// satisfy 1 <= nShards <= len(devices); 0 = use len(devices) (legacy
+// behaviour). Ignored for SingleGpu / Replicated modes.
+func NewGpuIvfPqWithShards[T VectorType](dataset []T, count uint64, dimension uint32, metric DistanceType,
+	bp IvfPqBuildParams, devices []int, nthread uint32, mode DistributionMode, ids []int64, nShards uint32) (*GpuIvfPq[T], error) {
 	if len(devices) == 0 {
 		return nil, moerr.NewInternalErrorNoCtx("at least one device must be specified")
 	}
@@ -115,6 +126,7 @@ func NewGpuIvfPq[T VectorType](dataset []T, count uint64, dimension uint32, metr
 		C.distribution_mode_t(mode),
 		C.quantization_t(qtype),
 		cIds,
+		C.uint32_t(nShards),
 		unsafe.Pointer(&errmsg),
 	)
 	runtime.KeepAlive(dataset)
@@ -140,8 +152,16 @@ func NewGpuIvfPq[T VectorType](dataset []T, count uint64, dimension uint32, metr
 }
 
 // NewGpuIvfPqFromDataFile creates a new GpuIvfPq instance from a MODF datafile.
+// Shard count defaults to len(devices); use NewGpuIvfPqFromDataFileWithShards to override.
 func NewGpuIvfPqFromDataFile[T VectorType](datafilename string, metric DistanceType,
 	bp IvfPqBuildParams, devices []int, nthread uint32, mode DistributionMode) (*GpuIvfPq[T], error) {
+	return NewGpuIvfPqFromDataFileWithShards[T](datafilename, metric, bp, devices, nthread, mode, 0)
+}
+
+// NewGpuIvfPqFromDataFileWithShards is like NewGpuIvfPqFromDataFile but lets
+// the caller pick the shard count for Sharded mode. See NewGpuIvfPqWithShards.
+func NewGpuIvfPqFromDataFileWithShards[T VectorType](datafilename string, metric DistanceType,
+	bp IvfPqBuildParams, devices []int, nthread uint32, mode DistributionMode, nShards uint32) (*GpuIvfPq[T], error) {
 	if len(devices) == 0 {
 		return nil, moerr.NewInternalErrorNoCtx("at least one device must be specified")
 	}
@@ -173,6 +193,7 @@ func NewGpuIvfPqFromDataFile[T VectorType](datafilename string, metric DistanceT
 		C.uint32_t(nthread),
 		C.distribution_mode_t(mode),
 		C.quantization_t(qtype),
+		C.uint32_t(nShards),
 		unsafe.Pointer(&errmsg),
 	)
 	runtime.KeepAlive(cDevices)
@@ -187,8 +208,6 @@ func NewGpuIvfPqFromDataFile[T VectorType](datafilename string, metric DistanceT
 		return nil, moerr.NewInternalErrorNoCtx("failed to create GpuIvfPq from data file")
 	}
 
-	// dimension will be updated when GetDim() is called, but we can set it to 0 for now
-	// or ideally GetDim() should be used.
 	return &GpuIvfPq[T]{
 		cIvfPq:    cIvfPq,
 		dimension: 0,
@@ -198,8 +217,16 @@ func NewGpuIvfPqFromDataFile[T VectorType](datafilename string, metric DistanceT
 }
 
 // NewGpuIvfPqEmpty creates a new GpuIvfPq instance with pre-allocated buffer but no data yet.
+// Shard count defaults to len(devices); use NewGpuIvfPqEmptyWithShards to override.
 func NewGpuIvfPqEmpty[T VectorType](totalCount uint64, dimension uint32, metric DistanceType,
 	bp IvfPqBuildParams, devices []int, nthread uint32, mode DistributionMode) (*GpuIvfPq[T], error) {
+	return NewGpuIvfPqEmptyWithShards[T](totalCount, dimension, metric, bp, devices, nthread, mode, 0)
+}
+
+// NewGpuIvfPqEmptyWithShards is like NewGpuIvfPqEmpty but lets the caller
+// pick the shard count for Sharded mode. See NewGpuIvfPqWithShards.
+func NewGpuIvfPqEmptyWithShards[T VectorType](totalCount uint64, dimension uint32, metric DistanceType,
+	bp IvfPqBuildParams, devices []int, nthread uint32, mode DistributionMode, nShards uint32) (*GpuIvfPq[T], error) {
 	if len(devices) == 0 {
 		return nil, moerr.NewInternalErrorNoCtx("at least one device must be specified")
 	}
@@ -230,6 +257,7 @@ func NewGpuIvfPqEmpty[T VectorType](totalCount uint64, dimension uint32, metric 
 		C.distribution_mode_t(mode),
 		C.quantization_t(qtype),
 		nil,
+		C.uint32_t(nShards),
 		unsafe.Pointer(&errmsg),
 	)
 	runtime.KeepAlive(cDevices)
@@ -466,6 +494,8 @@ func NewGpuIvfPqFromDataDirectory[T VectorType](dir string, dimension uint32, me
 	}
 
 	var errmsg *C.char
+	// n_shards = 0: the saved manifest determines the shard count via
+	// load_dir below.
 	cIvfPq := C.gpu_ivf_pq_new_empty(
 		0,
 		C.uint32_t(dimension),
@@ -477,6 +507,7 @@ func NewGpuIvfPqFromDataDirectory[T VectorType](dir string, dimension uint32, me
 		C.distribution_mode_t(mode),
 		C.quantization_t(qtype),
 		nil,
+		0,
 		unsafe.Pointer(&errmsg),
 	)
 	runtime.KeepAlive(cDevices)

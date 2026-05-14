@@ -77,8 +77,20 @@ func (gi *GpuCagra[T]) SetDynbConservativeDispatch(enable bool) error {
 
 // NewGpuCagra creates a new GpuCagra instance from a dataset.
 // ids may be nil to use internal sequential IDs (0..count-1).
+// Shard count defaults to len(devices) when mode == Sharded; use
+// NewGpuCagraWithShards to request fewer shards than GPUs.
 func NewGpuCagra[T VectorType](dataset []T, count uint64, dimension uint32, metric DistanceType,
 	bp CagraBuildParams, devices []int, nthread uint32, mode DistributionMode, ids []int64) (*GpuCagra[T], error) {
+	return NewGpuCagraWithShards(dataset, count, dimension, metric, bp, devices, nthread, mode, ids, 0)
+}
+
+// NewGpuCagraWithShards is like NewGpuCagra but lets the caller pick the
+// shard count for Sharded mode independently of len(devices). nShards must
+// satisfy 1 <= nShards <= len(devices); 0 = use len(devices) (legacy
+// behaviour). Ignored for SingleGpu / Replicated modes. CAGRA does not
+// support Sharded extends, but Sharded build / search work.
+func NewGpuCagraWithShards[T VectorType](dataset []T, count uint64, dimension uint32, metric DistanceType,
+	bp CagraBuildParams, devices []int, nthread uint32, mode DistributionMode, ids []int64, nShards uint32) (*GpuCagra[T], error) {
 	if len(devices) == 0 {
 		return nil, moerr.NewInternalErrorNoCtx("at least one device must be specified")
 	}
@@ -113,6 +125,7 @@ func NewGpuCagra[T VectorType](dataset []T, count uint64, dimension uint32, metr
 		C.distribution_mode_t(mode),
 		C.quantization_t(qtype),
 		cIds,
+		C.uint32_t(nShards),
 		unsafe.Pointer(&errmsg),
 	)
 	runtime.KeepAlive(dataset)
@@ -212,6 +225,8 @@ func NewGpuCagraFromDataDirectory[T VectorType](dir string, dimension uint32, me
 	}
 
 	var errmsg *C.char
+	// n_shards = 0: the saved manifest determines the shard count via
+	// load_dir below.
 	cCagra := C.gpu_cagra_new_empty(
 		0,
 		C.uint32_t(dimension),
@@ -223,6 +238,7 @@ func NewGpuCagraFromDataDirectory[T VectorType](dir string, dimension uint32, me
 		C.distribution_mode_t(mode),
 		C.quantization_t(qtype),
 		nil,
+		0,
 		unsafe.Pointer(&errmsg),
 	)
 	runtime.KeepAlive(cDevices)
@@ -323,8 +339,16 @@ func (gi *GpuCagra[T]) Build() error {
 }
 
 // NewGpuCagraEmpty creates a new GpuCagra instance with pre-allocated buffer but no data yet.
+// Shard count defaults to len(devices); use NewGpuCagraEmptyWithShards to override.
 func NewGpuCagraEmpty[T VectorType](totalCount uint64, dimension uint32, metric DistanceType,
 	bp CagraBuildParams, devices []int, nthread uint32, mode DistributionMode) (*GpuCagra[T], error) {
+	return NewGpuCagraEmptyWithShards[T](totalCount, dimension, metric, bp, devices, nthread, mode, 0)
+}
+
+// NewGpuCagraEmptyWithShards is like NewGpuCagraEmpty but lets the caller
+// pick the shard count for Sharded mode. See NewGpuCagraWithShards.
+func NewGpuCagraEmptyWithShards[T VectorType](totalCount uint64, dimension uint32, metric DistanceType,
+	bp CagraBuildParams, devices []int, nthread uint32, mode DistributionMode, nShards uint32) (*GpuCagra[T], error) {
 	if len(devices) == 0 {
 		return nil, moerr.NewInternalErrorNoCtx("at least one device must be specified")
 	}
@@ -353,6 +377,7 @@ func NewGpuCagraEmpty[T VectorType](totalCount uint64, dimension uint32, metric 
 		C.distribution_mode_t(mode),
 		C.quantization_t(qtype),
 		nil,
+		C.uint32_t(nShards),
 		unsafe.Pointer(&errmsg),
 	)
 	runtime.KeepAlive(cDevices)

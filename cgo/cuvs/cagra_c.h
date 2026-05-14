@@ -31,17 +31,19 @@ typedef void* gpu_cagra_c;
 // Opaque pointer to the C++ CAGRA search result object
 typedef void* gpu_cagra_result_c;
 
-// Constructor for building from dataset
+// Constructor for building from dataset.
+// n_shards: SHARDED-only. 0 = use device_count. Must be <= device_count when SHARDED.
 gpu_cagra_c gpu_cagra_new(const void* dataset_data, uint64_t count_vectors, uint32_t dimension,
                             distance_type_t metric, cagra_build_params_t build_params,
                             const int* devices, int device_count, uint32_t nthread,
                             distribution_mode_t dist_mode, quantization_t qtype,
-                            const int64_t* ids, void* errmsg);
+                            const int64_t* ids, uint32_t n_shards, void* errmsg);
 
-// Constructor for loading from file
+// Constructor for loading from file. (Shard count is read from the saved
+// manifest on load_dir — no n_shards parameter here.)
 gpu_cagra_c gpu_cagra_load_file(const char* filename, uint32_t dimension, distance_type_t metric,
                                  cagra_build_params_t build_params,
-                                 const int* devices, int device_count, uint32_t nthread, 
+                                 const int* devices, int device_count, uint32_t nthread,
                                  distribution_mode_t dist_mode, quantization_t qtype, void* errmsg);
 
 // Destructor
@@ -53,12 +55,12 @@ void gpu_cagra_start(gpu_cagra_c index_c, void* errmsg);
 // Build function (actually triggers the build/load logic)
 void gpu_cagra_build(gpu_cagra_c index_c, void* errmsg);
 
-// Constructor for an empty index (pre-allocates)
+// Constructor for an empty index (pre-allocates). n_shards as above.
 gpu_cagra_c gpu_cagra_new_empty(uint64_t total_count, uint32_t dimension, distance_type_t metric,
                                      cagra_build_params_t build_params,
                                      const int* devices, int device_count, uint32_t nthread,
                                      distribution_mode_t dist_mode, quantization_t qtype,
-                                     const int64_t* ids, void* errmsg);
+                                     const int64_t* ids, uint32_t n_shards, void* errmsg);
 
 // Add chunk of data (same type as index quantization)
 void gpu_cagra_add_chunk(gpu_cagra_c index_c, const void* chunk_data, uint64_t chunk_count, const int64_t* ids, void* errmsg);

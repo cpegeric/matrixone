@@ -227,7 +227,7 @@ public:
     gpu_cagra_t(const T* dataset_data, uint64_t count_vectors, uint32_t dimension,
                     distance_type_t m, const cagra_build_params_t& bp,
                     const std::vector<int>& devices, uint32_t nthread, distribution_mode_t mode,
-                    const int64_t* ids = nullptr) {
+                    const int64_t* ids = nullptr, uint32_t n_shards = 0) {
 
         this->dimension = dimension;
         this->count = static_cast<uint64_t>(count_vectors);
@@ -235,6 +235,7 @@ public:
         this->build_params = bp;
         this->dist_mode = mode;
         this->devices_ = devices;
+        this->init_n_shards(n_shards, devices.size());
         this->current_offset_ = count_vectors;
 
         std::vector<int> worker_devices = this->devices_;
@@ -258,7 +259,7 @@ public:
     gpu_cagra_t(uint64_t total_count, uint32_t dimension, distance_type_t m,
                     const cagra_build_params_t& bp, const std::vector<int>& devices,
                     uint32_t nthread, distribution_mode_t mode,
-                    const int64_t* ids = nullptr) {
+                    const int64_t* ids = nullptr, uint32_t n_shards = 0) {
 
         this->dimension = dimension;
         this->count = static_cast<uint64_t>(total_count);
@@ -266,6 +267,7 @@ public:
         this->build_params = bp;
         this->dist_mode = mode;
         this->devices_ = devices;
+        this->init_n_shards(n_shards, devices.size());
         this->current_offset_ = 0;
 
         std::vector<int> worker_devices = this->devices_;
@@ -281,7 +283,8 @@ public:
         }
     }
 
-    // Constructor for loading from file
+    // Constructor for loading from file. n_shards_ stays 0 until load_dir
+    // reads it from the saved manifest.
     gpu_cagra_t(const std::string& filename, uint32_t dimension, distance_type_t m,
                     const cagra_build_params_t& bp, const std::vector<int>& devices,
                     uint32_t nthread, distribution_mode_t mode) {
@@ -1458,6 +1461,8 @@ public:
                     this->shard_sizes_[i] = static_cast<uint64_t>(ss[i]);
             }
         }
+
+        this->validate_loaded_n_shards();
 
         std::string idx_file   = json_value(m.comp_json, "index");
         std::vector<std::string> shard_files = json_string_array(m.comp_json, "shards");

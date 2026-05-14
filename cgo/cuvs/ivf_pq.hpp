@@ -204,7 +204,7 @@ public:
     gpu_ivf_pq_t(const T* dataset_data, uint64_t count_vectors, uint32_t dimension,
                     distance_type_t m, const ivf_pq_build_params_t& bp,
                     const std::vector<int>& devices, uint32_t nthread, distribution_mode_t mode,
-                    const int64_t* ids = nullptr) {
+                    const int64_t* ids = nullptr, uint32_t n_shards = 0) {
 
         this->dimension = dimension;
         this->count = count_vectors;
@@ -212,6 +212,7 @@ public:
         this->build_params = bp;
         this->dist_mode = mode;
         this->devices_ = devices;
+        this->init_n_shards(n_shards, devices.size());
         this->current_offset_ = count_vectors;
 
         std::vector<int> worker_devices = this->devices_;
@@ -235,7 +236,7 @@ public:
     gpu_ivf_pq_t(uint64_t total_count, uint32_t dimension, distance_type_t m,
                     const ivf_pq_build_params_t& bp, const std::vector<int>& devices,
                     uint32_t nthread, distribution_mode_t mode,
-                    const int64_t* ids = nullptr) {
+                    const int64_t* ids = nullptr, uint32_t n_shards = 0) {
 
         this->dimension = dimension;
         this->count = total_count;
@@ -243,6 +244,7 @@ public:
         this->build_params = bp;
         this->dist_mode = mode;
         this->devices_ = devices;
+        this->init_n_shards(n_shards, devices.size());
         this->current_offset_ = 0;
 
         std::vector<int> worker_devices = this->devices_;
@@ -261,12 +263,13 @@ public:
     // Constructor for loading metadata from file (used for tests and data-file builds)
     gpu_ivf_pq_t(const std::string& filename, distance_type_t m,
                     const ivf_pq_build_params_t& bp, const std::vector<int>& devices,
-                    uint32_t nthread, distribution_mode_t mode) {
+                    uint32_t nthread, distribution_mode_t mode, uint32_t n_shards = 0) {
 
         this->metric = m;
         this->build_params = bp;
         this->dist_mode = mode;
         this->devices_ = devices;
+        this->init_n_shards(n_shards, devices.size());
         this->data_filename_ = filename;
 
         std::vector<int> worker_devices = this->devices_;
@@ -278,7 +281,8 @@ public:
         this->current_offset_ = 0;
     }
 
-    // Constructor for loading a serialized IVF-PQ index from file
+    // Constructor for loading a serialized IVF-PQ index from file. n_shards_
+    // stays 0 until load_dir reads it from the saved manifest.
     gpu_ivf_pq_t(const std::string& filename, uint32_t dimension, distance_type_t m,
                     const ivf_pq_build_params_t& bp, const std::vector<int>& devices,
                     uint32_t nthread, distribution_mode_t mode) {
@@ -1677,6 +1681,8 @@ public:
                     this->shard_sizes_[i] = static_cast<uint64_t>(ss[i]);
             }
         }
+
+        this->validate_loaded_n_shards();
 
         std::string idx_file   = json_value(m.comp_json, "index");
         std::vector<std::string> shard_files = json_string_array(m.comp_json, "shards");
