@@ -73,7 +73,23 @@ func (s *scheduler) Schedule(cnState logservice.CNState, currentTick uint64) {
 		zap.Int("created", len(createdTasks)),
 		zap.Int("expired", len(expiredTasks)))
 	s.allocateTasks(createdTasks, workingCNPool)
-	s.completeTasks(expiredTasks)
+
+	// If a mass-failure fraction of CN stores looks expired at once, the
+	// HAKeeper itself was likely stalled (GC / CPU starvation / recent leader
+	// change) and the missing heartbeats say nothing about CN health. Skip
+	// failing the running tasks this round rather than killing live work. New
+	// allocations above are unaffected (they simply have no working CN to land
+	// on and retry next round).
+	expiredCNs := cnPool.Len() - workingCNPool.Len()
+	if s.cfg.CNMassFailureSuppressed(expiredCNs, cnPool.Len()) {
+		runtime.ServiceRuntime(s.service).Logger().Warn(
+			"hakeeper.task.mass.failure.suppressed",
+			zap.Int("expired-cn", expiredCNs),
+			zap.Int("total-cn", cnPool.Len()),
+			zap.Int("would-fail-tasks", len(expiredTasks)))
+	} else {
+		s.completeTasks(expiredTasks)
+	}
 
 	s.truncateTasks()
 }

@@ -24,6 +24,19 @@ const (
 	DefaultTNStoreTimeout    = 10 * time.Second
 	DefaultCNStoreTimeout    = 30 * time.Second
 	DefaultProxyStoreTimeout = 30 * time.Second
+
+	// DefaultMassFailureRatio is the fraction of CN stores that must be
+	// simultaneously expired in a single evaluation round before the HAKeeper
+	// treats the situation as a detector-side disruption (its own GC pause /
+	// CPU starvation / a recent leader change) rather than a genuine mass
+	// outage. When the threshold is met, CN expiry is suppressed for that
+	// round so live CNs are not evicted and their sessions are not migrated.
+	DefaultMassFailureRatio = 0.5
+
+	// MinMassFailureStores is the minimum number of expired CN stores required
+	// before mass-failure suppression can engage. Below this, a legitimate
+	// single-store outage is always acted upon.
+	MinMassFailureStores = 2
 )
 
 type Config struct {
@@ -93,4 +106,18 @@ func (cfg Config) ProxyStoreExpired(start, current uint64) bool {
 
 func (cfg Config) ExpiredTick(start uint64, timeout time.Duration) uint64 {
 	return uint64(timeout/time.Second)*uint64(cfg.TickPerSecond) + start
+}
+
+// CNMassFailureSuppressed reports whether the number of simultaneously expired
+// CN stores is large enough (relative to the total) that the expiry is more
+// likely caused by the HAKeeper itself being unable to observe heartbeats (a
+// GC pause, CPU starvation, or a recent leader change) than by the CN stores
+// actually being down. A real outage takes CNs down one at a time; a blind
+// detector sees them all go stale together. When this returns true, callers
+// MUST NOT treat the CN stores as expired for this evaluation round.
+func (cfg Config) CNMassFailureSuppressed(expired, total int) bool {
+	if total <= 0 || expired < MinMassFailureStores {
+		return false
+	}
+	return float64(expired) >= float64(total)*DefaultMassFailureRatio
 }

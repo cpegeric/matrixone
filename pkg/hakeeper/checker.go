@@ -37,7 +37,15 @@ type Checker interface {
 	// Check is periodically called by the HAKeeper for checking the cluster
 	// health status, a list of Operator instances will be returned describing
 	// actions required to ensure the high availability of the cluster.
-	Check(alloc util.IDAllocator, state pb.CheckerState, standbyEnabled bool) []pb.ScheduleCommand
+	//
+	// graceTicks is a leader-local amount subtracted from the current tick
+	// before any store-expiry comparison. It is non-zero only while the
+	// HAKeeper is recovering from a period during which it could not observe
+	// heartbeats (its own GC pause / CPU starvation, or the moment just after it
+	// became leader). Subtracting it makes every store look that much more
+	// recently alive, so no store of any type is evicted on heartbeats the
+	// detector was never in a position to receive.
+	Check(alloc util.IDAllocator, state pb.CheckerState, standbyEnabled bool, graceTicks uint64) []pb.ScheduleCommand
 }
 
 type CheckerCommonFields struct {

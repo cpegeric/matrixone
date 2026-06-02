@@ -301,12 +301,14 @@ func (rb *remoteBackend) adjust() {
 	rb.rateLimitLogger = logutil.NewRateLimitedLogger(rb.logger)
 	rb.options.goettyOptions = append(rb.options.goettyOptions,
 		goetty.WithSessionCodec(rb.codec),
-		goetty.WithSessionLogger(rb.logger))
+		goetty.WithSessionLogger(logutil.FilterGoettyCloseNoise(rb.logger)))
 	// Pass our shared logger to goetty so it does not call getDefaultZapLoggerWithLevel(),
 	// which uses zap.Config.Build() with Sampling and allocates zapcore.newCounters per
 	// session (~hundreds of KB each). Without WithSessionLogger, the path
 	// NewRemoteBackend->NewIOSession->adjust->adjustLogger->getDefaultZapLoggerWithLevel
 	// ->zap.Config.Build->NewSamplerWithOptions->newCounters caused ~83GB under sysbench.
+	// FilterGoettyCloseNoise drops goetty's expected connection-teardown ERROR
+	// logs ("close conneciton failed") without disturbing any other output.
 }
 
 // logFields returns zap fields for this backend; use at log sites instead of a per-backend Logger.With().

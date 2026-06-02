@@ -160,6 +160,30 @@ type store struct {
 
 	// onReplicaChanged is a called when the replicas on the store changes.
 	onReplicaChanged func(shardID uint64, replicaID uint64, typ ChangeType)
+
+	// haHealth holds leader-local failure-detector guard state. It is read and
+	// written only by the single ticker() goroutine (via hakeeperTick and
+	// hakeeperCheck), so it requires no synchronization. It is what stops the
+	// HAKeeper from evicting CN stores during periods when it could not itself
+	// observe heartbeats: a self-stall (its own GC pause / CPU starvation) or
+	// the moment just after it became leader.
+	haHealth struct {
+		// wasLeader is whether this node was the HAKeeper leader at the
+		// previous tick. A false->true transition opens a grace window so
+		// stores can re-register heartbeats with the new leader.
+		wasLeader bool
+		// lastTickAt is the wall-clock time of the previous tick, used to
+		// measure how long the ticker goroutine was stalled.
+		lastTickAt time.Time
+		// graceUntil is the wall-clock instant until which the grace window is
+		// active. While active, currentGraceTicks() returns graceTicks.
+		graceUntil time.Time
+		// graceTicks is how much to pull the current tick back during the
+		// window, in HAKeeper ticks — the magnitude of the blind period. The
+		// checker subtracts it before any store-expiry comparison so no store
+		// of any type is evicted on heartbeats the detector could not receive.
+		graceTicks uint64
+	}
 }
 
 func newLogStore(cfg Config,
@@ -1243,6 +1267,8 @@ func (l *store) hakeeperTick() {
 		return
 	}
 
+	l.updateHealthGuard(isLeader)
+
 	if isLeader {
 		cmd := hakeeper.GetTickCmd()
 		ctx, cancel := context.WithTimeoutCause(context.Background(), hakeeperDefaultTimeout, moerr.CauseHakeeperTick)
@@ -1254,6 +1280,101 @@ func (l *store) hakeeperTick() {
 			return
 		}
 	}
+}
+
+// updateHealthGuard maintains the leader-local failure-detector guard state. It
+// is called once per tick from the single ticker() goroutine, so it needs no
+// locking. It detects the two conditions under which a missing heartbeat says
+// nothing about CN health and so must not lead to eviction:
+//
+//   - this node just became HAKeeper leader: heartbeats need time to re-flow to
+//     the new leader, so grant one CNStoreTimeout window of grace.
+//   - the ticker goroutine was itself stalled (GC pause / CPU starvation): the
+//     detector was blind during the stall, so grant a grace window that covers
+//     the blind period.
+func (l *store) updateHealthGuard(isLeader bool) {
+	now := time.Now()
+	last := l.haHealth.lastTickAt
+	l.haHealth.lastTickAt = now
+
+	// Clear an elapsed grace window so a later, smaller blind period does not
+	// inherit a stale, larger magnitude via the max() in extendHealthGrace.
+	if !l.haHealth.graceUntil.IsZero() && !now.Before(l.haHealth.graceUntil) {
+		l.haHealth.graceUntil = time.Time{}
+		l.haHealth.graceTicks = 0
+	}
+
+	if !isLeader {
+		l.haHealth.wasLeader = false
+		return
+	}
+
+	cfg := l.cfg.GetHAKeeperConfig()
+	cnTimeout := cfg.CNStoreTimeout
+	// Cap the grace so a pathological multi-minute stall cannot blind the
+	// detector for minutes.
+	maxGrace := 2 * cnTimeout
+
+	// leader transition (non-leader -> leader): grant one CNStoreTimeout window
+	// for stores to re-register heartbeats with the new leader.
+	if !l.haHealth.wasLeader {
+		l.haHealth.wasLeader = true
+		l.extendHealthGrace(now, cnTimeout, maxGrace, cfg.TickPerSecond)
+		l.runtime.Logger().Info("hakeeper.health.guard.leader.grace",
+			zap.Duration("window", cnTimeout))
+		return
+	}
+
+	// self-stall detection. The expected gap between ticks is one tick
+	// interval; a much larger gap means the ticker goroutine was starved. The
+	// threshold is well above normal hakeeperCheck latency (which runs in this
+	// same goroutine and can block for up to hakeeperDefaultTimeout) so routine
+	// check latency does not trip it.
+	if !last.IsZero() {
+		stallThreshold := cnTimeout / 3
+		if stallThreshold < 3*time.Second {
+			stallThreshold = 3 * time.Second
+		}
+		gap := now.Sub(last)
+		if gap > stallThreshold {
+			l.extendHealthGrace(now, gap, maxGrace, cfg.TickPerSecond)
+			l.runtime.Logger().Warn("hakeeper.health.guard.self.stall",
+				zap.Duration("stall", gap),
+				zap.Duration("threshold", stallThreshold))
+		}
+	}
+}
+
+// extendHealthGrace opens (or lengthens) the grace window to cover a blind
+// period of duration blind, capped at maxGrace. It records both the wall-clock
+// deadline and the tick magnitude to subtract during the window, taking the max
+// of any existing values so overlapping blind periods do not shrink the grace.
+func (l *store) extendHealthGrace(now time.Time, blind, maxGrace time.Duration, tickPerSecond int) {
+	if blind > maxGrace {
+		blind = maxGrace
+	}
+	if tickPerSecond <= 0 {
+		tickPerSecond = hakeeper.DefaultTickPerSecond
+	}
+	until := now.Add(blind)
+	// Match how CNStoreExpired converts a timeout to ticks: seconds * ticks/s.
+	ticks := uint64(blind/time.Second) * uint64(tickPerSecond)
+	if until.After(l.haHealth.graceUntil) {
+		l.haHealth.graceUntil = until
+	}
+	if ticks > l.haHealth.graceTicks {
+		l.haHealth.graceTicks = ticks
+	}
+}
+
+// currentGraceTicks returns the amount to subtract from the current tick while
+// the grace window is active, or 0 otherwise. Called from the ticker goroutine
+// (hakeeperCheck), the same goroutine that maintains the guard via hakeeperTick.
+func (l *store) currentGraceTicks() uint64 {
+	if time.Now().Before(l.haHealth.graceUntil) {
+		return l.haHealth.graceTicks
+	}
+	return 0
 }
 
 func (l *store) getHeartbeatMessage() pb.LogStoreHeartbeat {

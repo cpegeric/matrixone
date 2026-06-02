@@ -698,6 +698,7 @@ func TestFixExpiredStore(t *testing.T) {
 				NonVotingReplicaNum: c.nonVotingReplicaNum,
 			},
 			false,
+			0,
 		)
 		assert.Equal(t, c.expected, output)
 	}
@@ -865,6 +866,7 @@ func TestFixZombie(t *testing.T) {
 				LogState:    c.log,
 			},
 			false,
+			0,
 		)
 		assert.Equal(t, c.expected, output)
 	}
@@ -896,6 +898,7 @@ func TestOpExpiredAndThenCompleted(t *testing.T) {
 			LogState:    logState,
 		},
 		false,
+		0,
 	))
 	assert.Nil(t, coordinator.Check(
 		idAlloc,
@@ -905,6 +908,7 @@ func TestOpExpiredAndThenCompleted(t *testing.T) {
 			LogState:    logState,
 		},
 		false,
+		0,
 	))
 
 	ops := coordinator.OperatorController.GetOperators(1)
@@ -919,6 +923,7 @@ func TestOpExpiredAndThenCompleted(t *testing.T) {
 			LogState:    logState,
 		},
 		false,
+		0,
 	))
 	ops = coordinator.OperatorController.GetOperators(1)
 	assert.Equal(t, 1, len(ops))
@@ -942,5 +947,43 @@ func TestOpExpiredAndThenCompleted(t *testing.T) {
 			LogState:    logState,
 		},
 		false,
+		0,
 	))
+}
+
+func hasDeleteCN(cmds []pb.ScheduleCommand) bool {
+	for _, c := range cmds {
+		if c.DeleteCNStore != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// TestEvictionGraceSuppressesExpiry verifies that a non-zero graceTicks pulls
+// the current tick back so an otherwise-expired store is not evicted, while a
+// zero graceTicks evicts it as before.
+func TestEvictionGraceSuppressesExpiry(t *testing.T) {
+	cfg := hakeeper.Config{}
+	cfg.Fill()
+	// a CN whose last heartbeat was at tick 0, observed well past its timeout.
+	cnExpireTicks := uint64(cfg.CNStoreTimeout/time.Second) * uint64(cfg.TickPerSecond)
+	currentTick := cnExpireTicks + 100
+	state := pb.CheckerState{
+		Tick:          currentTick,
+		TaskTableUser: pb.TaskTableUser{Username: "u", Password: "p"},
+		CNState: pb.CNState{Stores: map[string]pb.CNStoreInfo{
+			"cn-a": {Tick: 0},
+		}},
+	}
+
+	// no grace: the expired CN is deleted.
+	noGrace := NewCoordinator("", hakeeper.Config{})
+	cmds := noGrace.Check(util.NewTestIDAllocator(0), state, false, 0)
+	assert.True(t, hasDeleteCN(cmds), "expired CN should be deleted without grace")
+
+	// grace covering the whole elapsed tick: the CN is not deleted.
+	withGrace := NewCoordinator("", hakeeper.Config{})
+	cmds = withGrace.Check(util.NewTestIDAllocator(0), state, false, currentTick)
+	assert.False(t, hasDeleteCN(cmds), "expired CN must not be deleted while in grace")
 }

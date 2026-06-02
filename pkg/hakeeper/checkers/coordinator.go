@@ -53,7 +53,7 @@ func NewCoordinator(
 	}
 }
 
-func (c *Coordinator) Check(alloc util.IDAllocator, state pb.CheckerState, standbyEnabled bool) []pb.ScheduleCommand {
+func (c *Coordinator) Check(alloc util.IDAllocator, state pb.CheckerState, standbyEnabled bool, graceTicks uint64) []pb.ScheduleCommand {
 	logState := state.LogState
 	tnState := state.TNState
 	cnState := state.CNState
@@ -61,12 +61,34 @@ func (c *Coordinator) Check(alloc util.IDAllocator, state pb.CheckerState, stand
 	cluster := state.ClusterInfo
 	currentTick := state.Tick
 	user := state.TaskTableUser
+
+	// While the HAKeeper is recovering from a period it was blind to heartbeats
+	// (its own GC pause / CPU starvation, or just after becoming leader), pull
+	// the current tick back by graceTicks so every store-expiry comparison
+	// across CN / TN / Log treats that much less time as having passed. This
+	// suppresses eviction at the source — no operator is generated — for any
+	// store that would only look expired because of the blind period.
+	effectiveTick := currentTick
+	if graceTicks > 0 {
+		if graceTicks >= currentTick {
+			effectiveTick = 0
+		} else {
+			effectiveTick = currentTick - graceTicks
+		}
+		runtime.ServiceRuntime(c.service).Logger().Info("hakeeper checker eviction grace active",
+			zap.Uint64("grace ticks", graceTicks),
+			zap.Uint64("current tick", currentTick),
+			zap.Uint64("effective tick", effectiveTick),
+		)
+	}
+
 	runtime.ServiceRuntime(c.service).Logger().Debug("hakeeper checker state",
 		zap.Any("cluster information", cluster),
 		zap.Any("log state", logState),
 		zap.Any("dn state", tnState),
 		zap.Any("cn state", cnState),
 		zap.Uint64("current tick", currentTick),
+		zap.Uint64("effective tick", effectiveTick),
 	)
 
 	defer func() {
@@ -83,7 +105,7 @@ func (c *Coordinator) Check(alloc util.IDAllocator, state pb.CheckerState, stand
 	}
 
 	// check whether system health or not.
-	if operators, health := syshealth.Check(c.cfg, cluster, tnState, logState, currentTick); !health {
+	if operators, health := syshealth.Check(c.cfg, cluster, tnState, logState, effectiveTick); !health {
 		c.teardown = true
 		c.teardownOps = operators
 		return c.OperatorController.Dispatch(c.teardownOps, logState, tnState, cnState, proxyState)
@@ -100,7 +122,7 @@ func (c *Coordinator) Check(alloc util.IDAllocator, state pb.CheckerState, stand
 		alloc,
 		cluster,
 		user,
-		currentTick,
+		effectiveTick,
 	)
 	checkers := []hakeeper.ModuleChecker{
 		logservice.NewLogServiceChecker(

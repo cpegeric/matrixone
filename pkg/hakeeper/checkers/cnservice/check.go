@@ -70,6 +70,18 @@ func (c *cnServiceChecker) Check() (operators []*operator.Operator) {
 			}
 		}
 	}
+	// If a mass-failure fraction of CN stores is expired at once, the HAKeeper
+	// itself was likely stalled (GC / CPU starvation / recent leader change)
+	// and the missed heartbeats say nothing about CN health. Suppress the
+	// deletions this round rather than evicting live CNs.
+	if c.Cfg.CNMassFailureSuppressed(len(expired), len(working)+len(expired)) {
+		runtime.ServiceRuntime(c.ServiceID).Logger().Warn(
+			"hakeeper.checker.cnservice.mass.failure.suppressed",
+			zap.Int("expired", len(expired)),
+			zap.Int("total", len(working)+len(expired)),
+		)
+		return operators
+	}
 	for _, store := range expired {
 		runtime.ServiceRuntime(c.ServiceID).Logger().Warn(
 			"hakeeper.checker.cnservice.expired.cn",

@@ -839,9 +839,21 @@ func (s *stateMachine) handleClusterDetailsQuery(cfg Config) *pb.ClusterDetails 
 		LogStores:   make([]pb.LogStore, 0, len(s.state.LogState.Stores)),
 		ProxyStores: make([]pb.ProxyStore, 0, len(s.state.ProxyState.Stores)),
 	}
+	// Count expired CN stores up front. If a mass-failure fraction is expired
+	// at once, the HAKeeper was likely blind to heartbeats (GC pause / CPU
+	// starvation / recent leader change), so report every CN as Normal this
+	// round. This keeps the proxy/clusterservice from migrating sessions off
+	// live CNs. Deterministic: reads only replicated state.
+	cnExpired := 0
+	for _, info := range s.state.CNState.Stores {
+		if cfg.CNStoreExpired(info.Tick, s.state.Tick) {
+			cnExpired++
+		}
+	}
+	cnMassFailure := cfg.CNMassFailureSuppressed(cnExpired, len(s.state.CNState.Stores))
 	for uuid, info := range s.state.CNState.Stores {
 		state := pb.NormalState
-		if cfg.CNStoreExpired(info.Tick, s.state.Tick) {
+		if !cnMassFailure && cfg.CNStoreExpired(info.Tick, s.state.Tick) {
 			state = pb.TimeoutState
 		}
 		n := pb.CNStore{

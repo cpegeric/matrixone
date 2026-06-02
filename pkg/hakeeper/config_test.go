@@ -27,3 +27,28 @@ func TestTimeoutConfig(t *testing.T) {
 	assert.Equal(t, DefaultLogStoreTimeout, c.LogStoreTimeout)
 	assert.Equal(t, DefaultTNStoreTimeout, c.TNStoreTimeout)
 }
+
+func TestCNMassFailureSuppressed(t *testing.T) {
+	c := Config{}
+	c.Fill()
+	cases := []struct {
+		name    string
+		expired int
+		total   int
+		want    bool
+	}{
+		{"no stores", 0, 0, false},
+		{"none expired", 0, 5, false},
+		{"single expired in big cluster", 1, 5, false}, // below MinMassFailureStores
+		{"single expired single cluster", 1, 1, false}, // real outage, act on it
+		{"two of three expired", 2, 3, true},           // correlated dip -> suppress
+		{"half expired", 3, 6, true},
+		{"just under half", 2, 5, false},
+		{"all expired", 5, 5, true}, // detector was blind
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, c.CNMassFailureSuppressed(tc.expired, tc.total))
+		})
+	}
+}
