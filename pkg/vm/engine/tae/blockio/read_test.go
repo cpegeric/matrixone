@@ -217,7 +217,6 @@ func TestHandleOrderByLimitOnSelectRows(t *testing.T) {
 		Typ:        types.T_array_float32,
 		NumVec:     types.ArrayToBytes[float32]([]float32{0.0, 0.0}),
 		MetricType: metric.Metric_L2Distance,
-		DistHeap:   make(objectio.Float64Heap, 0, 2),
 	}
 
 	resSels, resDists, err := handleOrderByLimitOnSelectRows(ctx, selectRows, orderByLimit, nil, -1, cacheVectors)
@@ -228,6 +227,49 @@ func TestHandleOrderByLimitOnSelectRows(t *testing.T) {
 	// Closest should be index 1 (0.1, 0.2), then index 2 (0.5, 0.5)
 	require.Equal(t, int64(1), resSels[0])
 	require.Equal(t, int64(2), resSels[1])
+}
+
+// A LIMIT far larger than the block must not trigger a limit-proportional
+// (here: ~maxint) allocation: the bounded top-k buffers are capped at the
+// candidate row count. With limit >> rows, every row is in the top-k, returned
+// ascending by distance.
+func TestHandleOrderByLimitHugeLimitSmallBlock(t *testing.T) {
+	mp := mpool.MustNewZero()
+	defer mpool.DeleteMPool(mp)
+	ctx := context.Background()
+
+	vec0 := vector.NewVec(types.T_int32.ToType())
+	vec1 := vector.NewVec(types.T_array_float32.ToType())
+	for i := 0; i < 3; i++ {
+		vector.AppendFixed(vec0, int32(i), false, mp)
+	}
+	vector.AppendBytes(vec1, types.ArrayToBytes[float32]([]float32{1.0, 1.0}), false, mp) // dist: 2
+	vector.AppendBytes(vec1, types.ArrayToBytes[float32]([]float32{0.1, 0.2}), false, mp) // dist: 0.05
+	vector.AppendBytes(vec1, types.ArrayToBytes[float32]([]float32{0.5, 0.5}), false, mp) // dist: 0.5
+
+	cacheVectors := make(containers.Vectors, 2)
+	cacheVectors[0] = *vec0
+	cacheVectors[1] = *vec1
+
+	orderByLimit := &objectio.IndexReaderTopOp{
+		ColPos:     1,
+		Limit:      uint64(^uint(0) >> 1), // maxint
+		Typ:        types.T_array_float32,
+		NumVec:     types.ArrayToBytes[float32]([]float32{0.0, 0.0}),
+		MetricType: metric.Metric_L2Distance,
+	}
+
+	var resSels []int64
+	var resDists []float64
+	var err error
+	require.NotPanics(t, func() {
+		resSels, resDists, err = handleOrderByLimitOnSelectRows(ctx, []int64{0, 1, 2}, orderByLimit, nil, -1, cacheVectors)
+	})
+	require.NoError(t, err)
+	require.Equal(t, 3, len(resSels))
+	require.Equal(t, 3, len(resDists))
+	// ascending by distance: row1 (0.05), row2 (0.5), row0 (2)
+	require.Equal(t, []int64{1, 2, 0}, resSels)
 }
 
 // TestTopInputRowsConstruction tests the code section at lines 674-684
@@ -579,7 +621,6 @@ func TestHandleOrderByLimitOnSelectRows_Narrow(t *testing.T) {
 			Typ:        c.oid,
 			NumVec:     c.num,
 			MetricType: metric.Metric_L2Distance,
-			DistHeap:   make(objectio.Float64Heap, 0, 2),
 		}
 		resSels, resDists, err := handleOrderByLimitOnSelectRows(ctx, []int64{0, 1, 2}, orderByLimit, nil, -1, cacheVectors)
 		require.NoErrorf(t, err, c.name)

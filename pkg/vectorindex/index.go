@@ -191,6 +191,9 @@ func NewFastMaxHeap[T types.RealNumbers, K HeapKeyType](limit int, keysBuf []K, 
 	}
 }
 
+// Len returns the number of elements currently held (<= limit).
+func (h *FastMaxHeap[T, K]) Len() int { return h.size }
+
 func (h *FastMaxHeap[T, K]) siftUp(j int) {
 	for {
 		i := (j - 1) / 2 // parent

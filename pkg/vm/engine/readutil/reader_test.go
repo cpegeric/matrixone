@@ -24,7 +24,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestReaderSetIndexParamDoesNotPreallocateDistHeap(t *testing.T) {
+// SetIndexParam must accept a huge LIMIT without doing limit-proportional work.
+// (The bounded top-k allocation now happens in blockio, capped at the candidate
+// row count — see TestHandleOrderByLimitHugeLimitSmallBlock.)
+func TestReaderSetIndexParamHandlesHugeLimit(t *testing.T) {
 	r := &reader{}
 	limit := ^uint64(0)
 
@@ -66,8 +69,6 @@ func TestReaderSetIndexParamDoesNotPreallocateDistHeap(t *testing.T) {
 	})
 	require.NotNil(t, r.orderByLimit)
 	require.Equal(t, limit, r.orderByLimit.Limit)
-	require.Zero(t, len(r.orderByLimit.DistHeap))
-	require.Zero(t, cap(r.orderByLimit.DistHeap))
 }
 
 func TestReaderSetIndexParamSupportsOrderedLimit(t *testing.T) {

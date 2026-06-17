@@ -488,7 +488,6 @@ func (r *reader) SetIndexParam(param *plan.IndexReaderParam) {
 		r.orderByLimit.OrderedLimit = true
 		r.orderByLimit.Desc = param.OrderBy[0].Flag&plan.OrderBySpec_DESC != 0
 		r.orderByLimit.NumVec = nil
-		r.orderByLimit.DistHeap = nil
 		r.orderByLimit.LowerBoundType = 0
 		r.orderByLimit.UpperBoundType = 0
 		r.orderByLimit.LowerBound = 0
@@ -535,9 +534,6 @@ func (r *reader) SetIndexParam(param *plan.IndexReaderParam) {
 			r.orderByLimit.UpperBound *= r.orderByLimit.UpperBound
 		}
 	}
-
-	// Avoid eager O(limit) allocation; blockio grows the heap as rows are accepted.
-	r.orderByLimit.DistHeap = nil
 }
 
 func (r *reader) GetOrderBy() []*plan.OrderBySpec {

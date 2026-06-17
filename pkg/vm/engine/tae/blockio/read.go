@@ -15,7 +15,6 @@
 package blockio
 
 import (
-	"container/heap"
 	"context"
 	"fmt"
 	"slices"
@@ -418,8 +417,12 @@ func HandleOrderByLimitOnIVFFlatIndex(
 	selectRows = slices.DeleteFunc(selectRows, func(row int64) bool {
 		return nullsBm.Contains(uint64(row))
 	})
+	if len(selectRows) == 0 {
+		// Nothing to rank. Also keeps us from building a zero-capacity
+		// FastMaxHeap below (Push on a limit-0 heap would index an empty buffer).
+		return nil, nil, nil
+	}
 
-	searchResults := make([]vectorindex.SearchResult, 0, len(selectRows))
 	topLimit, err := vectorIndexTopLimit(ctx, orderByLimit.Limit)
 	if err != nil {
 		return nil, nil, err
@@ -450,6 +453,23 @@ func HandleOrderByLimitOnIVFFlatIndex(
 		return nil, nil, err
 	}
 
+	// Bounded top-k via FastMaxHeap: it carries the row id alongside the
+	// distance (SoA, zero per-row boxing) and natively keeps only the best
+	// topLimit, so the previous full-block searchResults slice + the separate
+	// DistHeap + the O(n) DeleteFunc prune are all gone.
+	//
+	// The heap holds at most min(topLimit, candidate count) rows, so size the
+	// backing buffers to that: Limit can be up to maxint, and sizing to topLimit
+	// directly would turn a large LIMIT over a small block into a huge (OOM)
+	// allocation — the old DistHeap grew incrementally to min(limit, rows).
+	heapCap := topLimit
+	if len(selectRows) < heapCap {
+		heapCap = len(selectRows)
+	}
+	keysBuf := make([]int64, heapCap)
+	distsBuf := make([]float64, heapCap)
+	h := vectorindex.NewFastMaxHeap[float64, int64](heapCap, keysBuf, distsBuf)
+
 	for _, row := range selectRows {
 		dist64, err := distOf(vecCol.GetBytesAt(int(row)))
 		if err != nil {
@@ -475,32 +495,18 @@ func HandleOrderByLimitOnIVFFlatIndex(
 			}
 		}
 
-		if len(orderByLimit.DistHeap) >= topLimit {
-			if dist64 < orderByLimit.DistHeap[0] {
-				orderByLimit.DistHeap[0] = dist64
-				heap.Fix(&orderByLimit.DistHeap, 0)
-			} else {
-				continue
-			}
-		} else {
-			heap.Push(&orderByLimit.DistHeap, dist64)
-		}
-
-		searchResults = append(searchResults, vectorindex.SearchResult{
-			Id:       row,
-			Distance: dist64,
-		})
+		h.Push(row, dist64)
 	}
 
-	searchResults = slices.DeleteFunc(searchResults, func(res vectorindex.SearchResult) bool {
-		return res.Distance > orderByLimit.DistHeap[0]
-	})
-
-	sels := make([]int64, len(searchResults))
-	dists := make([]float64, len(searchResults))
-	for i, res := range searchResults {
-		sels[i] = res.Id
-		dists[i] = res.Distance
+	// Drain the max-heap tail-first so the output is ascending by distance
+	// (closest first), preserving the previous result ordering.
+	n := h.Len()
+	sels := make([]int64, n)
+	dists := make([]float64, n)
+	for i := n - 1; i >= 0; i-- {
+		key, dist, _ := h.Pop()
+		sels[i] = key
+		dists[i] = dist
 	}
 
 	return sels, dists, nil
