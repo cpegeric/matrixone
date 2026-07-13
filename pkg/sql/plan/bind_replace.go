@@ -825,12 +825,13 @@ func (builder *QueryBuilder) appendDedupAndMultiUpdateNodesForBindReplace(
 			},
 		})
 		updateCtxList = append(updateCtxList, &plan.UpdateCtx{
-			ObjRef:             objRef,
-			TableDef:           tableDef,
-			InsertCols:         insertCols,
-			DeleteCols:         deleteCols,
-			SkipInsertOnNullPk: true,
-			InsertPkColIdx:     insertPkColIdx,
+			ObjRef:                objRef,
+			TableDef:              tableDef,
+			InsertCols:            insertCols,
+			DeleteCols:            deleteCols,
+			SkipInsertOnNullPk:    true,
+			InsertPkColIdx:        insertPkColIdx,
+			CountDeleteAffectRows: true,
 		})
 	}
 
