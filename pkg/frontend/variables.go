@@ -3807,6 +3807,24 @@ var gSysVarsDefs = map[string]SystemVariable{
 		Type:              InitSystemVariableBoolType("fulltext_bloom_filter_pushdown"),
 		Default:           int8(0),
 	},
+	// plan_verifier turns on pkg/planverify: structural invariant checks that run on the
+	// plan right after the rewrites build it (see that package for what and why).
+	//
+	// OFF by default and meant to stay that way in production -- a violation FAILS THE
+	// QUERY, which is the point when running a test suite and unacceptable when serving.
+	// The intended users are BVT (`set global plan_verifier = 1` for a whole run, so
+	// thousands of real plans are checked) and manual debugging of a rewrite.
+	//
+	// An int rather than a bool so verification levels can be added later (for example a
+	// value that enables only the index-scan rules) without introducing a second variable.
+	"plan_verifier": {
+		Name:              "plan_verifier",
+		Scope:             ScopeBoth,
+		Dynamic:           true,
+		SetVarHintApplies: false,
+		Type:              InitSystemVariableIntType("plan_verifier", 0, 1, false),
+		Default:           int64(0),
+	},
 	"probe_limit": {
 		Name:              "probe_limit",
 		Scope:             ScopeBoth,

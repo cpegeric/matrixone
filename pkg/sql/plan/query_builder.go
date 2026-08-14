@@ -35,6 +35,7 @@ import (
 	lockpb "github.com/matrixorigin/matrixone/pkg/pb/lock"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
+	"github.com/matrixorigin/matrixone/pkg/planverify"
 	sqliceberg "github.com/matrixorigin/matrixone/pkg/sql/iceberg"
 	sqlmongodb "github.com/matrixorigin/matrixone/pkg/sql/mongodb"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
@@ -3351,6 +3352,12 @@ func (builder *QueryBuilder) createQuery() (*Query, error) {
 			rootID, err = builder.applyIndices(rootID, colRefCnt, idxColMap)
 		}
 		builder.resetSpecialIndexGuards()
+		if err == nil {
+			// Verify here, not at the end of createQuery: binding tags still identify the
+			// rewrite that produced each column, so a violation names the culprit instead of
+			// describing a finished plan. No-op unless plan_verifier is on.
+			err = builder.verifyPlan(planverify.PreRemap)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -3405,6 +3412,12 @@ func (builder *QueryBuilder) createQuery() (*Query, error) {
 			return nil, err
 		}
 		builder.qry.Steps[i] = builder.removeUnnecessaryProjections(rootID)
+
+		// Second pass with the post-remap rule set: column references are child-relative
+		// from here on, so this catches damage done by remapping itself.
+		if err = builder.verifyPlan(planverify.PostRemap); err != nil {
+			return nil, err
+		}
 	}
 
 	// Expose the SINK column remap so irregular-index maintenance sub-plans built
