@@ -1,7 +1,8 @@
-# FP8 (E4M3) Vector Column Type for IVFFLAT — Design Spec & Implementation Plan
+# FP8 (E4M3) Vector Column Type for IVFFLAT — Design Spec, Measured and Rejected
 
-This document proposes `vecf8`, an 8-bit floating-point vector column type, and
-its use as an IVFFLAT entry format. The motivating property is not size — `vecint8`
+This document proposed `vecf8`, an 8-bit floating-point vector column type, and
+its use as an IVFFLAT entry format. It was measured and rejected; see §0 for the
+result and the recommendation that replaces it. The motivating property is not size — `vecint8`
 already occupies the one-byte-per-element class — but that FP8 narrows through a
 **cast** rather than a **trained quantizer**, which removes a large and
 historically bug-prone body of machinery.
@@ -10,9 +11,73 @@ historically bug-prone body of machinery.
 
 ## 0. Status
 
-**Proposed, gated.** Nothing is implemented. Phase 0 below is a measurement that
-decides whether the rest is worth building; it touches no MO code and can be run
-in about an hour.
+**Measured and rejected for CPU IVFFLAT.** The format and its distance kernels were
+built and benchmarked (`6aa855df28`); FP8 costs **6.6x float32** in the L2 kernel
+after exhausting every optimisation the SIMD surface allows. The proposal below is
+kept because its reasoning stands — the cast-vs-quantizer argument in §1 is sound
+and still worth acting on — but the conclusion is that **bf16 already delivers it**.
+
+### What was measured
+
+Seven L2 kernels at dim 1024, against the existing formats:
+
+| format | ns/op | vs f32 | bytes/elem |
+|---|---|---|---|
+| **bf16** | **39.9** | **0.94x — faster than f32** | 2 |
+| f32 | 42.6 | 1.00x | 4 |
+| int8 | 55.0 | 1.29x | 1 |
+| f16 | 204.8 | 4.81x | 2 |
+| **f8 AVX512 x2** | **280.5** | **6.58x** | 1 |
+| f8 LUT x4 | 303.4 | 7.12x | 1 |
+| f8 AVX512 | 345.5 | 8.11x | 1 |
+| f8 AVX2 x2 | 401.9 | 9.43x | 1 |
+| f8 AVX2 | 502.3 | 11.79x | 1 |
+| f8 LUT flat | 612.8 | 14.38x | 1 |
+| f8 scalar | 2379.0 | 55.85x | 1 |
+
+The optimisation levers compound — 512-bit lanes 1.45x, loop unrolling 1.25x,
+1.79x together over plain AVX2 — and the floor is still 6.6x.
+
+### Why the floor is structural
+
+x86 has **no FP8 conversion instruction**, the way f16 has `VCVTPH2PS`, and Go's
+`simd/archsimd` exposes **no widening load** (`As*` are bit reinterprets, not
+`VPMOVZXBD`-style conversions). So every value costs a shift, two masks, a multiply
+and an or. int8 escapes all of it because sign-extending a byte to a dword is one
+instruction — which is exactly why it runs at 55 ns and FP8 cannot.
+
+The distance kernel was 28% of query CPU in profiling. At 6.6x that becomes ~185%,
+roughly tripling query cost, and the memory saving cannot offset it: int8's 4x
+footprint reduction produced **no** speedup on this path, so it is not memory-bound.
+
+### Recommendation: bf16
+
+bf16 delivers the entire motivation of §1 — narrower entries with **no quantizer**,
+since it is already in the `CastSQL` family — while running *faster than float32*
+at half the size, with ~0.4% relative error against E4M3's ~6%. It is already
+implemented, already supported by all three index families, and needs no new type,
+no parser change, and no kernels.
+
+If the goal is "narrow IVFFLAT entries without the quantizer", the answer is
+`quantization 'bf16'`, available today.
+
+### Findings that outlive the verdict
+
+1. **Raw normalized embeddings must not be stored in E4M3 unscaled.** Components of
+   a unit-norm 768-dim vector sit near 1/sqrt(768) ~ 0.036, putting ~14% of them
+   below 2^-6 into the subnormal regime, where spacing is absolute rather than
+   relative; the smallest flush to zero. A fixed scale of 32 lifts them into the
+   normal range: worst per-component error 100% -> 5.9%, squared-L2 error against
+   exact f32 0.72%. The scale is a constant, not trained state, and cancels out of
+   the ranking since scaling both sides scales every distance by scale^2.
+2. **A branchy decode, not arithmetic, is what makes a scalar narrow kernel slow.**
+   `Float8.ToFloat32` renormalises subnormals in a loop, so it branches per element.
+   Replacing it with a 1 KiB L1-resident lookup table is 7.3x faster at identical
+   unrolling — worth remembering for any future narrow type.
+3. **Go 1.26 `simd/archsimd` has no float type below Float32.** Only
+   `Float32x{4,8,16}` and `Float64x{2,4,8}`; f16 and bf16 are handled by loading raw
+   bits as `Uint32xN` and decoding in-register. Any future sub-32-bit float format
+   inherits that constraint.
 
 ---
 
@@ -85,40 +150,18 @@ an error, matching how a narrowing cast behaves elsewhere.
 
 ---
 
-## 3. Phase 0 — GATE: does 4 significant bits hold recall?
+## 3. Phase 0 — superseded
 
-E4M3 gives ~4 significant bits, roughly 6% relative error per component. Whether
-768 such errors average out in an L2 sum or compound into rank churn in the top-20
-is empirical, and no amount of design settles it.
+This section originally gated the work on a numpy recall simulation. That was the
+wrong first question: building the distance kernels answered feasibility faster and
+answered it on throughput, before recall ever became the deciding factor.
 
-**Run this before writing any code:**
-
-1. Load `base.1M.fbin` and `queries.fbin` (wiki_all 1M, dim 768)
-2. Round base vectors through E4M3 (round-to-nearest-even on the 4-bit exponent /
-   3-bit mantissa fields) and back to float32
-3. Brute-force top-20 against `groundtruth.1M.neighbors.ibin`
-4. Report recall@20 for float32, simulated int8, and simulated E4M3
-
-**Measured baselines to compare against** (wiki_all 1M, lists=1000, probe 16,
-k=20, concurrency 8):
-
-| entry format | recall@20 |
-|---|---|
-| float32 | 0.8931 – 0.8986 |
-| int8 (trained SQ) | 0.8777 – 0.8800 |
-
-**Decision rule.** The bar is *comparable recall*, not beating int8. Removing the
-quantizer is a benefit in its own right — no trained bounds, no metadata, no
-writers to keep in agreement — so FP8 does not need to win on recall to be worth
-having; it needs to not lose meaningfully. Proceed if E4M3 lands close to the
-float32 and int8 band above; stop only if it drops out of that band.
-
-The precision comparison is genuinely two-sided, which is why it is measured
-rather than argued. At typical embedding magnitudes (~0.036) E4M3's ulp is
-≈ 0.0039 while int8 over a naive `[-1,1]` steps 0.0078 — FP8 wins. But int8 over
-*trained* bounds such as `[-0.2, 0.2]` steps 0.0016 — int8 wins. Trained
-adaptivity is exactly what the quantizer buys, and exactly what makes it
-fragile.
+Recall was never measured for E4M3, and does not need to be — a format that costs
+6.6x in the kernel cannot be justified by recall parity. The per-component error
+figures in §0 are the only accuracy numbers gathered, and they are sound (5.9%
+worst per component when scaled, 0.72% on squared L2), which suggests recall would
+likely have been acceptable. That is precisely why measuring throughput first
+mattered.
 
 ---
 
