@@ -51,7 +51,9 @@ func f8AsU32(s []types.Float8) []uint32 {
 
 // f8decX8 decodes the byte at position k of every lane.
 func f8decX8(u archsimd.Uint32x8, k uint8, mFF, m7f, m80 archsimd.Uint32x8, magic archsimd.Float32x8) archsimd.Float32x8 {
-	b := u.ShiftAllRight(uint64(8 * k)).And(mFF)
+	// No byte mask: 0x7f and 0x80 are both subsets of 0xff, so masking the byte
+	// out first is dead work -- the two field masks below already isolate it.
+	b := u.ShiftAllRight(uint64(8 * k))
 	of := b.And(m7f).ShiftAllLeft(20).AsFloat32x8().Mul(magic)
 	return of.AsUint32x8().Or(b.And(m80).ShiftAllLeft(24)).AsFloat32x8()
 }
@@ -157,7 +159,7 @@ func l2sqF8AVX2x2(a, b []types.Float8) (float64, error) {
 // AVX-512: 16 uint32 lanes per load, so 64 E4M3 values per iteration.
 
 func f8decX16(u archsimd.Uint32x16, k uint8, mFF, m7f, m80 archsimd.Uint32x16, magic archsimd.Float32x16) archsimd.Float32x16 {
-	b := u.ShiftAllRight(uint64(8 * k)).And(mFF)
+	b := u.ShiftAllRight(uint64(8 * k))
 	of := b.And(m7f).ShiftAllLeft(20).AsFloat32x16().Mul(magic)
 	return of.AsUint32x16().Or(b.And(m80).ShiftAllLeft(24)).AsFloat32x16()
 }
@@ -255,6 +257,224 @@ func l2sqF8AVX512x2(a, b []types.Float8) (float64, error) {
 	for i := j * 4; i < n; i++ {
 		d := f8fast(a[i]) - f8fast(b[i])
 		sum += d * d
+	}
+	return float64(sum), nil
+}
+
+// ---------------------------------------------------------------------------
+// The remaining metrics, all on the AVX-512 shape that won for L2. Each decodes
+// four byte positions per lane and keeps one accumulator per position, so the
+// decode cost per element is identical across metrics and the comparison against
+// the other formats is apples to apples.
+
+func innerProductF8AVX512(a, b []types.Float8) (float64, error) {
+	if len(a) != len(b) {
+		return 0, moerr.NewInternalErrorNoCtx("vector dimension not matched")
+	}
+	n := len(a)
+	au, bu := f8AsU32(a), f8AsU32(b)
+	mFF, m7f, m80, magic := f8DecodeConstsX16()
+	acc0, acc1 := archsimd.Float32x16{}, archsimd.Float32x16{}
+	acc2, acc3 := archsimd.Float32x16{}, archsimd.Float32x16{}
+	np, j := len(au), 0
+	for ; j <= np-16; j += 16 {
+		ua := archsimd.LoadUint32x16Slice(au[j : j+16])
+		ub := archsimd.LoadUint32x16Slice(bu[j : j+16])
+		acc0 = f8decX16(ua, 0, mFF, m7f, m80, magic).MulAdd(f8decX16(ub, 0, mFF, m7f, m80, magic), acc0)
+		acc1 = f8decX16(ua, 1, mFF, m7f, m80, magic).MulAdd(f8decX16(ub, 1, mFF, m7f, m80, magic), acc1)
+		acc2 = f8decX16(ua, 2, mFF, m7f, m80, magic).MulAdd(f8decX16(ub, 2, mFF, m7f, m80, magic), acc2)
+		acc3 = f8decX16(ua, 3, mFF, m7f, m80, magic).MulAdd(f8decX16(ub, 3, mFF, m7f, m80, magic), acc3)
+	}
+	sum := sumF32x16(acc0.Add(acc1).Add(acc2.Add(acc3)))
+	for i := j * 4; i < n; i++ {
+		sum += f8fast(a[i]) * f8fast(b[i])
+	}
+	return float64(sum), nil
+}
+
+func l1DistanceF8AVX512(a, b []types.Float8) (float64, error) {
+	if len(a) != len(b) {
+		return 0, moerr.NewInternalErrorNoCtx("vector dimension not matched")
+	}
+	n := len(a)
+	au, bu := f8AsU32(a), f8AsU32(b)
+	mFF, m7f, m80, magic := f8DecodeConstsX16()
+	absMask := archsimd.BroadcastUint32x16(0x7fffffff)
+	acc0, acc1 := archsimd.Float32x16{}, archsimd.Float32x16{}
+	acc2, acc3 := archsimd.Float32x16{}, archsimd.Float32x16{}
+	abs := func(v archsimd.Float32x16) archsimd.Float32x16 {
+		return v.AsUint32x16().And(absMask).AsFloat32x16()
+	}
+	np, j := len(au), 0
+	for ; j <= np-16; j += 16 {
+		ua := archsimd.LoadUint32x16Slice(au[j : j+16])
+		ub := archsimd.LoadUint32x16Slice(bu[j : j+16])
+		acc0 = acc0.Add(abs(f8decX16(ua, 0, mFF, m7f, m80, magic).Sub(f8decX16(ub, 0, mFF, m7f, m80, magic))))
+		acc1 = acc1.Add(abs(f8decX16(ua, 1, mFF, m7f, m80, magic).Sub(f8decX16(ub, 1, mFF, m7f, m80, magic))))
+		acc2 = acc2.Add(abs(f8decX16(ua, 2, mFF, m7f, m80, magic).Sub(f8decX16(ub, 2, mFF, m7f, m80, magic))))
+		acc3 = acc3.Add(abs(f8decX16(ua, 3, mFF, m7f, m80, magic).Sub(f8decX16(ub, 3, mFF, m7f, m80, magic))))
+	}
+	sum := sumF32x16(acc0.Add(acc1).Add(acc2.Add(acc3)))
+	for i := j * 4; i < n; i++ {
+		d := f8fast(a[i]) - f8fast(b[i])
+		if d < 0 {
+			d = -d
+		}
+		sum += d
+	}
+	return float64(sum), nil
+}
+
+// cosineDistanceF8AVX512 accumulates the dot product and both norms in one pass,
+// so each element is decoded once rather than three times.
+//
+// Each quantity gets one accumulator per byte position rather than a single
+// shared one. Sharing would make every accumulator a four-deep dependency chain
+// per iteration -- three chains of FMAs all waiting on themselves -- which is the
+// one thing the other metrics here avoid by construction.
+func cosineDistanceF8AVX512(a, b []types.Float8) (float64, error) {
+	if len(a) == 0 {
+		return 0, nil
+	}
+	if len(a) != len(b) {
+		return 0, moerr.NewInternalErrorNoCtx("vector dimension not matched")
+	}
+	n := len(a)
+	au, bu := f8AsU32(a), f8AsU32(b)
+	mFF, m7f, m80, magic := f8DecodeConstsX16()
+	var d0, d1, d2, d3 archsimd.Float32x16
+	var na0, na1, na2, na3 archsimd.Float32x16
+	var nb0, nb1, nb2, nb3 archsimd.Float32x16
+	np, j := len(au), 0
+	for ; j <= np-16; j += 16 {
+		ua := archsimd.LoadUint32x16Slice(au[j : j+16])
+		ub := archsimd.LoadUint32x16Slice(bu[j : j+16])
+
+		av0 := f8decX16(ua, 0, mFF, m7f, m80, magic)
+		bv0 := f8decX16(ub, 0, mFF, m7f, m80, magic)
+		av1 := f8decX16(ua, 1, mFF, m7f, m80, magic)
+		bv1 := f8decX16(ub, 1, mFF, m7f, m80, magic)
+		av2 := f8decX16(ua, 2, mFF, m7f, m80, magic)
+		bv2 := f8decX16(ub, 2, mFF, m7f, m80, magic)
+		av3 := f8decX16(ua, 3, mFF, m7f, m80, magic)
+		bv3 := f8decX16(ub, 3, mFF, m7f, m80, magic)
+
+		d0 = av0.MulAdd(bv0, d0)
+		d1 = av1.MulAdd(bv1, d1)
+		d2 = av2.MulAdd(bv2, d2)
+		d3 = av3.MulAdd(bv3, d3)
+		na0 = av0.MulAdd(av0, na0)
+		na1 = av1.MulAdd(av1, na1)
+		na2 = av2.MulAdd(av2, na2)
+		na3 = av3.MulAdd(av3, na3)
+		nb0 = bv0.MulAdd(bv0, nb0)
+		nb1 = bv1.MulAdd(bv1, nb1)
+		nb2 = bv2.MulAdd(bv2, nb2)
+		nb3 = bv3.MulAdd(bv3, nb3)
+	}
+	sdot := sumF32x16(d0.Add(d1).Add(d2.Add(d3)))
+	sna := sumF32x16(na0.Add(na1).Add(na2.Add(na3)))
+	snb := sumF32x16(nb0.Add(nb1).Add(nb2.Add(nb3)))
+	for i := j * 4; i < n; i++ {
+		av, bv := f8fast(a[i]), f8fast(b[i])
+		sdot += av * bv
+		sna += av * av
+		snb += bv * bv
+	}
+	if sna == 0 || snb == 0 {
+		return 0, moerr.NewInternalErrorNoCtx("cosine distance with zero-norm vector")
+	}
+	return 1 - float64(sdot)/(math.Sqrt(float64(sna))*math.Sqrt(float64(snb))), nil
+}
+
+// innerProductF8AVX512x2 and l1DistanceF8AVX512x2 unroll the load twice, matching
+// the arrangement that was fastest for L2: two loads per iteration feeding eight
+// independent accumulator chains, so the decode's own latency is overlapped
+// rather than exposed.
+
+func innerProductF8AVX512x2(a, b []types.Float8) (float64, error) {
+	if len(a) != len(b) {
+		return 0, moerr.NewInternalErrorNoCtx("vector dimension not matched")
+	}
+	n := len(a)
+	au, bu := f8AsU32(a), f8AsU32(b)
+	mFF, m7f, m80, magic := f8DecodeConstsX16()
+	var a0, a1, a2, a3, b0, b1, b2, b3 archsimd.Float32x16
+	np, j := len(au), 0
+	for ; j <= np-32; j += 32 {
+		ua0 := archsimd.LoadUint32x16Slice(au[j : j+16])
+		ub0 := archsimd.LoadUint32x16Slice(bu[j : j+16])
+		ua1 := archsimd.LoadUint32x16Slice(au[j+16 : j+32])
+		ub1 := archsimd.LoadUint32x16Slice(bu[j+16 : j+32])
+		a0 = f8decX16(ua0, 0, mFF, m7f, m80, magic).MulAdd(f8decX16(ub0, 0, mFF, m7f, m80, magic), a0)
+		a1 = f8decX16(ua0, 1, mFF, m7f, m80, magic).MulAdd(f8decX16(ub0, 1, mFF, m7f, m80, magic), a1)
+		a2 = f8decX16(ua0, 2, mFF, m7f, m80, magic).MulAdd(f8decX16(ub0, 2, mFF, m7f, m80, magic), a2)
+		a3 = f8decX16(ua0, 3, mFF, m7f, m80, magic).MulAdd(f8decX16(ub0, 3, mFF, m7f, m80, magic), a3)
+		b0 = f8decX16(ua1, 0, mFF, m7f, m80, magic).MulAdd(f8decX16(ub1, 0, mFF, m7f, m80, magic), b0)
+		b1 = f8decX16(ua1, 1, mFF, m7f, m80, magic).MulAdd(f8decX16(ub1, 1, mFF, m7f, m80, magic), b1)
+		b2 = f8decX16(ua1, 2, mFF, m7f, m80, magic).MulAdd(f8decX16(ub1, 2, mFF, m7f, m80, magic), b2)
+		b3 = f8decX16(ua1, 3, mFF, m7f, m80, magic).MulAdd(f8decX16(ub1, 3, mFF, m7f, m80, magic), b3)
+	}
+	for ; j <= np-16; j += 16 {
+		ua := archsimd.LoadUint32x16Slice(au[j : j+16])
+		ub := archsimd.LoadUint32x16Slice(bu[j : j+16])
+		a0 = f8decX16(ua, 0, mFF, m7f, m80, magic).MulAdd(f8decX16(ub, 0, mFF, m7f, m80, magic), a0)
+		a1 = f8decX16(ua, 1, mFF, m7f, m80, magic).MulAdd(f8decX16(ub, 1, mFF, m7f, m80, magic), a1)
+		a2 = f8decX16(ua, 2, mFF, m7f, m80, magic).MulAdd(f8decX16(ub, 2, mFF, m7f, m80, magic), a2)
+		a3 = f8decX16(ua, 3, mFF, m7f, m80, magic).MulAdd(f8decX16(ub, 3, mFF, m7f, m80, magic), a3)
+	}
+	sum := sumF32x16(a0.Add(a1).Add(a2.Add(a3)).Add(b0.Add(b1).Add(b2.Add(b3))))
+	for i := j * 4; i < n; i++ {
+		sum += f8fast(a[i]) * f8fast(b[i])
+	}
+	return float64(sum), nil
+}
+
+func l1DistanceF8AVX512x2(a, b []types.Float8) (float64, error) {
+	if len(a) != len(b) {
+		return 0, moerr.NewInternalErrorNoCtx("vector dimension not matched")
+	}
+	n := len(a)
+	au, bu := f8AsU32(a), f8AsU32(b)
+	mFF, m7f, m80, magic := f8DecodeConstsX16()
+	absMask := archsimd.BroadcastUint32x16(0x7fffffff)
+	abs := func(v archsimd.Float32x16) archsimd.Float32x16 {
+		return v.AsUint32x16().And(absMask).AsFloat32x16()
+	}
+	dec := func(u, v archsimd.Uint32x16, k uint8) archsimd.Float32x16 {
+		return abs(f8decX16(u, k, mFF, m7f, m80, magic).Sub(f8decX16(v, k, mFF, m7f, m80, magic)))
+	}
+	var a0, a1, a2, a3, b0, b1, b2, b3 archsimd.Float32x16
+	np, j := len(au), 0
+	for ; j <= np-32; j += 32 {
+		ua0 := archsimd.LoadUint32x16Slice(au[j : j+16])
+		ub0 := archsimd.LoadUint32x16Slice(bu[j : j+16])
+		ua1 := archsimd.LoadUint32x16Slice(au[j+16 : j+32])
+		ub1 := archsimd.LoadUint32x16Slice(bu[j+16 : j+32])
+		a0 = a0.Add(dec(ua0, ub0, 0))
+		a1 = a1.Add(dec(ua0, ub0, 1))
+		a2 = a2.Add(dec(ua0, ub0, 2))
+		a3 = a3.Add(dec(ua0, ub0, 3))
+		b0 = b0.Add(dec(ua1, ub1, 0))
+		b1 = b1.Add(dec(ua1, ub1, 1))
+		b2 = b2.Add(dec(ua1, ub1, 2))
+		b3 = b3.Add(dec(ua1, ub1, 3))
+	}
+	for ; j <= np-16; j += 16 {
+		ua := archsimd.LoadUint32x16Slice(au[j : j+16])
+		ub := archsimd.LoadUint32x16Slice(bu[j : j+16])
+		a0 = a0.Add(dec(ua, ub, 0))
+		a1 = a1.Add(dec(ua, ub, 1))
+		a2 = a2.Add(dec(ua, ub, 2))
+		a3 = a3.Add(dec(ua, ub, 3))
+	}
+	sum := sumF32x16(a0.Add(a1).Add(a2.Add(a3)).Add(b0.Add(b1).Add(b2.Add(b3))))
+	for i := j * 4; i < n; i++ {
+		d := f8fast(a[i]) - f8fast(b[i])
+		if d < 0 {
+			d = -d
+		}
+		sum += d
 	}
 	return float64(sum), nil
 }
