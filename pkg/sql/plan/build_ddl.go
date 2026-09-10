@@ -1511,6 +1511,9 @@ func buildCTASDefaultFromOrigin(
 	if err != nil {
 		return nil, err
 	}
+	if err = preservePersistedFormatCompatibility(ctx.GetContext(), defaultExpr); err != nil {
+		return nil, err
+	}
 	defaultExpr, err = makePlan2AssignmentCastExpr(ctx.GetContext(), defaultExpr, typ)
 	if err != nil {
 		return nil, err
@@ -2578,6 +2581,17 @@ func buildCreateTable(
 		// when create hidden talbe(like: auto_incr_table, index_table)， we set relKind to empty
 		if catalog.IsHiddenTable(createTable.TableDef.Name) {
 			kind = ""
+		}
+		// ALTER TABLE ... COPY rebuilds the table from regenerated DDL, which cannot carry
+		// relkind. The replica must keep the original's kind rather than the one derived
+		// above from its (temporary) name, or a table whose kind is the only thing hiding it
+		// -- an index metadata table, a fulltext store -- becomes visible to every
+		// relkind-keyed filter after any ALTER. The caller supplies it via
+		// StatementOption.WithKeepRelKind; "" is a legitimate value, hence the presence flag.
+		if v := ctx.GetContext().Value(defines.RelKindKey{}); v != nil {
+			if keep, ok := v.(string); ok {
+				kind = keep
+			}
 		}
 		createSQL := createTableSQLForCatalog(ctx, stmt)
 		properties := []*plan.Property{
@@ -3655,6 +3669,9 @@ func appendCheckDef(
 	binder.enableCanonicalNameConstValueCast()
 	checkExpr, err := binder.BindExpr(canonicalClause.Exprs[0].Expr, 0, true)
 	if err != nil {
+		return err
+	}
+	if err = preservePersistedFormatCompatibility(ctx.GetContext(), checkExpr); err != nil {
 		return err
 	}
 	if err = validateCheckExpr(ctx.GetContext(), tableDef, checkExpr, columnPos); err != nil {
