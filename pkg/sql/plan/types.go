@@ -1101,6 +1101,7 @@ type DefaultBinder struct {
 	baseBinder
 	typ           Type
 	cols          []string
+	colTypes      []Type
 	allowSubquery bool
 }
 
