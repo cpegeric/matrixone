@@ -18,9 +18,9 @@ import (
 	"reflect"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
@@ -28,14 +28,8 @@ import (
 // (including expressions persisted by DDL) and remote pipeline boundaries.
 // Old DECIMAL128 identities remain executable during a rolling upgrade.
 func validateOctStringProtocol(proc *process.Process, value any) error {
-	if proc != nil {
-		if rt := moruntime.ServiceRuntime(proc.GetService()); rt != nil {
-			v, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-			version, valid := v.(int64)
-			if ok && valid && version >= defines.MORPCVersion62 {
-				return nil
-			}
-		}
+	if proc != nil && versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion62) {
+		return nil
 	}
 	// Reuse the protobuf walker so nested CHECK/default/generated expressions
 	// and child pipelines cannot bypass the same admission rule.

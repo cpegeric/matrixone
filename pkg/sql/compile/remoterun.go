@@ -25,7 +25,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
@@ -81,6 +80,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec/value_scan"
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/readutil"
@@ -105,6 +105,9 @@ func encodeScope(s *Scope) ([]byte, error) {
 	if err = validateRemoteIgnoreCheckPipelineProtocol(s.Proc, p); err != nil {
 		return nil, err
 	}
+	if err = versionchecker.RunAll(s.Proc, p); err != nil {
+		return nil, err
+	}
 	return p.Marshal()
 }
 
@@ -119,29 +122,7 @@ func encodeRemoteScope(s *Scope, proc *process.Process) ([]byte, error) {
 	if err = validateRemoteExpressionPipelineProtocol(proc, p); err != nil {
 		return nil, err
 	}
-	features, err := plan.RequiredRemoteExpressionFeatures(p)
-	if err != nil {
-		return nil, err
-	}
-	if features.IntegerArithmeticDomains {
-		if err = validateIntegerDomainDestination(proc, p); err != nil {
-			return nil, err
-		}
-	}
-	if features.RowDependentConvBases {
-		if err = validateConvBasesDestination(proc, p); err != nil {
-			return nil, err
-		}
-	}
-	if features.IPFunctionSemantics {
-		if err = validateIPFunctionDestination(proc, p); err != nil {
-			return nil, err
-		}
-	}
-	if err = validateStrictWriteDestination(proc, p); err != nil {
-		return nil, err
-	}
-	if err = validateGroupConcatTimeZoneDestination(proc, p); err != nil {
+	if err = versionchecker.RunAll(proc, p); err != nil {
 		return nil, err
 	}
 	if err = validateRemotePadSpacePipelineProtocol(proc, p); err != nil {
@@ -1957,13 +1938,7 @@ func isVarianceAggregate(agg aggexec.AggFuncExecExpression) bool {
 }
 
 func procSupportsRemoteVarianceAggregates(proc *process.Process) bool {
-	value, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	version, ok := value.(int64)
-	return ok && version >= defines.MORPCVersion35
+	return versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion35)
 }
 
 func validateRemoteJoinProtocol(proc *process.Process, joinType plan.Node_JoinType) error {
@@ -2085,7 +2060,7 @@ func validateRemoteExpressionPipelineProtocol(
 	}
 	protocolVersion, hasProtocolVersion := int64(0), false
 	if proc != nil {
-		protocolVersion, hasProtocolVersion = remoteMORPCProtocolVersion(proc.GetService())
+		protocolVersion, hasProtocolVersion = versionchecker.ProtocolVersion(proc.GetService())
 	}
 	if features.NumericPrefix &&
 		(!hasProtocolVersion || protocolVersion < defines.MORPCVersion30) {
@@ -2227,13 +2202,7 @@ func validateRemotePartitionTopNWithTiesPipelineProtocol(
 }
 
 func procSupportsRemotePartitionTopNWithTies(proc *process.Process) bool {
-	version, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion69
+	return versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion69)
 }
 
 func validateRemoteRightDedupInputKeysUniquePipelineProtocol(
@@ -2459,13 +2428,8 @@ func validateRemoteBinaryStringPipelineProtocol(
 	proc *process.Process,
 	p *pipeline.Pipeline,
 ) error {
-	if proc != nil {
-		value, ok := moruntime.ServiceRuntime(proc.GetService()).
-			GetGlobalVariables(moruntime.MOProtocolVersion)
-		version, versionOK := value.(int64)
-		if ok && versionOK && version >= defines.MORPCVersion58 {
-			return nil
-		}
+	if proc != nil && versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion58) {
+		return nil
 	}
 	if p == nil || !pipelineContainsFunction(p, func(functionID, _ int32) bool {
 		return binaryStringSemanticFunction(functionID)

@@ -22,6 +22,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 )
 
 const (
@@ -162,29 +163,11 @@ func localProtocolEnablesVersionedExactKeyContract(sid string) bool {
 	// their capabilities. Deployment orchestration is responsible for raising
 	// participating services consistently after rollout, and for draining v8
 	// work before lowering the gate and reintroducing older participants.
-	rt := runtime.ServiceRuntime(sid)
-	if rt == nil {
-		return false
-	}
-	value, ok := rt.GetGlobalVariables(runtime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	version, ok := value.(int64)
-	return ok && version >= defines.MORPCVersion8
+	return versionchecker.LocalAtLeast(sid, defines.MORPCVersion8)
 }
 
 func localProtocolEnablesSortedMembershipFilter(sid string) bool {
-	rt := runtime.ServiceRuntime(sid)
-	if rt == nil {
-		return false
-	}
-	value, ok := rt.GetGlobalVariables(runtime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	version, ok := value.(int64)
-	return ok && version >= defines.MORPCVersion10
+	return versionchecker.LocalAtLeast(sid, defines.MORPCVersion10)
 }
 
 func (builder *QueryBuilder) exactRuntimeFilterPlanEncoding(

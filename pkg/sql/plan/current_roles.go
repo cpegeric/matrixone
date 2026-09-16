@@ -18,11 +18,11 @@ import (
 	"context"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	planpb "github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
@@ -39,16 +39,7 @@ func requireCurrentRolesProtocol(ctx context.Context, proc *process.Process) err
 	if proc == nil {
 		return nil
 	}
-	rt := moruntime.ServiceRuntime(proc.GetService())
-	if rt == nil {
-		return moerr.NewNotSupported(
-			ctx,
-			"mo_current_roles requires all CNs to support protocol version 41",
-		)
-	}
-	value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	if !ok || !valid || version < defines.MORPCVersion41 {
+	if !versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion41) {
 		return moerr.NewNotSupported(
 			ctx,
 			"mo_current_roles requires all CNs to support protocol version 41",

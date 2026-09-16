@@ -25,7 +25,6 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
@@ -35,6 +34,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
@@ -733,14 +733,8 @@ func buildDefaultExprWithColumns(
 // evaluate a persisted default containing row references. The deployment must
 // keep its protocol at the old value until all CNs have been upgraded.
 func requireExpressionDefaultProtocol(proc *process.Process) error {
-	if proc != nil {
-		if rt := moruntime.ServiceRuntime(proc.GetService()); rt != nil {
-			value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-			version, valid := value.(int64)
-			if ok && valid && version >= defines.MORPCVersion60 {
-				return nil
-			}
-		}
+	if proc != nil && versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion60) {
+		return nil
 	}
 	return moerr.NewNotSupported(context.Background(),
 		"column-reference defaults require all CNs to support protocol version 60")

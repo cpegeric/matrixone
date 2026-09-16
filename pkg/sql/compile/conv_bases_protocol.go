@@ -15,13 +15,9 @@
 package compile
 
 import (
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/defines"
-	"github.com/matrixorigin/matrixone/pkg/pb/pipeline"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine"
-	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
 func (c *Compile) constrainConvBasesWorkers(qry *plan.Query) error {
@@ -42,17 +38,4 @@ func (c *Compile) constrainConvBasesWorkers(qry *plan.Query) error {
 	c.execType = plan2.ExecTypeAP_ONECN
 	c.cnList, err = c.scheduleQueryWorkers()
 	return err
-}
-func validateConvBasesDestination(proc *process.Process, p *pipeline.Pipeline) error {
-	if p == nil || p.Node == nil {
-		return moerr.NewNotSupportedNoCtx("row-dependent CONV bases requires a versioned remote destination")
-	}
-	supported, err := remoteWorkersSupportProtocol(proc, engine.Nodes{{Id: p.Node.Id, Addr: p.Node.Addr}}, defines.MORPCVersion70)
-	if err != nil {
-		return err
-	}
-	if !supported {
-		return moerr.NewNotSupportedNoCtx("remote destination does not support row-dependent CONV bases (MORPC version 70)")
-	}
-	return nil
 }

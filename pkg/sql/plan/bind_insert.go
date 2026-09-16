@@ -21,9 +21,10 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
+
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	indexplugin "github.com/matrixorigin/matrixone/pkg/indexplugin"
@@ -33,7 +34,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	"github.com/matrixorigin/matrixone/pkg/sql/util"
-	"go.uber.org/zap"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 )
 
 func (builder *QueryBuilder) bindInsert(stmt *tree.Insert, bindCtx *BindContext) (int32, error) {
@@ -4776,13 +4777,7 @@ func (builder *QueryBuilder) localProtocolEnablesRightDedupInputKeysUnique() boo
 	if proc == nil {
 		return false
 	}
-	rt := moruntime.ServiceRuntime(proc.GetService())
-	if rt == nil {
-		return false
-	}
-	value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return ok && valid && version >= defines.MORPCVersion21
+	return versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion21)
 }
 
 // insertSourceColumn identifies an output column that is still a direct

@@ -15,9 +15,9 @@
 package plan
 
 import (
-	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 )
 
 func (builder *QueryBuilder) generateScalarPredicateRuntimeFilters(nodeID int32) {
@@ -41,9 +41,7 @@ func (builder *QueryBuilder) generateScalarPredicateRuntimeFilter(filter *plan.N
 	if proc == nil {
 		return
 	}
-	version, _ := runtime.ServiceRuntime(proc.GetService()).GetGlobalVariables(runtime.MOProtocolVersion)
-	protocolVersion, ok := version.(int64)
-	if !ok || protocolVersion < defines.MORPCVersion43 {
+	if !versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion43) {
 		return
 	}
 	if filter == nil || filter.IsEnd || filter.FilterIsBarrier ||

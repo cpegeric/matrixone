@@ -20,9 +20,9 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/config"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
@@ -30,6 +30,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
 	"github.com/matrixorigin/matrixone/pkg/sql/util"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
@@ -250,16 +251,7 @@ func requireCheckConstraintProtocol(ctx context.Context, proc *process.Process) 
 	if proc == nil {
 		return nil
 	}
-	rt := moruntime.ServiceRuntime(proc.GetService())
-	if rt == nil {
-		return moerr.NewNotSupported(
-			ctx,
-			"CHECK constraints require all CNs to support protocol version 7",
-		)
-	}
-	value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	if !ok || !valid || version < defines.MORPCVersion7 {
+	if !versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion7) {
 		return moerr.NewNotSupported(
 			ctx,
 			"CHECK constraints require all CNs to support protocol version 7",
@@ -277,16 +269,7 @@ func requireInformationSchemaCheckConstraintsProtocol(ctx context.Context, proc 
 	if proc == nil {
 		return nil
 	}
-	rt := moruntime.ServiceRuntime(proc.GetService())
-	if rt == nil {
-		return moerr.NewNotSupported(
-			ctx,
-			"information_schema CHECK_CONSTRAINTS requires all CNs to support protocol version 16",
-		)
-	}
-	value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	if !ok || !valid || version < defines.MORPCVersion16 {
+	if !versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion16) {
 		return moerr.NewNotSupported(
 			ctx,
 			"information_schema CHECK_CONSTRAINTS requires all CNs to support protocol version 16",
@@ -302,10 +285,7 @@ func requirePrefixIndexV2Protocol(ctx context.Context, proc *process.Process, co
 	if !strings.ContainsAny(columnName, ":,") || proc == nil {
 		return nil
 	}
-	value, ok := moruntime.ServiceRuntime(proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	if !ok || !valid || version < defines.MORPCVersion13 {
+	if !versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion13) {
 		return moerr.NewNotSupported(
 			ctx,
 			"prefix indexes on column names containing ':' or ',' require all CNs to support protocol version 13",
@@ -1343,13 +1323,7 @@ func assignmentCastProtocolSupported(proc *process.Process) bool {
 	if proc == nil {
 		return true
 	}
-	rt := moruntime.ServiceRuntime(proc.GetService())
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	protocolVersion, valid := version.(int64)
-	return ok && valid && protocolVersion >= defines.MORPCVersion5
+	return versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion5)
 }
 
 // needsSameTypeAssignmentCast reports whether values with the same planner

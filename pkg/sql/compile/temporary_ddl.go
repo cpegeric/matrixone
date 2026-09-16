@@ -20,20 +20,12 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	planutil "github.com/matrixorigin/matrixone/pkg/sql/plan"
 	"github.com/matrixorigin/matrixone/pkg/util/executor"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
 func supportsSessionTemporaryDDL(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	v, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	version, ok := v.(int64)
-	return ok && version >= defines.MORPCVersion55
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion55)
 }
 
 // sessionTemporaryDDLOwner admits only top-level client schema operations to

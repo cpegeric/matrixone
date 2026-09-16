@@ -23,11 +23,11 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/objectkey"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	planpb "github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
@@ -747,16 +747,7 @@ func requireSubscriptionMetadataProtocol(ctx context.Context, proc *process.Proc
 	if proc == nil {
 		return nil
 	}
-	rt := moruntime.ServiceRuntime(proc.GetService())
-	if rt == nil {
-		return moerr.NewNotSupported(
-			ctx,
-			"subscription information-schema metadata requires all CNs to support protocol version 46",
-		)
-	}
-	value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	if !ok || !valid || version < defines.MORPCVersion46 {
+	if !versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion46) {
 		return moerr.NewNotSupported(
 			ctx,
 			"subscription information-schema metadata requires all CNs to support protocol version 46",

@@ -69,6 +69,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/util/fault"
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
 	"github.com/matrixorigin/matrixone/pkg/vectorindex/idxcron"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 	"go.uber.org/zap"
@@ -5500,10 +5501,7 @@ func (c *Compile) requireCheckRenameProtocol(checks []*plan.CheckDef) error {
 	if len(checks) == 0 {
 		return nil
 	}
-	value, ok := moruntime.ServiceRuntime(c.proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	if !ok || !valid || version < defines.MORPCVersion15 {
+	if !versionchecker.LocalAtLeast(c.proc.GetService(), defines.MORPCVersion15) {
 		return moerr.NewNotSupported(
 			c.proc.Ctx,
 			"renaming a column in a table with CHECK constraints requires all services to support protocol version 15",
@@ -6842,12 +6840,8 @@ func validateStableInitialSnapshotCompileProtocol(
 ) error {
 	protocolVersion := int64(defines.MORPCVersion4)
 	if c != nil && c.proc != nil {
-		if rt := moruntime.ServiceRuntime(c.proc.GetService()); rt != nil {
-			if value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion); ok {
-				if version, valid := value.(int64); valid {
-					protocolVersion = version
-				}
-			}
+		if v, ok := versionchecker.ProtocolVersion(c.proc.GetService()); ok {
+			protocolVersion = v
 		}
 	}
 	return cdc.ValidateStableInitialSnapshotProtocol(ctx, stable, protocolVersion)

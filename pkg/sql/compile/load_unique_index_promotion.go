@@ -28,7 +28,6 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	indexplugin "github.com/matrixorigin/matrixone/pkg/indexplugin"
@@ -43,6 +42,7 @@ import (
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 )
 
@@ -188,13 +188,7 @@ func loadUniqueIndexPromotionTxnEligible(txnOp client.TxnOperator) bool {
 }
 
 func supportsLoadLogtailReadBarrier(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	return ok && valid && version >= defines.MORPCVersion39
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion39)
 }
 
 // loadLogtailReadBarrier unwraps EntireEngine before capability admission.

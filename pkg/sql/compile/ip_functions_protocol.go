@@ -15,13 +15,9 @@
 package compile
 
 import (
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/defines"
-	"github.com/matrixorigin/matrixone/pkg/pb/pipeline"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine"
-	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
 // constrainIPFunctionWorkers keeps changed IP expressions on one CN while a
@@ -45,26 +41,4 @@ func (c *Compile) constrainIPFunctionWorkers(qry *plan.Query) error {
 	c.execType = plan2.ExecTypeAP_ONECN
 	c.cnList, err = c.scheduleQueryWorkers()
 	return err
-}
-
-// validateIPFunctionDestination rechecks the actual serialized destination at
-// send time. A worker can be downgraded or replaced after compile-time
-// placement, so a coordinator-only version check is insufficient.
-func validateIPFunctionDestination(proc *process.Process, p *pipeline.Pipeline) error {
-	if p == nil || p.Node == nil {
-		return moerr.NewNotSupportedNoCtx(
-			"corrected IP function semantics require a versioned remote destination",
-		)
-	}
-	supported, err := remoteWorkersSupportProtocol(proc,
-		engine.Nodes{{Id: p.Node.Id, Addr: p.Node.Addr}}, defines.MORPCVersion72)
-	if err != nil {
-		return err
-	}
-	if !supported {
-		return moerr.NewNotSupportedNoCtx(
-			"remote destination does not support corrected IP function semantics (MORPC version 72)",
-		)
-	}
-	return nil
 }

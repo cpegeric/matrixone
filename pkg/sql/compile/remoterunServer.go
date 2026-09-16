@@ -29,7 +29,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/common/system"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
@@ -52,6 +51,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/util/debug/goroutine"
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/util/resource"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
@@ -1181,12 +1181,7 @@ func (receiver *messageReceiverOnServer) sendBatch(
 	if receiver.cnInformation.lockService != nil {
 		service = receiver.cnInformation.lockService.GetConfig().ServiceID
 	}
-	version := int64(0)
-	if runtime := moruntime.ServiceRuntime(service); runtime != nil {
-		if value, ok := runtime.GetGlobalVariables(moruntime.MOProtocolVersion); ok {
-			version, _ = value.(int64)
-		}
-	}
+	version, _ := versionchecker.ProtocolVersion(service)
 	if b.HasBinaryStringMetadata() && version < defines.MORPCVersion18 {
 		return moerr.NewInvalidStateNoCtx(
 			"binary-string provenance requires MORPCVersion18 for remote results")

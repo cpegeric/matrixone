@@ -21,13 +21,13 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/common/sqlquote"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 )
 
 // RenameColumn Can change a column name but not its definition.
@@ -257,10 +257,7 @@ func requireCheckRenameProtocol(ctx CompilerContext, checks []*plan.CheckDef) er
 	if len(checks) == 0 || ctx.GetProcess() == nil {
 		return nil
 	}
-	value, ok := moruntime.ServiceRuntime(ctx.GetProcess().GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	if !ok || !valid || version < defines.MORPCVersion15 {
+	if !versionchecker.LocalAtLeast(ctx.GetProcess().GetService(), defines.MORPCVersion15) {
 		return moerr.NewNotSupported(
 			ctx.GetContext(),
 			"renaming a column in a table with CHECK constraints requires all services to support protocol version 15",

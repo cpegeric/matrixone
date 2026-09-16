@@ -18,9 +18,9 @@ import (
 	"context"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	planpb "github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
@@ -44,14 +44,8 @@ func RequirePersistedIPFunctionProtocol(ctx context.Context, proc *process.Proce
 	if !features.IPFunctionSemantics {
 		return nil
 	}
-	if proc != nil {
-		if rt := moruntime.ServiceRuntime(proc.GetService()); rt != nil {
-			value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-			version, valid := value.(int64)
-			if ok && valid && version >= defines.MORPCVersion72 {
-				return nil
-			}
-		}
+	if proc != nil && versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion72) {
+		return nil
 	}
 	if ctx == nil {
 		ctx = context.Background()

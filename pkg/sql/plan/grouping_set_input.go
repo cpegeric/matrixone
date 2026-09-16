@@ -21,11 +21,11 @@ import (
 	"strings"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
-	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	planpb "github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/internal/materialized"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 )
 
 const (
@@ -81,9 +81,7 @@ func (builder *QueryBuilder) sharePendingGroupingSetInputs(rootID int32) int32 {
 	if proc == nil {
 		return rootID
 	}
-	version, _ := runtime.ServiceRuntime(proc.GetService()).GetGlobalVariables(runtime.MOProtocolVersion)
-	protocolVersion, ok := version.(int64)
-	if !ok || protocolVersion < defines.MORPCVersion49 {
+	if !versionchecker.LocalAtLeast(proc.GetService(), defines.MORPCVersion49) {
 		return rootID
 	}
 	parents := builder.groupingSetConsumerParents()

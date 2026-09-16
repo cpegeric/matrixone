@@ -101,6 +101,7 @@ import (
 	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
 	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace/statistic"
+	"github.com/matrixorigin/matrixone/pkg/versionchecker"
 	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
@@ -433,13 +434,7 @@ func (c *Compile) bindStringShuffleHashAlgorithmForCompile() {
 }
 
 func supportsStableStringShuffleHash(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	protocolVersion, valid := version.(int64)
-	return ok && valid && protocolVersion >= defines.MORPCVersion33
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion33)
 }
 
 func UpdateScopeTxnOffset(scope *Scope, txnOffset int) {
@@ -5759,13 +5754,7 @@ func isCheckConstraintFunction(functionID, _ int32) bool {
 }
 
 func supportsRemoteIgnoreCheck(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, versionOK := value.(int64)
-	return ok && versionOK && version >= defines.MORPCVersion63
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion63)
 }
 
 func (c *Compile) scopesRunOnCoordinator(ss []*Scope) bool {
@@ -7860,93 +7849,39 @@ func supportsRemoteOrderedAggregates(service string) bool {
 	// MOProtocolVersion is the service-local deployment rollout gate.
 	// Deployment orchestration raises it after participating receivers
 	// understand Aggregate.config_type and lowers it before rollback.
-	version, ok := moruntime.ServiceRuntime(service).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion6
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion6)
 }
 
 func supportsRemoteOrderedSetAggregates(service string) bool {
-	version, ok := moruntime.ServiceRuntime(service).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion17
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion17)
 }
 
 func (c *Compile) supportsRemoteVarianceAggregates() bool {
-	version, ok := moruntime.ServiceRuntime(c.proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion35
+	return versionchecker.LocalAtLeast(c.proc.GetService(), defines.MORPCVersion35)
 }
 
 func (c *Compile) supportsRemoteWidenedDecimalSum() bool {
-	version, ok := moruntime.ServiceRuntime(c.proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion73
+	return versionchecker.LocalAtLeast(c.proc.GetService(), defines.MORPCVersion73)
 }
 
 func (c *Compile) supportsRemotePartitionTopN() bool {
-	version, ok := moruntime.ServiceRuntime(c.proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion19
+	return versionchecker.LocalAtLeast(c.proc.GetService(), defines.MORPCVersion19)
 }
 
 func (c *Compile) supportsRemotePartitionTopNWithTies() bool {
-	version, ok := moruntime.ServiceRuntime(c.proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion69
+	return versionchecker.LocalAtLeast(c.proc.GetService(), defines.MORPCVersion69)
 }
 
 func (c *Compile) supportsRemoteHashPartition() bool {
-	version, ok := moruntime.ServiceRuntime(c.proc.GetService()).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion47
+	return versionchecker.LocalAtLeast(c.proc.GetService(), defines.MORPCVersion47)
 }
 
 func supportsRemoteTextCollationAggregates(service string) bool {
-	version, ok := moruntime.ServiceRuntime(service).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion14
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion14)
 }
 
 func supportsRemoteAsofJoin(service string) bool {
-	version, ok := moruntime.ServiceRuntime(service).
-		GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion27
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion27)
 }
 
 // supportsRemoteMongoUserQuery guards the MongoScan payload that carries
@@ -7954,16 +7889,7 @@ func supportsRemoteAsofJoin(service string) bool {
 // execute the legacy unfiltered Find path, so explicit queries must wait until
 // deployment has raised the cluster's oldest-live protocol version.
 func supportsRemoteMongoUserQuery(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion44
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion44)
 }
 
 // mongoScanUsesV44Payload reports whether a scan uses any field introduced by
@@ -7974,198 +7900,59 @@ func mongoScanUsesV44Payload(scan *plan.MongoScan) bool {
 }
 
 func supportsRemoteTargetAwareUpdate(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion20
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion20)
 }
 
 func supportsRemoteRightDedupInputKeysUnique(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion21
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion21)
 }
 
 func supportsRemoteAffectedRowsSelectors(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion24
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion24)
 }
 
 func supportsRemoteODKUAffectedRows(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion50
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion50)
 }
 
 func supportsRemoteODKUActionRows(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion51
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion51)
 }
 
 func supportsRemoteCrossDomainStringLiterals(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion23
-}
-
-func remoteMORPCProtocolVersion(service string) (int64, bool) {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return 0, false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return 0, false
-	}
-	protocolVersion, ok := version.(int64)
-	return protocolVersion, ok
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion23)
 }
 
 func supportsRemoteStatementLastInsertID(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion26
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion26)
 }
 
 func supportsRemoteAutoIncrementSessionOptions(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion56
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion56)
 }
 
 func supportsRemoteUpdateChangedRows(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion25
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion25)
 }
 
 func supportsRemotePadSpaceSemantics(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion40
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion40)
 }
 
 func supportsRemoteParquetWholeFileFanout(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion45
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion45)
 }
 
 func supportsRemoteGroupingSetExpansion(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion49
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion49)
 }
 
 func supportsDistributedOrderedTop(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion53
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion53)
 }
 
 func supportsRemoteArrowLoadPipeline(service string) bool {
-	rt := moruntime.ServiceRuntime(service)
-	if rt == nil {
-		return false
-	}
-	version, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	if !ok {
-		return false
-	}
-	protocolVersion, ok := version.(int64)
-	return ok && protocolVersion >= defines.MORPCVersion57
+	return versionchecker.LocalAtLeast(service, defines.MORPCVersion57)
 }
 
 func (c *Compile) canCompileShuffleGroup(node *plan.Node) bool {
