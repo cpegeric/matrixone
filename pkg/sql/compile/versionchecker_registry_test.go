@@ -24,13 +24,13 @@ import (
 
 // TestDestinationChecksRegisteredAndWellFormed is the drift guard: every remote destination check
 // this package's init()s register must be well-formed, so a new version-gated wire feature cannot
-// land a malformed (or silently ineffective) fence. A plain gate needs a detector, a positive
-// MinVer no greater than the latest protocol version, and a message; a Custom check owns its own
-// logic. The compile package registers integer-domain, conv-bases, ip, strict-write, and
-// group-concat, so the registry is at least those five.
+// land a malformed (or silently ineffective) fence. A plain gate needs a detector, a positive MinVer
+// no greater than the latest protocol version, and a message; a Custom check owns its own logic. The
+// compile package registers conv-bases, integer-domain, ip, string-numeric, strict-write, and
+// group-concat, so the registry is at least those six.
 func TestDestinationChecksRegisteredAndWellFormed(t *testing.T) {
 	checks := versionchecker.Registered()
-	require.GreaterOrEqual(t, len(checks), 5, "the migrated destination checks must be registered")
+	require.GreaterOrEqual(t, len(checks), 6, "the migrated destination checks must be registered")
 	for i, c := range checks {
 		if c.Custom != nil {
 			require.Nil(t, c.Needs, "check %d: Custom and Needs are mutually exclusive", i)

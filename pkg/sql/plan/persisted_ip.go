@@ -18,6 +18,7 @@ import (
 	"context"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	planpb "github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
@@ -188,16 +189,18 @@ func RequirePersistedProtocolVersionForService(
 		requiredVersion)
 }
 
-// persistedProtocolRuntimeAllows keeps the fast DDL/metadata admission check
-// independent from row execution. A missing floor key is retained only for
-// standalone/unit-test runtimes created before the admission protocol.
-func persistedProtocolRuntimeAllows(rt moruntime.Runtime, requiredVersion int64) bool {
+// persistedProtocolRuntimeAllowsWithFloor keeps the fast DDL/metadata admission check independent
+// from row execution: the local rollout version must reach requiredVersion AND, when the named
+// admission floor key is installed, that floor must too. A missing floor key is retained only for
+// standalone/unit-test runtimes created before the admission protocol (production CN initialization
+// always installs it). The read/authoring variants differ solely in which floor key they consult.
+func persistedProtocolRuntimeAllowsWithFloor(rt moruntime.Runtime, requiredVersion int64, floorKey string) bool {
 	value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
 	version, valid := value.(int64)
 	if !ok || !valid || version < requiredVersion {
 		return false
 	}
-	floorValue, floorPresent := rt.GetGlobalVariables(moruntime.PersistedExpressionProtocolFloor)
+	floorValue, floorPresent := rt.GetGlobalVariables(floorKey)
 	if !floorPresent {
 		return true
 	}
@@ -205,18 +208,10 @@ func persistedProtocolRuntimeAllows(rt moruntime.Runtime, requiredVersion int64)
 	return valid && floor >= requiredVersion
 }
 
+func persistedProtocolRuntimeAllows(rt moruntime.Runtime, requiredVersion int64) bool {
+	return persistedProtocolRuntimeAllowsWithFloor(rt, requiredVersion, moruntime.PersistedExpressionProtocolFloor)
+}
+
 func persistedProtocolAuthoringRuntimeAllows(rt moruntime.Runtime, requiredVersion int64) bool {
-	value, ok := rt.GetGlobalVariables(moruntime.MOProtocolVersion)
-	version, valid := value.(int64)
-	if !ok || !valid || version < requiredVersion {
-		return false
-	}
-	floorValue, floorPresent := rt.GetGlobalVariables(moruntime.PersistedExpressionProtocolAuthoringFloor)
-	if !floorPresent {
-		// Production CN initialization always installs this key; the fallback
-		// preserves historical standalone/unit-test runtime setup.
-		return true
-	}
-	floor, valid := floorValue.(int64)
-	return valid && floor >= requiredVersion
+	return persistedProtocolRuntimeAllowsWithFloor(rt, requiredVersion, moruntime.PersistedExpressionProtocolAuthoringFloor)
 }

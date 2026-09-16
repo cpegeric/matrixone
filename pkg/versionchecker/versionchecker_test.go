@@ -173,6 +173,40 @@ func TestRequireSupportedDestination(t *testing.T) {
 	require.NoError(t, Require(proc, p, true, 55, "test feature"))
 }
 
+// MaxRequiredVersion returns the highest MinVer among firing plain gates (+ its Name), ignores
+// Custom gates and gates whose detector does not fire, and returns 0,"" when none fire. It reads the
+// same registry RunAll enforces, and the owner it passes detectors is opaque (a *plan.Query in
+// production, here a marker type).
+func TestMaxRequiredVersion(t *testing.T) {
+	before := len(Registered())
+	type marker struct{ needConv, needStr bool }
+	fires := func(pick func(marker) bool) func(*process.Process, any) bool {
+		return func(_ *process.Process, owner any) bool { m, _ := owner.(marker); return pick(m) }
+	}
+	customCalled := false
+	Register(Check{MinVer: 70, Needs: fires(func(m marker) bool { return m.needConv }), Name: "conv"})
+	Register(Check{MinVer: 80, Needs: fires(func(m marker) bool { return m.needStr }), Name: "str"})
+	Register(Check{Custom: func(*process.Process, *pipeline.Pipeline) error { customCalled = true; return nil }})
+
+	// None fire -> 0, "".
+	v, name := MaxRequiredVersion(nil, marker{})
+	require.Zero(t, v)
+	require.Empty(t, name)
+	require.False(t, customCalled, "MaxRequiredVersion must not invoke Custom gates")
+
+	// Only the lower gate fires.
+	v, name = MaxRequiredVersion(nil, marker{needConv: true})
+	require.Equal(t, int64(70), v)
+	require.Equal(t, "conv", name)
+
+	// Both fire -> the highest floor and its name govern.
+	v, name = MaxRequiredVersion(nil, marker{needConv: true, needStr: true})
+	require.Equal(t, int64(80), v)
+	require.Equal(t, "str", name)
+
+	registry = registry[:before]
+}
+
 func TestRegisterAndRunAll(t *testing.T) {
 	before := len(Registered())
 
@@ -180,7 +214,7 @@ func TestRegisterAndRunAll(t *testing.T) {
 	skipped := true
 	Register(Check{ // data gate that is not needed -> RunAll skips it
 		MinVer: 999,
-		Needs:  func(*process.Process, *pipeline.Pipeline) bool { skipped = false; return false },
+		Needs:  func(*process.Process, any) bool { skipped = false; return false },
 		Name:   "unused feature",
 	})
 	Register(Check{ // custom check that fails
@@ -193,4 +227,6 @@ func TestRegisterAndRunAll(t *testing.T) {
 	err := RunAll(nil, nil)
 	require.ErrorIs(t, err, sentinel)
 	require.False(t, skipped, "the data check's detector must have been evaluated")
+
+	registry = registry[:before]
 }

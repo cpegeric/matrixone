@@ -140,14 +140,16 @@ type Check struct {
 	// version number appears for a plain gate -- the error message is derived from it (see Require),
 	// so a renumber on a merge collision changes just this one field.
 	MinVer int64
-	// Needs reports whether the pipeline about to be serialized actually uses the feature.
-	Needs func(proc *process.Process, p *pipeline.Pipeline) bool
+	// Needs reports whether owner uses the feature. owner is the *pipeline.Pipeline about to be
+	// serialized at the send boundary, or a *plan.Query at compile-time placement -- it is typed any
+	// so one declarative entry drives both stages via RequiredRemoteExpressionFeatures(owner).
+	Needs func(proc *process.Process, owner any) bool
 	// Name is the feature phrase used to build the NotSupported message ("remote destination does
 	// not support <Name> (MORPC version <MinVer>)"). It carries no version number.
 	Name string
-	// Custom, when set, replaces the default Needs/MinVer/Name fail-closed gate for a feature whose
-	// contract is not a plain "supported-or-error" (e.g. one that also degrades). RunAll invokes it
-	// directly and ignores MinVer/Needs/Name.
+	// Custom, when set, replaces the default gate for a feature whose contract is not a plain
+	// "supported-or-error" (e.g. one that also degrades). RunAll invokes it directly and ignores
+	// MinVer/Needs/Name; MaxRequiredVersion skips it.
 	Custom func(proc *process.Process, p *pipeline.Pipeline) error
 }
 
@@ -194,4 +196,23 @@ func RunAll(proc *process.Process, p *pipeline.Pipeline) error {
 		}
 	}
 	return nil
+}
+
+// MaxRequiredVersion returns the highest MinVer among registered plain gates whose detector fires
+// for owner (a *pipeline.Pipeline or a *plan.Query), plus that gate's Name; 0, "" when none fire.
+// It reads the SAME declarative registry the send boundary enforces, so the compile-time placement
+// path can decide whether a plan may stay multi-CN without re-listing any feature's version -- a
+// version-gated feature is declared once and governs both stages. The highest floor governs because
+// placement is all-or-nothing: a destination that supports it supports every lower floor too.
+func MaxRequiredVersion(proc *process.Process, owner any) (int64, string) {
+	maxVer, name := int64(0), ""
+	for _, c := range registry {
+		if c.Custom != nil || c.Needs == nil {
+			continue
+		}
+		if c.MinVer > maxVer && c.Needs(proc, owner) {
+			maxVer, name = c.MinVer, c.Name
+		}
+	}
+	return maxVer, name
 }
