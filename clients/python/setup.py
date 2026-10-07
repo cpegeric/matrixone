@@ -105,6 +105,9 @@ setup(
             "pyarrow>=10.0.0",  # For Parquet file generation in tests/examples
             "Faker>=10.0.0",
         ],
+        "torch": [
+            "torch>=2.9",  # For matrixone.vecblock tensor functions
+        ],
     },
     keywords="matrixone, database, sql, python, sdk, sqlalchemy, async, fulltext, search, vector, similarity, ai, ml, embedding, hnsw, ivf, diagnostic, cli, monitoring",
     include_package_data=True,

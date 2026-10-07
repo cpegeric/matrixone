@@ -122,6 +122,12 @@ class User(Base):
 pip install matrixone-python-sdk
 ```
 
+With PyTorch, for the vecf8 / vecf4 tensor functions in `matrixone.vecblock`:
+
+```bash
+pip install 'matrixone-python-sdk[torch]'
+```
+
 ### From test.pypi (Latest Pre-release)
 
 ```bash
