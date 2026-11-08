@@ -77,10 +77,14 @@ type CacheConfig struct {
 	DiskPrefetchRangeAuto bool `toml:"disk-prefetch-range-auto"`
 	// DiskPrefetchRangeNarrowOnly limits prefetch ranges to the narrow reads of tables
 	// that read ranges instead of whole objects.
-	DiskPrefetchRangeNarrowOnly bool         `toml:"disk-prefetch-range-narrow-only"`
-	RemoteCacheEnabled          bool         `toml:"remote-cache-enabled"`
-	RPC                         morpc.Config `toml:"rpc"`
-	CheckOverlaps               bool         `toml:"check-overlaps"`
+	DiskPrefetchRangeNarrowOnly bool `toml:"disk-prefetch-range-narrow-only"`
+	// DiskPageSize caches objects in aligned pages of this size: a range read fetches
+	// the pages it misses, at least a prefetch range of them, and caches each page in a
+	// file of its own, in place of whole objects. 0 keeps whole objects. Default 0.
+	DiskPageSize       *toml.ByteSize `toml:"disk-page-size"`
+	RemoteCacheEnabled bool           `toml:"remote-cache-enabled"`
+	RPC                morpc.Config   `toml:"rpc"`
+	CheckOverlaps      bool           `toml:"check-overlaps"`
 
 	// IndexFileDiskCapacity is the capacity of the index-file cache, separate from
 	// DiskCapacity; DisableCacheCapacity or less disables it. Default
@@ -282,6 +286,9 @@ func (c *CacheConfig) diskPrefetchRange() prefetchRangeConfig {
 	}
 	ret.auto = c.DiskPrefetchRangeAuto
 	ret.narrowOnly = c.DiskPrefetchRangeNarrowOnly
+	if c.DiskPageSize != nil && *c.DiskPageSize > 0 {
+		ret.page = int64(*c.DiskPageSize)
+	}
 	return ret
 }
 

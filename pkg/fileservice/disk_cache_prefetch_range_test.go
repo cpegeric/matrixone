@@ -294,6 +294,91 @@ func TestPrefetchFastestFlight(t *testing.T) {
 	require.Empty(t, d.prefetchFlights.m)
 }
 
+func newPageFS(t *testing.T, page, unit int64, size int) (*S3FS, *countingStorage, []byte) {
+	ctx := context.Background()
+	fs, err := NewS3FS(ctx, ObjectStorageArguments{Name: "s3", Endpoint: "disk", Bucket: t.TempDir()}, CacheConfig{
+		DiskPath: ptrTo(t.TempDir()), DiskCapacity: ptrTo[toml.ByteSize](64 << 20),
+		MemoryCapacity:       ptrTo[toml.ByteSize](0),
+		DiskPrefetchRangeMin: ptrTo(toml.ByteSize(unit)),
+		DiskPageSize:         ptrTo(toml.ByteSize(page)),
+	}, nil, false, false)
+	require.NoError(t, err)
+	fs.SetAsyncUpdate(false)
+	t.Cleanup(func() { fs.Close(ctx) })
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte(i*7 + i/1021)
+	}
+	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(data)), Data: data}}, Policy: SkipDiskCache | SkipMemoryCache}))
+	storage := &countingStorage{ObjectStorage: fs.storage}
+	fs.storage = storage
+	return fs, storage, data
+}
+
+func readPages(t *testing.T, fs *S3FS, offset, size int64) IOEntry {
+	vec := &IOVector{FilePath: "object", Policy: SkipMemoryCache, Entries: []IOEntry{{Offset: offset, Size: size}}}
+	require.NoError(t, fs.Read(context.Background(), vec))
+	fs.diskCache.prefetchFlights.reads.Wait()
+	return vec.Entries[0]
+}
+
+func cachedPages(fs *S3FS) map[int64]int64 {
+	fs.diskCache.ranges.mu.Lock()
+	defer fs.diskCache.ranges.mu.Unlock()
+	pages := map[int64]int64{}
+	for _, rs := range fs.diskCache.ranges.byObject {
+		for _, r := range rs {
+			pages[r.offset] = r.size
+		}
+	}
+	return pages
+}
+
+// A read fetches the prefetch range around it in one request, without the whole object,
+// and caches it as pages; a later read across pages is served by the disk cache.
+func TestS3FSPagesCacheAPrefetchRange(t *testing.T) {
+	fs, storage, data := newPageFS(t, 4096, 16384, 64<<10)
+	require.Equal(t, data[5000:5002], readPages(t, fs, 5000, 2).Data)
+	require.Equal(t, int64(1), storage.reads.Load())
+	require.Equal(t, int64(16384), storage.bytes.Load())
+	require.Equal(t, map[int64]int64{0: 4096, 4096: 4096, 8192: 4096, 12288: 4096}, cachedPages(fs))
+
+	e := readPages(t, fs, 4000, 9000)
+	require.Equal(t, data[4000:13000], e.Data)
+	require.Same(t, fs.diskCache, e.fromCache)
+	require.Equal(t, int64(1), storage.reads.Load())
+}
+
+// A read fetches only the pages of its prefetch range that are not cached.
+func TestS3FSPagesFetchOnlyMissingPages(t *testing.T) {
+	fs, storage, data := newPageFS(t, 4096, 16384, 64<<10)
+	readPages(t, fs, 5000, 2)
+	fs.diskCache.cache.Delete(context.Background(), fs.diskCache.pathForIOEntry("object", IOEntry{Offset: 8192, Size: 4096}))
+	require.Equal(t, data[100:16000], readPages(t, fs, 100, 15900).Data)
+	require.Equal(t, int64(2), storage.reads.Load())
+	require.Equal(t, int64(16384+4096), storage.bytes.Load())
+}
+
+// The page at the end of the object holds the bytes up to the end and serves later reads.
+func TestS3FSPagesAtObjectEnd(t *testing.T) {
+	fs, storage, data := newPageFS(t, 4096, 4096, 10000)
+	require.Equal(t, data[9990:10000], readPages(t, fs, 9990, 10).Data)
+	require.Equal(t, map[int64]int64{8192: 1808}, cachedPages(fs))
+	require.Equal(t, data[8200:9000], readPages(t, fs, 8200, 800).Data)
+	require.Equal(t, int64(1), storage.reads.Load())
+}
+
+func TestPageEntries(t *testing.T) {
+	content := make([]byte, 10)
+	require.Len(t, pageEntries(5, content, 0), 1)
+	es := pageEntries(8, content, 4)
+	require.Len(t, es, 3)
+	require.Equal(t, []int64{8, 12, 16}, []int64{es[0].Offset, es[1].Offset, es[2].Offset})
+	require.Equal(t, []int64{4, 4, 2}, []int64{es[0].Size, es[1].Size, es[2].Size})
+	require.Equal(t, int64(8192), prefetchRangeConfig{min: 5000, page: 4096}.unit())
+	require.Equal(t, int64(4096), prefetchRangeConfig{page: 4096}.unit())
+}
+
 // A read of entries far apart fetches the units they are in, not the bytes between them.
 func TestS3FSPrefetchRangeSkipsGapsBetweenEntries(t *testing.T) {
 	fs, storage, data := newPrefetchRangeFS(t, 4096, false, 64<<10)

@@ -38,6 +38,8 @@ type prefetchRangeConfig struct {
 	auto bool
 	// narrowOnly limits prefetch ranges to narrow reads of groups that read ranges.
 	narrowOnly bool
+	// page is the size of the aligned pages objects are cached in, 0 for none.
+	page int64
 }
 
 // unit returns the size of prefetch ranges, 0 when they are off.
@@ -45,6 +47,9 @@ func (c prefetchRangeConfig) unit() int64 {
 	unit := c.min
 	if c.auto {
 		unit = max(unit, autoPrefetchUnit(rangeReadCosts.bandwidthDelay()))
+	}
+	if c.page > 0 {
+		unit = (max(unit, c.page) + c.page - 1) / c.page * c.page
 	}
 	return unit
 }
@@ -66,7 +71,7 @@ func (d *DiskCache) prefetchUnit(vector *IOVector) (int64, bool) {
 	if unit <= 0 || vector.Policy.Any(SkipDiskCacheWrites) || !vector.Policy.CacheIOEntry() {
 		return 0, false
 	}
-	if d.prefetchRange.narrowOnly && !(vector.Policy.Any(NarrowRead) && vector.Policy.Any(SkipFullFilePreloads)) {
+	if d.prefetchRange.page == 0 && d.prefetchRange.narrowOnly && !(vector.Policy.Any(NarrowRead) && vector.Policy.Any(SkipFullFilePreloads)) {
 		return 0, false
 	}
 	for i := range vector.Entries {
@@ -121,8 +126,11 @@ func (d *DiskCache) prefetchRead(
 	if min < 0 || max <= min {
 		return nil, false
 	}
+	page := d.prefetchRange.page
 	block := int64(prefetchBlockMax)
-	if unit < block || unit%block != 0 {
+	if page > 0 {
+		block = page
+	} else if unit < block || unit%block != 0 {
 		block = unit
 	}
 	windowStart := min / unit * unit
@@ -157,8 +165,15 @@ func (d *DiskCache) prefetchRead(
 			b.needed = true
 			b.start, b.end = maxInt64(b.start, min), minInt64(b.end, max)
 		}
-		if r, ok := d.ranges.containing(key, b.start, b.end-b.start, nil); ok && d.cache.Contains(r.diskPath) {
-			b.state, b.cached = blockCached, r
+		if page > 0 {
+			if p := d.pathForIOEntry(filePath, IOEntry{Offset: start, Size: page}); d.cache.Contains(p) {
+				b.state, b.cached = blockCached, cachedRange{diskPath: p, offset: start, size: page}
+			}
+		}
+		if b.state != blockCached {
+			if r, ok := d.ranges.containing(key, b.start, b.end-b.start, nil); ok && d.cache.Contains(r.diskPath) {
+				b.state, b.cached = blockCached, r
+			}
 		}
 		blocks = append(blocks, b)
 	}
@@ -225,7 +240,7 @@ func (d *DiskCache) prefetchRead(
 				_ = d.Update(context.WithoutCancel(ctx), &IOVector{
 					FilePath: filePath,
 					Policy:   policy,
-					Entries:  []IOEntry{{Offset: fl.start, Size: int64(len(content)), Data: content}},
+					Entries:  pageEntries(fl.start, content, page),
 				}, false)
 			}
 			d.endPrefetch(diskPath, fl, content, err)
@@ -269,6 +284,28 @@ func (d *DiskCache) prefetchRead(
 		}
 	}
 	return out, true
+}
+
+// pageEntries returns content read at offset as entries of page bytes each, or as one
+// entry when page is 0.
+func pageEntries(offset int64, content []byte, page int64) []IOEntry {
+	if page <= 0 {
+		return []IOEntry{{Offset: offset, Size: int64(len(content)), Data: content}}
+	}
+	entries := make([]IOEntry, 0, (int64(len(content))+page-1)/page)
+	for i := int64(0); i < int64(len(content)); i += page {
+		data := content[i:minInt64(i+page, int64(len(content)))]
+		entries = append(entries, IOEntry{Offset: offset + i, Size: int64(len(data)), Data: data})
+	}
+	return entries
+}
+
+// pageSize returns the size of the pages objects are cached in, 0 when they are not.
+func (d *DiskCache) pageSize() int64 {
+	if d == nil {
+		return 0
+	}
+	return d.prefetchRange.page
 }
 
 // readCachedRange reads len(dst) bytes at offset of the object from the cached range r.
