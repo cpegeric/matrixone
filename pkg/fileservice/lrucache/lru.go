@@ -30,6 +30,8 @@ import (
 const (
 	numShards  = 16
 	evictBatch = 64
+	// numClasses is the number of classes SetClasses divides the items into.
+	numClasses = 2
 )
 
 // Cache evicts the least recently used items once the total size exceeds the capacity.
@@ -37,6 +39,8 @@ const (
 // ordered by the stamp of its items' last use, and eviction takes the evictable item with
 // the oldest stamp across the shards when it removes it. An item that becomes evictable, or
 // is set oldest, while an eviction scans the shards can be passed over by that eviction.
+// With classes, each class is ordered apart, and eviction takes, of the oldest evictable
+// item of each class, the one whose age over its class's value is the largest.
 type Cache[K comparable, V any] struct {
 	capacity fscache.CapacityFunc
 	seed     maphash.Seed
@@ -49,6 +53,10 @@ type Cache[K comparable, V any] struct {
 	oldest   atomic.Int64  // last stamp given by SetOldest
 	evictor  sync.Mutex
 
+	classOf   func(key K) int
+	value     func(class int, size int64) float64
+	classUsed [numClasses]atomic.Int64
+
 	postSet      func(ctx context.Context, key K, value V, size int64, seq uint64)
 	postGet      func(ctx context.Context, key K, value V, size int64)
 	prepareEvict func(key K, value V, size int64, seq uint64) func()
@@ -58,18 +66,23 @@ type Cache[K comparable, V any] struct {
 
 type shard[K comparable, V any] struct {
 	mu    sync.Mutex
-	order list.List // of *item[K, V], highest stamp first
+	order [numClasses]list.List // of *item[K, V] of each class, highest stamp first
 	items map[K]*list.Element
-	tail  atomic.Int64 // stamp of the last item, or math.MaxInt64 when empty
-	_     [128]byte
+	tail  [numClasses]atomic.Int64 // stamp of the last item of each class, or math.MaxInt64 when none
+	// tailSize is the size of the last item of each class.
+	tailSize [numClasses]atomic.Int64
+	_        [128]byte
 }
 
-// updateTail publishes the stamp of the last item. The caller holds s.mu.
-func (s *shard[K, V]) updateTail() {
-	if e := s.order.Back(); e != nil {
-		s.tail.Store(e.Value.(*item[K, V]).stamp)
+// updateTail publishes the stamp and size of the last item of class. The caller holds
+// s.mu.
+func (s *shard[K, V]) updateTail(class int) {
+	if e := s.order[class].Back(); e != nil {
+		it := e.Value.(*item[K, V])
+		s.tailSize[class].Store(it.size)
+		s.tail[class].Store(it.stamp)
 	} else {
-		s.tail.Store(math.MaxInt64)
+		s.tail[class].Store(math.MaxInt64)
 	}
 }
 
@@ -79,6 +92,7 @@ type item[K comparable, V any] struct {
 	size  int64
 	seq   uint64
 	stamp int64
+	class int
 	// pending is set until postSet of the item returns; eviction passes over it. It is
 	// guarded by the item's shard lock.
 	pending bool
@@ -108,9 +122,24 @@ func NewWithPrepareEvict[K comparable, V any](
 	}
 	for i := range c.shards {
 		c.shards[i].items = make(map[K]*list.Element)
-		c.shards[i].tail.Store(math.MaxInt64)
+		for class := range numClasses {
+			c.shards[i].tail[class].Store(math.MaxInt64)
+		}
 	}
 	return c
+}
+
+// SetClasses divides the items into classOf's classes, below numClasses. value returns the
+// value per byte of an item of class of size bytes; eviction takes, of the oldest evictable
+// item of each class, the one whose age over its value is the largest. value runs under
+// the eviction lock and must not call the cache. Call it before the cache is used.
+func (c *Cache[K, V]) SetClasses(classOf func(key K) int, value func(class int, size int64) float64) {
+	c.classOf, c.value = classOf, value
+}
+
+// ClassUsed returns the bytes used by the items of class.
+func (c *Cache[K, V]) ClassUsed(class int) int64 {
+	return c.classUsed[class].Load()
 }
 
 // SetEvictable makes eviction pass over the items for which evictable returns false,
@@ -141,34 +170,40 @@ func (c *Cache[K, V]) set(ctx context.Context, key K, value V, size int64, oldes
 	// An item larger than the capacity is evicted before any other.
 	oversized := size > c.capacity()
 	oldest = oldest || oversized
+	class := 0
+	if c.classOf != nil {
+		class = c.classOf(key)
+	}
 	s := c.shardOf(key)
 	s.mu.Lock()
 	if s.items[key] != nil {
 		s.mu.Unlock()
 		return false
 	}
-	it := &item[K, V]{key: key, value: value, size: size, seq: c.nextSeq.Add(1), pending: true, oversized: oversized}
+	it := &item[K, V]{key: key, value: value, size: size, seq: c.nextSeq.Add(1), class: class, pending: true, oversized: oversized}
+	order := &s.order[class]
 	if oversized {
 		it.stamp = c.oldest.Add(-1) + math.MinInt64/2
-		s.items[key] = s.order.PushBack(it)
+		s.items[key] = order.PushBack(it)
 	} else if oldest {
 		it.stamp = c.oldest.Add(-1)
-		e := s.order.Back()
+		e := order.Back()
 		for e != nil && e.Value.(*item[K, V]).oversized {
 			e = e.Prev()
 		}
 		if e == nil {
-			s.items[key] = s.order.PushFront(it)
+			s.items[key] = order.PushFront(it)
 		} else {
-			s.items[key] = s.order.InsertAfter(it, e)
+			s.items[key] = order.InsertAfter(it, e)
 		}
 	} else {
 		it.stamp = c.newest.Add(1)
-		s.items[key] = s.order.PushFront(it)
+		s.items[key] = order.PushFront(it)
 	}
-	s.updateTail()
+	s.updateTail(class)
 	c.pending.Add(size)
 	c.used.Add(size)
+	c.classUsed[class].Add(size)
 	c.added.Add(1)
 	seq := it.seq
 	s.mu.Unlock()
@@ -199,10 +234,11 @@ func (c *Cache[K, V]) Get(ctx context.Context, key K) (value V, ok bool) {
 	it := e.Value.(*item[K, V])
 	if !it.oversized {
 		it.stamp = c.newest.Add(1)
-		wasTail := e == s.order.Back()
-		s.order.MoveToFront(e)
+		order := &s.order[it.class]
+		wasTail := e == order.Back()
+		order.MoveToFront(e)
 		if wasTail {
-			s.updateTail()
+			s.updateTail(it.class)
 		}
 	}
 	value, size := it.value, it.size
@@ -249,6 +285,10 @@ func (c *Cache[K, V]) Replace(ctx context.Context, key K, value V, size int64) b
 	old := *it
 	it.value, it.size, it.seq = value, size, c.nextSeq.Add(1)
 	c.used.Add(size - old.size)
+	c.classUsed[it.class].Add(size - old.size)
+	if e == s.order[it.class].Back() {
+		s.updateTail(it.class)
+	}
 	if size > old.size {
 		c.added.Add(1)
 	}
@@ -362,18 +402,26 @@ func (c *Cache[K, V]) removeTo(target int64) []item[K, V] {
 // since its stamp was read is read again. The caller holds c.evictor.
 func (c *Cache[K, V]) removeOldest(target int64) (item[K, V], bool) {
 	for {
-		var oldest *shard[K, V]
-		stamp := int64(math.MaxInt64)
-		for i := range c.shards {
-			if t := c.shards[i].tail.Load(); t < stamp {
-				oldest, stamp = &c.shards[i], t
+		var shards [numClasses]*shard[K, V]
+		var stamps, sizes [numClasses]int64
+		for class := range numClasses {
+			stamps[class] = math.MaxInt64
+			for i := range c.shards {
+				if t := c.shards[i].tail[class].Load(); t < stamps[class] {
+					shards[class], stamps[class] = &c.shards[i], t
+				}
+			}
+			if shards[class] != nil {
+				sizes[class] = shards[class].tailSize[class].Load()
 			}
 		}
-		if oldest == nil {
+		class := c.evictClass(shards[:], stamps[:], sizes[:])
+		if class < 0 {
 			return item[K, V]{}, false
 		}
+		oldest, stamp := shards[class], stamps[class]
 		oldest.mu.Lock()
-		e := oldest.order.Back()
+		e := oldest.order[class].Back()
 		if e == nil || e.Value.(*item[K, V]).stamp != stamp {
 			oldest.mu.Unlock()
 			continue
@@ -396,23 +444,27 @@ func (c *Cache[K, V]) removeOldest(target int64) (item[K, V], bool) {
 // when the oldest evictable item of the shard it picked changed meanwhile.
 func (c *Cache[K, V]) scanOldest(target int64) (item[K, V], bool) {
 	for {
-		var oldest *shard[K, V]
-		var stamp int64
+		var shards [numClasses]*shard[K, V]
+		var stamps, sizes [numClasses]int64
 		for i := range c.shards {
 			s := &c.shards[i]
 			s.mu.Lock()
-			if e := c.oldestLocked(s); e != nil {
-				if st := e.Value.(*item[K, V]).stamp; oldest == nil || st < stamp {
-					oldest, stamp = s, st
+			for class := range numClasses {
+				if e := c.oldestLocked(s, class); e != nil {
+					if it := e.Value.(*item[K, V]); shards[class] == nil || it.stamp < stamps[class] {
+						shards[class], stamps[class], sizes[class] = s, it.stamp, it.size
+					}
 				}
 			}
 			s.mu.Unlock()
 		}
-		if oldest == nil {
+		class := c.evictClass(shards[:], stamps[:], sizes[:])
+		if class < 0 {
 			return item[K, V]{}, false
 		}
+		oldest, stamp := shards[class], stamps[class]
 		oldest.mu.Lock()
-		if e := c.oldestLocked(oldest); e != nil && e.Value.(*item[K, V]).stamp == stamp {
+		if e := c.oldestLocked(oldest, class); e != nil && e.Value.(*item[K, V]).stamp == stamp {
 			if c.settled() <= target {
 				oldest.mu.Unlock()
 				return item[K, V]{}, false
@@ -425,10 +477,38 @@ func (c *Cache[K, V]) scanOldest(target int64) (item[K, V], bool) {
 	}
 }
 
-// oldestLocked returns the evictable element of s with the oldest stamp, or nil. The
-// caller holds s.mu.
-func (c *Cache[K, V]) oldestLocked(s *shard[K, V]) *list.Element {
-	for e := s.order.Back(); e != nil; e = e.Prev() {
+// evictClass returns the class whose oldest item, of stamp stamps[class] and size
+// sizes[class] in shards[class], eviction takes: the one whose age over its value is the
+// largest, or -1 when no class has an item. The caller holds c.evictor.
+func (c *Cache[K, V]) evictClass(shards []*shard[K, V], stamps, sizes []int64) int {
+	best, bestScore := -1, 0.0
+	newest := c.newest.Load()
+	for class := range numClasses {
+		if shards[class] == nil {
+			continue
+		}
+		if best < 0 {
+			best = class
+		}
+		if c.value == nil {
+			continue
+		}
+		v := c.value(class, sizes[class])
+		if v <= 0 {
+			v = 1
+		}
+		score := (float64(newest) - float64(stamps[class])) / v
+		if class == best || score > bestScore {
+			best, bestScore = class, score
+		}
+	}
+	return best
+}
+
+// oldestLocked returns the evictable element of class in s with the oldest stamp, or nil.
+// The caller holds s.mu.
+func (c *Cache[K, V]) oldestLocked(s *shard[K, V], class int) *list.Element {
+	for e := s.order[class].Back(); e != nil; e = e.Prev() {
 		if c.canEvict(e) {
 			return e
 		}
@@ -446,9 +526,10 @@ func (c *Cache[K, V]) canEvict(e *list.Element) bool {
 func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *list.Element) item[K, V] {
 	it := *e.Value.(*item[K, V])
 	c.used.Add(-it.size)
-	s.order.Remove(e)
+	c.classUsed[it.class].Add(-it.size)
+	s.order[it.class].Remove(e)
 	delete(s.items, it.key)
-	s.updateTail()
+	s.updateTail(it.class)
 	return it
 }
 

@@ -109,13 +109,15 @@ func (d *DiskCache) rangeObjectKey(filePath string) string {
 }
 
 // parseRangeFile returns the object key, offset and size of the range file at diskPath
-// under the cache directory root. The size digits run into the object name, so the size
-// is the prefix of them that equals the file's length. Only files in the shard
-// directory of their object are range files of objects whose paths have no separator,
-// the only ones indexed.
+// under the cache directory root, in either layer. The size digits run into the object
+// name, so the size is the prefix of them that equals the file's length. Only files in
+// the shard directory of their object are range files of objects whose paths have no
+// separator, the only ones indexed. A file of the meta layer has the key of its object.
 func parseRangeFile(root, diskPath string, length int64) (key string, offset, size int64, ok bool) {
 	dir, name := filepath.Split(diskPath)
-	if !strings.HasSuffix(name, cacheFileSuffix) || filepath.Dir(filepath.Clean(dir)) != filepath.Clean(root) {
+	root = filepath.Clean(root)
+	if parent := filepath.Dir(filepath.Clean(dir)); !strings.HasSuffix(name, cacheFileSuffix) ||
+		parent != root && parent != filepath.Join(root, metaCacheDir) {
 		return "", 0, 0, false
 	}
 	dash := strings.IndexByte(name, '-')
@@ -134,7 +136,7 @@ func parseRangeFile(root, diskPath string, length int64) (key string, offset, si
 		}
 		object := strings.TrimSuffix(digits[i:], cacheFileSuffix)
 		if size == length && object != "" && diskCacheShard(fromOSPath(object)) == filepath.Base(dir) {
-			return filepath.Join(dir, digits[i:]), offset, size, true
+			return filepath.Join(root, filepath.Base(dir), digits[i:]), offset, size, true
 		}
 	}
 	return "", 0, 0, false

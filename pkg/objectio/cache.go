@@ -288,6 +288,7 @@ func LoadObjectMetaByExtent(
 	v, ok := getMeta(key)
 	if ok {
 		metric.FSReadHitMetaCounter.Add(1)
+		touchMeta(key, fs, name, extent)
 		return checkedObjectMeta(v)
 	}
 	if extent.Length() == 0 {
@@ -296,7 +297,7 @@ func LoadObjectMetaByExtent(
 			zap.String("extent", extent.String()))
 	}
 	v, err = dedupLoad(ctx, key, func() ([]byte, error) {
-		return ReadExtent(ctx, name.UnsafeString(), extent, policy, fs, constructorFactory)
+		return ReadExtent(ctx, name.UnsafeString(), extent, policy|fileservice.ObjectMetaRead, fs, constructorFactory)
 	})
 	if err != nil {
 		return
@@ -334,6 +335,7 @@ func FastLoadBF(
 	v, ok := getMeta(key)
 	if ok {
 		metric.FSReadHitMetaCounter.Add(1)
+		touchBF(key, fs, location, nil)
 		return v, nil
 	}
 	meta, err := FastLoadObjectMeta(ctx, &location, isPrefetch, fs)
@@ -357,6 +359,7 @@ func LoadBFWithMeta(
 	v, ok := getMeta(key)
 	if ok {
 		metric.FSReadHitMetaCounter.Add(1)
+		touchBF(key, fs, location, meta)
 		return v, nil
 	}
 	extent := meta.BlockHeader().BFExtent()

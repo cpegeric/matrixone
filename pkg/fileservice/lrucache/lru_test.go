@@ -21,6 +21,7 @@ import (
 	"math/rand"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -73,8 +74,10 @@ func keys(c *Cache[string, int]) []string {
 	for i := range c.shards {
 		s := &c.shards[i]
 		s.mu.Lock()
-		for e := s.order.Front(); e != nil; e = e.Next() {
-			items = append(items, e.Value.(*item[string, int]))
+		for class := range numClasses {
+			for e := s.order[class].Front(); e != nil; e = e.Next() {
+				items = append(items, e.Value.(*item[string, int]))
+			}
 		}
 		s.mu.Unlock()
 	}
@@ -368,8 +371,10 @@ func TestConcurrentAccounting(t *testing.T) {
 	present := keys(c)
 	var used int64
 	for i := range c.shards {
-		for e := c.shards[i].order.Front(); e != nil; e = e.Next() {
-			used += e.Value.(*item[string, int]).size
+		for class := range numClasses {
+			for e := c.shards[i].order[class].Front(); e != nil; e = e.Next() {
+				used += e.Value.(*item[string, int]).size
+			}
 		}
 	}
 	require.Equal(t, used, c.Used())
@@ -600,4 +605,101 @@ func TestEvictionDoesNotCountPendingInsertion(t *testing.T) {
 	wg.Wait()
 	require.True(t, c.Contains("a"))
 	require.True(t, c.Contains("b"))
+}
+
+// newClassed returns a cache whose keys starting with "m" are of class 1, worth 100 times
+// a byte of class 0.
+func newClassed(capacity int64) *Cache[string, int] {
+	c := NewWithPrepareEvict[string, int](fscache.ConstCapacity(capacity), nil, nil, nil, nil)
+	c.SetClasses(func(key string) int {
+		if strings.HasPrefix(key, "m") {
+			return 1
+		}
+		return 0
+	}, func(class int, _ int64) float64 {
+		if class == 1 {
+			return 100
+		}
+		return 1
+	})
+	return c
+}
+
+// An item of a class of more value stays while items of less value are evicted, until its
+// age over its value passes theirs.
+func TestCacheClassesEvictByAgeOverValue(t *testing.T) {
+	ctx := context.Background()
+	c := newClassed(10)
+	c.Set(ctx, "m", 0, 1)
+	for i := range 100 {
+		c.Set(ctx, fmt.Sprintf("d%d", i), i, 1)
+	}
+	require.True(t, c.Contains("m"), "the item of more value stays")
+	require.Equal(t, int64(1), c.ClassUsed(1))
+	require.Equal(t, int64(9), c.ClassUsed(0))
+	for i := 100; i < 2000; i++ {
+		c.Set(ctx, fmt.Sprintf("d%d", i), i, 1)
+	}
+	require.False(t, c.Contains("m"), "an idle item of more value ages out")
+	require.Equal(t, int64(0), c.ClassUsed(1))
+	require.Equal(t, int64(10), c.Used())
+}
+
+// Items of one class are evicted least recently used first, and take the whole capacity
+// when the other class has none.
+func TestCacheClassesShareCapacity(t *testing.T) {
+	ctx := context.Background()
+	c := newClassed(4)
+	for i := range 6 {
+		c.Set(ctx, fmt.Sprintf("m%d", i), i, 1)
+	}
+	require.Equal(t, []string{"m5", "m4", "m3", "m2"}, keys(c))
+	require.Equal(t, int64(4), c.ClassUsed(1))
+	c.Get(ctx, "m2")
+	c.Set(ctx, "d0", 0, 1)
+	require.Equal(t, []string{"d0", "m2", "m5", "m4"}, keys(c))
+}
+
+// Concurrent sets, gets and deletes of items of two classes keep each class's bytes and
+// the total within the capacity.
+func TestConcurrentClassAccounting(t *testing.T) {
+	ctx := context.Background()
+	c := newClassed(5000)
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			r := rand.New(rand.NewSource(int64(g)))
+			for i := 0; i < 20000; i++ {
+				k := strconv.Itoa(r.Intn(500))
+				if r.Intn(3) == 0 {
+					k = "m" + k
+				}
+				switch r.Intn(4) {
+				case 0:
+					c.Get(ctx, k)
+				case 1:
+					c.Delete(ctx, k)
+				default:
+					c.Set(ctx, k, 0, int64(1+r.Intn(100)))
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	var used [numClasses]int64
+	for i := range c.shards {
+		for class := range numClasses {
+			for e := c.shards[i].order[class].Front(); e != nil; e = e.Next() {
+				it := e.Value.(*item[string, int])
+				require.Equal(t, class, it.class)
+				used[class] += it.size
+			}
+		}
+	}
+	require.Equal(t, used[0], c.ClassUsed(0))
+	require.Equal(t, used[1], c.ClassUsed(1))
+	require.Equal(t, used[0]+used[1], c.Used())
+	require.LessOrEqual(t, c.Used(), int64(5000))
 }

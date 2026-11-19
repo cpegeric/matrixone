@@ -45,6 +45,9 @@ const (
 	// their Data slices, and backing owners valid and unchanged until Write
 	// returns. ReaderForWrite remains a one-shot stream.
 	ReplayDataForDiskCache
+	// ObjectMetaRead marks a read of an object's meta or bloom filter. The disk cache
+	// keeps the entries it writes in its meta layer.
+	ObjectMetaRead
 )
 
 const (

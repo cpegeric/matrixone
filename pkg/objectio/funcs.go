@@ -88,7 +88,7 @@ func ReadBloomFilter(
 		ctx,
 		name,
 		extent,
-		policy,
+		policy|fileservice.ObjectMetaRead,
 		fs,
 		constructorFactory); err != nil {
 		return
@@ -112,7 +112,7 @@ func ReadObjectMeta(
 	fs fileservice.FileService,
 ) (meta ObjectMeta, err error) {
 	var v []byte
-	if v, err = ReadExtent(ctx, name, extent, policy, fs, constructorFactory); err != nil {
+	if v, err = ReadExtent(ctx, name, extent, policy|fileservice.ObjectMetaRead, fs, constructorFactory); err != nil {
 		return
 	}
 	meta = MustObjectMeta(v)

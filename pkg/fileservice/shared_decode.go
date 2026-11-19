@@ -470,7 +470,7 @@ func sharedDecodeDiskFillAvailable(d *DiskCache, path string, vector *IOVector) 
 	if d.cache.Contains(d.pathForFile(path)) {
 		return true
 	}
-	return len(vector.Entries) == 1 && d.cache.Contains(d.pathForIOEntry(path, vector.Entries[0]))
+	return len(vector.Entries) == 1 && d.cache.Contains(d.pathForEntry(vector.Policy, path, vector.Entries[0]))
 }
 
 // sharedDecodeIndexFillAvailable reports whether the index-file cache holds the object of

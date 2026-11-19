@@ -287,6 +287,12 @@ func newDiskCache(
 		capacityBytes.Set(float64(capacityFunc()))
 	}
 	ret.cache = lrucache.NewWithPrepareEvict(capacityFunc, postSet, nil, prepareEvict, postEvict)
+	ret.cache.SetClasses(func(path string) int {
+		if ret.isMetaPath(path) {
+			return metaClass
+		}
+		return 0
+	}, missCostPerByte)
 	if opts.dirEntries {
 		ret.cache.SetEvictable(func(path string) bool { return !ret.dirHeld(path) })
 	}
@@ -642,7 +648,7 @@ func (d *DiskCache) Read(
 		var openedOK bool
 
 		// entry file
-		diskPath := d.pathForIOEntry(path.File, *entry)
+		diskPath := d.pathForEntry(vector.Policy, path.File, *entry)
 		if f, newlyOpened, ok := openPath(diskPath); ok {
 			if newlyOpened {
 				numOpenIOEntry++
@@ -844,7 +850,7 @@ func (d *DiskCache) Update(
 			continue
 		}
 
-		diskPath := d.pathForIOEntry(path.File, entry)
+		diskPath := d.pathForEntry(vector.Policy, path.File, entry)
 		if async && len(onWritten) == 0 {
 			d.writeEntryAsync(ctx, vector.FilePath, diskPath, entry)
 			continue
@@ -1279,7 +1285,12 @@ func (d *DiskCache) Flush(ctx context.Context) {
 const (
 	cacheFileSuffix     = ".mofscache"
 	cacheFileTempSuffix = cacheFileSuffix + ".tmp"
+	// metaCacheDir is the directory, under the disk cache's path, of its meta layer.
+	metaCacheDir = "meta"
 )
+
+// metaClass is the class of the meta layer's files in the disk cache's index.
+const metaClass = 1
 
 // Cache files are spread over diskCacheShardCount sub-directories so that no
 // single directory accumulates every cached object: filesystems cap the
@@ -1322,6 +1333,27 @@ func isDiskCacheShard(name string) bool {
 		}
 	}
 	return true
+}
+
+// pathForEntry returns the disk path of entry of path for a read under policy: in the meta
+// layer for an ObjectMetaRead read.
+func (d *DiskCache) pathForEntry(policy Policy, path string, entry IOEntry) string {
+	if policy.Any(ObjectMetaRead) {
+		return d.metaPathForIOEntry(path, entry)
+	}
+	return d.pathForIOEntry(path, entry)
+}
+
+// metaPathForIOEntry is pathForIOEntry in the meta layer.
+func (d *DiskCache) metaPathForIOEntry(path string, entry IOEntry) string {
+	dataPath := d.pathForIOEntry(path, entry)
+	rel, _ := filepath.Rel(d.path, dataPath)
+	return filepath.Join(d.path, metaCacheDir, rel)
+}
+
+// isMetaPath reports whether diskPath is in the meta layer.
+func (d *DiskCache) isMetaPath(diskPath string) bool {
+	return strings.HasPrefix(diskPath, filepath.Join(d.path, metaCacheDir)+string(filepath.Separator))
 }
 
 func (d *DiskCache) pathForIOEntry(path string, entry IOEntry) string {
