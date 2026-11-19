@@ -96,10 +96,14 @@ func TestDiskCacheMetaReadOfWholeObject(t *testing.T) {
 	require.Zero(t, cache.cache.ClassUsed(metaClass))
 }
 
-// Data files are evicted before a meta file read more recently than its value makes up
-// for, and an idle meta file ages out.
+// Data files are evicted before a meta file idle less than R times as long as the oldest
+// data file, and an idle meta file ages out.
 func TestDiskCacheMetaLayerEviction(t *testing.T) {
 	ctx := context.Background()
+	// latency × bandwidth of 100 KiB: a meta file of a block stays 26 times longer idle.
+	costs := rangeReadCosts.get()
+	rangeReadCosts.set(0.001, 100<<20)
+	t.Cleanup(func() { rangeReadCosts.set(costs.latency, costs.bytesPerS) })
 	cache, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1<<20), nil, false, nil, "")
 	require.NoError(t, err)
 	defer cache.Close(ctx)

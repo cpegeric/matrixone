@@ -25,11 +25,11 @@ queries before had evicted them.
 - A read finds an entry whichever layer holds it. A delete of an object removes its files
   in both layers. A restart keeps each file in its layer.
 - The two layers share the disk cache's capacity. When room is needed, of the least
-  recently used file of each layer, the one evicted is the one whose idle time over its
-  layer's value is the larger. A layer's value is the time a read from object storage of
-  a file of the layer's average size takes, the measured latency plus that size over the
-  measured bandwidth, per byte. Of files of one layer the least recently used goes first,
-  as before.
+  recently used file of each layer, the meta file is evicted only when its idle time is
+  more than R times the data file's, R = 1 + latency × bandwidth / the meta file's size,
+  of the measured latency and bandwidth of range reads. A data miss waits only for its
+  bytes, as prefetch overlaps its latency; a meta miss waits for the latency too. Of files
+  of one layer the least recently used goes first, as before.
 - Neither layer has a share of its own: one with nothing to evict leaves the other the
   whole capacity.
 - A read of a meta or bloom filter served by the memory meta cache counts as a use of its

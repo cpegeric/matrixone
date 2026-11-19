@@ -932,11 +932,16 @@ func (m *rangeReadCostModel) observeLatency(d time.Duration) {
 	})
 }
 
-// missCostPerByte returns the time, per byte, of a read from object storage of a file of
-// size bytes: the measured latency of range reads plus size over their bandwidth.
-func missCostPerByte(_ int, size int64) float64 {
-	size = max(size, 1)
+// missCostPerByte returns the time, per byte, a read of a file of size bytes of class waits
+// on object storage when the file is not cached: the measured latency of range reads plus
+// size over their bandwidth for a meta-layer file, and size over the bandwidth alone for a
+// data file, whose latency prefetch overlaps.
+func missCostPerByte(class int, size int64) float64 {
 	c := rangeReadCosts.get()
+	if class != metaClass {
+		return 1 / c.bytesPerS
+	}
+	size = max(size, 1)
 	return (c.latency + float64(size)/c.bytesPerS) / float64(size)
 }
 
