@@ -24,6 +24,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	metric "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"go.uber.org/zap"
@@ -290,7 +291,12 @@ func (p *prefetcher) add(req ObjectPrefetch) {
 		metric.FSPrefetchMergedCounter.Inc()
 		if e.queue == nil && !e.req.covers(req) {
 			// The running download does not download what req asks for: it is queued once
-			// the download ends. Past the queues' bytes, what it asks for is not kept.
+			// the download ends. Past the queues' bytes, what it asks for is not kept. What
+			// scans that all ended asked for is dropped, not merged into req.
+			if e.next != nil && !slices.ContainsFunc(e.nextScans, (*PrefetchScan).live) {
+				p.takeDeferredLocked(e)
+				metric.FSPrefetchEndedCounter.Inc()
+			}
 			deferred := func() (ObjectPrefetch, int64) {
 				if e.next == nil {
 					return req, 0
@@ -299,15 +305,9 @@ func (p *prefetcher) add(req ObjectPrefetch) {
 			}
 			next, kept := deferred()
 			grow := next.Size - kept
-			if grow > 0 && p.queuedBytesLocked()+grow > p.limit() {
-				if p.reclaimEndedDeferredLocked() {
-					next, kept = deferred()
-					grow = next.Size - kept
-				}
-				if grow > 0 && p.queuedBytesLocked()+grow > p.limit() {
-					metric.FSPrefetchDroppedCounter.Inc()
-					return
-				}
+			if grow > 0 && !p.roomLocked(grow, nil) {
+				metric.FSPrefetchDroppedCounter.Inc()
+				return
 			}
 			p.deferred += grow
 			p.deferredOf[e] = struct{}{}
@@ -318,19 +318,28 @@ func (p *prefetcher) add(req ObjectPrefetch) {
 			}
 			return
 		}
-		e.addScan(req.Scan)
 		if q := e.queue; q != nil {
-			merged := e.req.merge(req)
-			if grow := merged.Size - e.req.Size; grow > 0 && p.queuedBytesLocked()+grow > p.limit() &&
-				(!p.reclaimEndedDeferredLocked() || p.queuedBytesLocked()+grow > p.limit()) {
-				// Past the queues' bytes, the queued download keeps what it downloads.
-				merged.Size, merged.Ranges = e.req.Size, e.req.Ranges
-				metric.FSPrefetchDroppedCounter.Inc()
+			// What scans that all ended asked for is replaced by req, not merged into it.
+			merged := req
+			if e.live() {
+				merged = e.req.merge(req)
 			}
+			if grow := merged.Size - e.req.Size; grow > 0 && !p.roomLocked(grow, e) {
+				// Past the queues' bytes, a queued download in use keeps what it downloads,
+				// needed as soon as req; one whose reads all ended is not kept by req.
+				metric.FSPrefetchDroppedCounter.Inc()
+				if !e.live() {
+					return
+				}
+				merged.Size, merged.Ranges = e.req.Size, e.req.Ranges
+			}
+			e.addScan(req.Scan)
 			q.bytes += merged.Size - e.req.Size
 			e.req = merged
 			heap.Fix(&q.queue, e.index)
+			return
 		}
+		e.addScan(req.Scan)
 		return
 	}
 	if have {
@@ -344,7 +353,11 @@ func (p *prefetcher) add(req ObjectPrefetch) {
 		metric.FSPrefetchDroppedCounter.Inc()
 		return
 	}
-	// Room is made in the prefetch queue: a read waits for each download of the live queue.
+	// Room is made from the requests of ended scans deferred behind running downloads, then
+	// in the prefetch queue: a read waits for each download of the live queue.
+	if p.queuedBytesLocked()+req.Size > limit {
+		p.reclaimEndedDeferredLocked()
+	}
 	for p.queuedBytesLocked()+req.Size > limit {
 		q := p.prefetch.queue
 		// An entry whose scans ended goes first, then the last in download order.
@@ -379,6 +392,25 @@ func (p *prefetcher) add(req ObjectPrefetch) {
 // requests deferred behind running downloads.
 func (p *prefetcher) queuedBytesLocked() int64 {
 	return p.prefetch.bytes + p.live.bytes + p.deferred
+}
+
+// roomLocked reports whether need more bytes fit in the queues, after dropping as many as
+// it takes of the requests deferred behind running downloads whose scans all ended, then
+// of the downloads in the prefetch queue whose reads all ended, other than keep.
+func (p *prefetcher) roomLocked(need int64, keep *prefetchEntry) bool {
+	limit := p.limit()
+	if p.queuedBytesLocked()+need <= limit {
+		return true
+	}
+	p.reclaimEndedDeferredLocked()
+	for p.queuedBytesLocked()+need > limit {
+		i := slices.IndexFunc(p.prefetch.queue, func(o *prefetchEntry) bool { return o != keep && !o.live() })
+		if i < 0 {
+			return false
+		}
+		p.dropLocked(p.prefetch.queue[i])
+	}
+	return true
 }
 
 // reclaimEndedDeferredLocked drops the requests deferred behind running downloads whose
@@ -687,7 +719,7 @@ func (s *S3FS) prefetchRanges(ctx context.Context, req ObjectPrefetch) {
 		}
 		// Past the bytes of a MemoryPrefetchObject, the ranges download to files.
 		if bytes > s.diskCache.memoryPrefetchMax {
-			if err := s.prefetchFiles(ctx, path.File, ranges, open); err != nil {
+			if err := s.prefetchFiles(ctx, path.File, req.deletes, ranges, open); err != nil {
 				metric.FSPrefetchFailedCounter.Inc()
 				logutil.Debug("fileservice: prefetch ranges", zap.String("path", req.FilePath), zap.Error(err))
 				return
@@ -727,10 +759,16 @@ func (s *S3FS) prefetchRanges(ctx context.Context, req ObjectPrefetch) {
 // holding an object-storage connection.
 const prefetchFilesAtOnce = 4
 
+// errPrefetchDeleted is the error of a prefetch of an object deleted before it read all its
+// ranges.
+var errPrefetchDeleted = moerr.NewInternalErrorNoCtx("fileservice: object deleted during a prefetch")
+
 // prefetchFiles downloads each of ranges of the object at filePath as a FilePrefetchObject,
 // prefetchFilesAtOnce at a time. The prefetch counts as started once the first ranges are
-// under way; a read of a range not yet under way reads its own bytes.
-func (s *S3FS) prefetchFiles(ctx context.Context, filePath string, ranges []PrefetchRange, open rangeOpener) error {
+// under way; a read of a range not yet under way reads its own bytes. No range starts once
+// the object was deleted after the disk cache counted deletes deleted ones.
+func (s *S3FS) prefetchFiles(ctx context.Context, filePath string, deletes uint64, ranges []PrefetchRange, open rangeOpener) error {
+	objectPath := s.diskCache.pathForFile(filePath)
 	var running, started sync.WaitGroup
 	errs := make([]error, len(ranges))
 	workers := min(len(ranges), prefetchFilesAtOnce)
@@ -745,6 +783,10 @@ func (s *S3FS) prefetchFiles(ctx context.Context, filePath string, ranges []Pref
 			for i := int(next.Add(1) - 1); i < len(ranges); i = int(next.Add(1) - 1) {
 				if err := ctx.Err(); err != nil {
 					errs[i] = err
+					continue
+				}
+				if s.diskCache.deletes.since(objectPath, deletes) {
+					errs[i] = errPrefetchDeleted
 					continue
 				}
 				r := ranges[i]

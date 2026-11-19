@@ -626,6 +626,124 @@ func TestPrefetcherEndedDeferredRequestYieldsBytes(t *testing.T) {
 	require.Empty(t, p.deferredOf)
 }
 
+// A request for a running download does not take over what scans that all ended asked to
+// defer behind it, and the bytes of ended deferred requests make room before a live queued
+// download is dropped.
+func TestPrefetcherEndedDeferredRequestNotInherited(t *testing.T) {
+	started := make(chan string, 4)
+	release := make(chan struct{})
+	run := func(_ context.Context, req ObjectPrefetch) {
+		started <- req.FilePath
+		<-release
+	}
+	p := newPrefetcher(1, func() int64 { return 100 }, func(ObjectPrefetch) bool { return false }, run)
+	defer p.close(context.Background())
+	defer close(release)
+	p.add(ObjectPrefetch{FilePath: "a", Size: 1, Ranges: []PrefetchRange{{Offset: 0, Size: 1}}})
+	require.Equal(t, "a", <-started)
+	ended := &PrefetchScan{}
+	p.add(ObjectPrefetch{FilePath: "a", Size: 80, Ranges: []PrefetchRange{{Offset: 100, Size: 80}}, Scan: ended})
+	ended.End()
+	live := &PrefetchScan{}
+	p.add(ObjectPrefetch{FilePath: "a", Size: 1, Ranges: []PrefetchRange{{Offset: 500, Size: 1}}, Scan: live})
+	func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		require.Equal(t, int64(1), p.entries["a"].next.Size, "the ended request is dropped, not merged")
+		require.Equal(t, int64(1), p.deferred)
+	}()
+
+	p.add(ObjectPrefetch{FilePath: "a", Size: 79, Ranges: []PrefetchRange{{Offset: 1000, Size: 79}}, Scan: live})
+	live.End()
+	p.add(ObjectPrefetch{FilePath: "b", Size: 20, Due: 20, Ranges: []PrefetchRange{{Offset: 0, Size: 20}}, Scan: &PrefetchScan{}})
+	p.add(ObjectPrefetch{FilePath: "c", Size: 20, Due: 10, Ranges: []PrefetchRange{{Offset: 0, Size: 20}}, Scan: &PrefetchScan{}})
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.Contains(t, p.entries, "b", "the live queued download stays")
+	require.Contains(t, p.entries, "c")
+	require.Zero(t, p.deferred)
+}
+
+// A live request deferred behind a running download makes room by dropping a queued
+// download whose reads all ended.
+func TestPrefetcherDeferredRequestDropsEndedQueued(t *testing.T) {
+	started := make(chan string, 8)
+	release := make(chan struct{})
+	run := func(_ context.Context, req ObjectPrefetch) {
+		started <- req.FilePath
+		<-release
+	}
+	p := newPrefetcher(1, func() int64 { return 100 }, func(ObjectPrefetch) bool { return false }, run)
+	defer p.close(context.Background())
+	defer close(release)
+	p.add(ObjectPrefetch{FilePath: "a", Size: 10, Ranges: []PrefetchRange{{Offset: 0, Size: 10}}})
+	require.Equal(t, "a", <-started)
+	ended := &PrefetchScan{}
+	p.add(ObjectPrefetch{FilePath: "x", Size: 80, Scan: ended})
+	ended.End()
+	p.add(ObjectPrefetch{FilePath: "a", Size: 30, Ranges: []PrefetchRange{{Offset: 100, Size: 30}}, Scan: &PrefetchScan{}})
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.NotNil(t, p.entries["a"].next)
+	require.NotContains(t, p.entries, "x")
+}
+
+// A live request merged into a queued download makes room by dropping a queued download
+// whose reads all ended.
+func TestPrefetcherMergeDropsEndedQueued(t *testing.T) {
+	r := newPrefetchRecorder()
+	p := newPrefetcher(0, func() int64 { return 100 }, func(ObjectPrefetch) bool { return false }, r.run)
+	defer p.close(context.Background())
+	ended := &PrefetchScan{}
+	p.add(ObjectPrefetch{FilePath: "y", Size: 80, Scan: ended})
+	ended.End()
+	live := &PrefetchScan{}
+	p.add(ObjectPrefetch{FilePath: "z", Size: 10, Ranges: []PrefetchRange{{Offset: 0, Size: 10}}, Scan: live})
+	p.add(ObjectPrefetch{FilePath: "z", Size: 30, Ranges: []PrefetchRange{{Offset: 100, Size: 30}}, Scan: live})
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.Equal(t, int64(40), p.entries["z"].req.Size)
+	require.NotContains(t, p.entries, "y")
+}
+
+// A request for a queued download whose reads all ended replaces what they asked for: only
+// what the live read asked for is downloaded.
+func TestPrefetcherRequestReplacesEndedQueued(t *testing.T) {
+	var mu sync.Mutex
+	var ran []ObjectPrefetch
+	started := make(chan string, 8)
+	release := make(chan struct{})
+	run := func(_ context.Context, req ObjectPrefetch) {
+		started <- req.FilePath
+		if req.FilePath == "blk" {
+			<-release
+		}
+		mu.Lock()
+		ran = append(ran, req)
+		mu.Unlock()
+	}
+	p := newPrefetcher(1, func() int64 { return 100 }, func(ObjectPrefetch) bool { return false }, run)
+	p.add(ObjectPrefetch{FilePath: "blk", Size: 10})
+	require.Equal(t, "blk", <-started)
+	s1 := &PrefetchScan{}
+	p.add(ObjectPrefetch{FilePath: "e", Size: 50, Ranges: []PrefetchRange{{Offset: 0, Size: 50}}, Scan: s1})
+	s1.End()
+	p.add(ObjectPrefetch{FilePath: "f", Size: 40, Scan: &PrefetchScan{}})
+	p.add(ObjectPrefetch{FilePath: "e", Size: 20, Ranges: []PrefetchRange{{Offset: 100, Size: 20}}, Scan: &PrefetchScan{}})
+	close(release)
+	p.wg.Wait()
+	p.close(context.Background())
+	mu.Lock()
+	defer mu.Unlock()
+	var e []PrefetchRange
+	for _, req := range ran {
+		if req.FilePath == "e" {
+			e = append(e, req.Ranges...)
+		}
+	}
+	require.Equal(t, []PrefetchRange{{Offset: 100, Size: 20}}, e)
+}
+
 // A delete of an object being downloaded drops what later requests asked for beyond the
 // download: nothing is downloaded after it.
 func TestPrefetcherRemoveDropsDeferredRequest(t *testing.T) {
