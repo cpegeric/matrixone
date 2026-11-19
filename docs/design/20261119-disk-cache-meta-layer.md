@@ -26,9 +26,10 @@ queries before had evicted them.
   in both layers. A restart keeps each file in its layer.
 - The two layers share the disk cache's capacity. When room is needed, of the least
   recently used file of each layer, the one evicted is the one whose idle time over its
-  value is the larger. A file's value is the time a read of it from object storage takes,
-  the measured latency plus its size over the measured bandwidth, per byte. Of files of
-  one layer the least recently used goes first, as before.
+  layer's value is the larger. A layer's value is the time a read from object storage of
+  a file of the layer's average size takes, the measured latency plus that size over the
+  measured bandwidth, per byte. Of files of one layer the least recently used goes first,
+  as before.
 - Neither layer has a share of its own: one with nothing to evict leaves the other the
   whole capacity.
 - A read of a meta or bloom filter served by the memory meta cache counts as a use of its
