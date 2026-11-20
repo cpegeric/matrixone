@@ -15,7 +15,9 @@
 package fileservice
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
@@ -281,6 +283,96 @@ func TestBlackBoxForegroundReadNotHeldByBufferOfWaitingRange(t *testing.T) {
 	require.Equal(t, 1, total, "only the read reads the object")
 }
 
+// A column read of a range of a running prefetch whose range waits for a connection, held
+// by another object's download, reads its own bytes; once the connection is free, the
+// prefetch caches the range.
+func TestBlackBoxColumnReadNotHeldByPrefetchWaitingForConnection(t *testing.T) {
+	fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
+	ctx := context.Background()
+	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "other", Entries: []IOEntry{{Size: int64(len(data)), Data: data}},
+		Policy: SkipDiskCache | SkipMemoryCache}))
+	ranges := columnRanges(2, 40<<10, 1<<10)
+	fs.diskCache.maxDownloadConns = 1
+	objectKey, otherKey := fs.pathToKey("object"), fs.pathToKey("other")
+	g := newBlackBoxStorage(fs.storage, func(key string, _ int64) bool { return key == otherKey })
+	fs.storage = g
+	release := sync.OnceFunc(func() { close(g.gate) })
+	defer release()
+	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "other", Size: int64(len(data)), Scan: &PrefetchScan{}}))
+	require.Eventually(t, func() bool { cur, _, _ := g.counts(otherKey); return cur == 1 }, 5*time.Second, time.Millisecond,
+		"the whole download of other holds the connection")
+	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: 2 << 10, Ranges: ranges, Scan: &PrefetchScan{}}))
+	require.Eventually(t, func() bool { return fs.prefetcher.isRunning("object") }, 5*time.Second, time.Millisecond)
+	readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	got, err := readColumnRange(readCtx, fs, ranges[0])
+	require.NoError(t, err)
+	require.Equal(t, data[ranges[0].Offset:ranges[0].Offset+ranges[0].Size], got)
+	require.True(t, fs.prefetcher.isRunning("object"), "the prefetch still waits")
+	release()
+	require.Eventually(t, func() bool { return !fs.prefetcher.isRunning("object") }, 5*time.Second, time.Millisecond)
+	key := fs.diskCache.rangeObjectKey("object")
+	for _, r := range ranges {
+		_, cached := fs.diskCache.ranges.covering(key, r.Offset, r.Size)
+		require.True(t, cached)
+	}
+	_, _, total := g.counts(objectKey)
+	require.Equal(t, 2, total, "the prefetch reads only the range the read did not")
+}
+
+// A column read of a range of a running prefetch of ranges downloading to files, whose
+// range waits for a connection held by another object's download, reads its own bytes.
+func TestBlackBoxColumnReadNotHeldByFilePrefetchWaitingForConnection(t *testing.T) {
+	fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
+	ctx := context.Background()
+	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "other", Entries: []IOEntry{{Size: int64(len(data)), Data: data}},
+		Policy: SkipDiskCache | SkipMemoryCache}))
+	ranges := columnRanges(2, 40<<10, 16<<10)
+	fs.diskCache.maxDownloadConns = 1
+	fs.diskCache.memoryPrefetchMax = 16 << 10
+	otherKey := fs.pathToKey("other")
+	g := newBlackBoxStorage(fs.storage, func(key string, _ int64) bool { return key == otherKey })
+	fs.storage = g
+	release := sync.OnceFunc(func() { close(g.gate) })
+	defer release()
+	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "other", Size: int64(len(data)), Scan: &PrefetchScan{}}))
+	require.Eventually(t, func() bool { cur, _, _ := g.counts(otherKey); return cur == 1 }, 5*time.Second, time.Millisecond,
+		"the whole download of other holds the connection")
+	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: 32 << 10, Ranges: ranges, Scan: &PrefetchScan{}}))
+	require.Eventually(t, func() bool { return fs.prefetcher.isRunning("object") }, 5*time.Second, time.Millisecond)
+	readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	got, err := readColumnRange(readCtx, fs, ranges[0])
+	require.NoError(t, err)
+	require.Equal(t, data[ranges[0].Offset:ranges[0].Offset+ranges[0].Size], got)
+}
+
+// A memory-backed column prefetch whose ranges wait for a connection ends once its object
+// is deleted, while the download holding the connection still runs.
+func TestBlackBoxMemoryColumnPrefetchWaitingForConnectionEndsOnDelete(t *testing.T) {
+	fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
+	ctx := context.Background()
+	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "other", Entries: []IOEntry{{Size: int64(len(data)), Data: data}},
+		Policy: SkipDiskCache | SkipMemoryCache}))
+	ranges := columnRanges(2, 40<<10, 1<<10)
+	fs.diskCache.maxDownloadConns = 1
+	objectKey, otherKey := fs.pathToKey("object"), fs.pathToKey("other")
+	g := newBlackBoxStorage(fs.storage, func(key string, _ int64) bool { return key == otherKey })
+	fs.storage = g
+	release := sync.OnceFunc(func() { close(g.gate) })
+	defer release()
+	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "other", Size: int64(len(data)), Scan: &PrefetchScan{}}))
+	require.Eventually(t, func() bool { cur, _, _ := g.counts(otherKey); return cur == 1 }, 5*time.Second, time.Millisecond,
+		"the whole download of other holds the connection")
+	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: 2 << 10, Ranges: ranges, Scan: &PrefetchScan{}}))
+	require.Eventually(t, func() bool { return fs.prefetcher.isRunning("object") }, 5*time.Second, time.Millisecond)
+	require.NoError(t, fs.Delete(ctx, "object"))
+	require.Eventually(t, func() bool { return !fs.prefetcher.isRunning("object") }, 5*time.Second, time.Millisecond)
+	require.True(t, fs.prefetcher.isRunning("other"))
+	_, _, total := g.counts(objectKey)
+	require.Zero(t, total)
+}
+
 // A memory-backed column prefetch starts no range of an object deleted while its ranges
 // wait for buffers.
 func TestBlackBoxMemoryColumnPrefetchStopsAfterDelete(t *testing.T) {
@@ -300,4 +392,76 @@ func TestBlackBoxMemoryColumnPrefetchStopsAfterDelete(t *testing.T) {
 	require.Eventually(t, func() bool { return !fs.prefetcher.isRunning("object") }, 5*time.Second, time.Millisecond)
 	_, _, total := g.counts(key)
 	require.Equal(t, 1, total, "no range starts after the delete")
+}
+
+// A prefetch range of at least the split size is read as parts at once, each its own
+// prefetch object cached as its own range file; a read across the parts is served from
+// the cache.
+func TestBlackBoxPrefetchRangeSplitIntoParts(t *testing.T) {
+	fs, _, data := newPrefetchRangeFS(t, 0, 2<<20)
+	fs.diskCache.objectSplit = objectSplitConfig{parts: 2, min: 512 << 10}
+	key := fs.pathToKey("object")
+	g := newBlackBoxStorage(fs.storage, func(k string, _ int64) bool { return k == key })
+	fs.storage = g
+	release := sync.OnceFunc(func() { close(g.gate) })
+	defer release()
+	ctx := context.Background()
+	r := PrefetchRange{Offset: 64 << 10, Size: 1 << 20}
+	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: 2 << 20, Ranges: []PrefetchRange{r}, Scan: &PrefetchScan{}}))
+	require.Eventually(t, func() bool { cur, _, _ := g.counts(key); return cur == 2 }, 5*time.Second, time.Millisecond,
+		"the parts are read at once")
+	release()
+	require.Eventually(t, func() bool { return !fs.prefetcher.isRunning("object") }, 5*time.Second, time.Millisecond)
+	cached, ok := fs.diskCache.ranges.covering(fs.diskCache.rangeObjectKey("object"), r.Offset, r.Size)
+	require.True(t, ok)
+	require.Len(t, cached, 2, "each part is its own range file")
+	off := r.Offset + 512<<10 - 100
+	got, err := readColumnRange(ctx, fs, PrefetchRange{Offset: off, Size: 200})
+	require.NoError(t, err)
+	require.Equal(t, data[off:off+200], got)
+	_, _, total := g.counts(key)
+	require.Equal(t, 2, total, "the read across the parts is served from the cache")
+}
+
+// Reads of the same run past the bytes of a MemoryPrefetchObject that wait for a
+// connection, held by another object's download, download the run once.
+func TestBlackBoxConcurrentReadsOfFileRunDownloadOnce(t *testing.T) {
+	const unit = 64 << 10
+	fs, _, data := newPrefetchRangeFS(t, unit, 1<<20)
+	ctx := context.Background()
+	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "other", Entries: []IOEntry{{Size: int64(len(data)), Data: data}},
+		Policy: SkipDiskCache | SkipMemoryCache}))
+	fs.diskCache.maxDownloadConns = 1
+	fs.diskCache.memoryPrefetchMax = 2 * unit
+	objectKey, otherKey := fs.pathToKey("object"), fs.pathToKey("other")
+	g := newBlackBoxStorage(fs.storage, func(key string, _ int64) bool { return key == otherKey })
+	fs.storage = g
+	release := sync.OnceFunc(func() { close(g.gate) })
+	defer release()
+	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "other", Size: int64(len(data)), Scan: &PrefetchScan{}}))
+	require.Eventually(t, func() bool { cur, _, _ := g.counts(otherKey); return cur == 1 }, 5*time.Second, time.Millisecond,
+		"the whole download of other holds the connection")
+	const readers = 3
+	errs := make(chan error, readers)
+	for range readers {
+		go func() {
+			vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache,
+				Entries: []IOEntry{{Offset: 0, Size: 4 * unit}}}
+			err := fs.Read(ctx, vec)
+			if err == nil && !bytes.Equal(data[:4*unit], vec.Entries[0].Data) {
+				err = errors.New("wrong bytes")
+			}
+			vec.Release()
+			errs <- err
+		}()
+	}
+	require.Never(t, func() bool { return len(errs) > 0 }, 100*time.Millisecond, time.Millisecond, "the reads wait for the connection")
+	_, _, total := g.counts(objectKey)
+	require.Zero(t, total)
+	release()
+	for range readers {
+		require.NoError(t, <-errs)
+	}
+	_, _, total = g.counts(objectKey)
+	require.Equal(t, 1, total, "the run downloads once")
 }

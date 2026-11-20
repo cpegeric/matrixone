@@ -19,7 +19,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"slices"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -143,7 +145,12 @@ func TestObjectDownloadWaitsForItsPart(t *testing.T) {
 	ctx := context.Background()
 	o := newObjectDownload("", false, []int64{0, 4, 8})
 	_, wait := o.estimate(0, 1)
-	require.GreaterOrEqual(t, wait, rangeReadCosts.firstByte(), "a part not yet read is a latency away")
+	require.Equal(t, time.Duration(math.MaxInt64), wait, "a part that has not begun is out of reach")
+	o.begin(0)
+	o.begin(1)
+	_, wait = o.estimate(0, 1)
+	require.Positive(t, wait, "a part begun but not yet read is up to a latency away")
+	require.LessOrEqual(t, wait, rangeReadCosts.firstByte()+time.Duration(float64(time.Second)/downloadRates.rate()))
 	o.advance(1, 4)
 	written, ok := o.waitFor(ctx, 4, 8, time.Millisecond)
 	require.True(t, ok)
@@ -219,8 +226,8 @@ func TestS3FSFullObjectReadSkipsMergeWait(t *testing.T) {
 	require.Less(t, time.Since(t0), 2*time.Second)
 }
 
-// A download releases its connections once its transfer ends, and a split that cannot
-// reserve a connection for each part downloads the object as one range.
+// The parts of a split download each hold a connection while they read: with one
+// connection free they read one after the other, and each releases it once it ends.
 func TestS3FSDownloadConnsReservedPerPart(t *testing.T) {
 	fs, storage, data := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 128 << 10}, 300<<10)
 	d := fs.diskCache
@@ -229,9 +236,9 @@ func TestS3FSDownloadConnsReservedPerPart(t *testing.T) {
 	got, err := readFullObjectOf(fs, 100, 10)
 	require.NoError(t, err)
 	require.Equal(t, data[100:110], got)
-	require.Equal(t, int64(1), storage.reads.Load())
-	require.Empty(t, storage.starts, "one open-ended range with one connection free")
-	require.Equal(t, int64(1), d.downloadConns.Load(), "its connection is released")
+	require.Equal(t, int64(2), storage.reads.Load())
+	require.ElementsMatch(t, []int64{0, 192 << 10}, storage.starts, "the split stays with one connection free")
+	require.Equal(t, int64(1), d.downloadConns.Load(), "its connections are released")
 	require.True(t, d.cache.Contains(d.pathForFile("object")))
 }
 
@@ -323,4 +330,100 @@ func TestS3FSConfiguredConnsBoundDownloads(t *testing.T) {
 		require.Equal(t, tc.download, d.cache.Contains(d.pathForFile("object")), "conns %d", tc.conns)
 		fs.Close(ctx)
 	}
+}
+
+// More concurrent split downloads than the connections downloads may hold all cache their
+// objects: each part holds a connection only while it reads, so no download holds one
+// while it waits for another, and none stays held.
+func TestS3FSObjectSplitDownloadsShareFewConnections(t *testing.T) {
+	const (
+		objects = 6
+		size    = 300<<10 + 17
+	)
+	fs, _, _ := newPrefetchRangeFS(t, 0, 1)
+	fs.diskCache.objectSplit = objectSplitConfig{parts: 2, min: 128 << 10}
+	fs.diskCache.maxDownloadConns = 2
+	ctx := context.Background()
+	contents := make([][]byte, objects)
+	for i := range objects {
+		name := fmt.Sprintf("object-%d", i)
+		contents[i] = make([]byte, size)
+		for j := range contents[i] {
+			contents[i][j] = byte(i + j*13)
+		}
+		require.NoError(t, fs.Write(ctx, IOVector{FilePath: name, Entries: []IOEntry{{Size: size, Data: contents[i]}}, Policy: SkipDiskCache | SkipMemoryCache}))
+		fs.diskCache.prefetched.store(fs.diskCache.pathForFile(name), size)
+	}
+	errs := make(chan error, objects)
+	for i := range objects {
+		go func() {
+			vec := &IOVector{FilePath: fmt.Sprintf("object-%d", i), Policy: SkipMemoryCache, Entries: []IOEntry{{Offset: 250 << 10, Size: 10}}}
+			err := fs.Read(ctx, vec)
+			if err == nil && !slices.Equal(contents[i][250<<10:250<<10+10], vec.Entries[0].Data) {
+				err = errors.New("wrong bytes")
+			}
+			vec.Release()
+			errs <- err
+		}()
+	}
+	for range objects {
+		select {
+		case err := <-errs:
+			require.NoError(t, err)
+		case <-time.After(diskCacheLifecycleTestTimeout):
+			t.Fatal("a read did not return")
+		}
+	}
+	require.Eventually(t, func() bool { return fs.diskCache.downloadConns.Load() == 0 }, 5*time.Second, time.Millisecond)
+}
+
+// A read of bytes in a part of a split download that waits for a connection reads its own
+// range: no read waits for a part holding no connection.
+func TestS3FSReadOfPartWaitingForConnectionReadsItsRange(t *testing.T) {
+	fs, _, data := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 128 << 10}, 300<<10)
+	d := fs.diskCache
+	d.maxDownloadConns = 1
+	key := fs.pathToKey("object")
+	g := newBlackBoxStorage(fs.storage, func(k string, off int64) bool { return k == key && off == 0 })
+	fs.storage = g
+	release := sync.OnceFunc(func() { close(g.gate) })
+	defer release()
+	whole := make(chan error, 1)
+	go func() {
+		_, err := readFullObjectOf(fs, 100, 10)
+		whole <- err
+	}()
+	require.Eventually(t, func() bool { cur, _, _ := g.counts(key); return cur == 1 }, 5*time.Second, time.Millisecond,
+		"the first part holds the only connection")
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache, Entries: []IOEntry{{Offset: 250 << 10, Size: 10}}}
+	require.NoError(t, fs.Read(ctx, vec))
+	require.Equal(t, data[250<<10:250<<10+10], vec.Entries[0].Data)
+	vec.Release()
+	release()
+	require.NoError(t, <-whole)
+}
+
+// A read that joins bytes at copy time takes no download whose part holding them has not
+// begun, and takes it once the part begins.
+func TestCoveringSkipsPartNotBegun(t *testing.T) {
+	fs, _, _ := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 128 << 10}, 300<<10)
+	d := fs.diskCache
+	diskPath := d.pathForFile("object")
+	ctx, end := d.startFilePrefetch(context.Background(), diskPath, 0, 8)
+	defer end(nil)
+	o := newObjectDownload("", false, []int64{0, 4, 8})
+	o.begin(0)
+	fileDownloadStarted(ctx, o)
+	f := &d.prefetchObjects
+	covering := func(lo, hi int64) prefetchObject {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.coveringLocked(diskPath, lo, hi, time.Now())
+	}
+	require.NotNil(t, covering(1, 2), "the first part has begun")
+	require.Nil(t, covering(5, 6), "the second part has not begun")
+	o.begin(1)
+	require.NotNil(t, covering(5, 6))
 }

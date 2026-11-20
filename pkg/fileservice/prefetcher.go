@@ -18,13 +18,11 @@ import (
 	"cmp"
 	"container/heap"
 	"context"
-	"errors"
 	"io"
 	"slices"
 	"sync"
 	"sync/atomic"
 
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	metric "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"go.uber.org/zap"
@@ -746,20 +744,6 @@ func (s *S3FS) prefetchRanges(ctx context.Context, req ObjectPrefetch) {
 		open := func(ctx context.Context, start, end int64) (io.ReadCloser, error) {
 			return s.storage.Read(ctx, key, &start, &end)
 		}
-		var bytes int64
-		for _, r := range ranges {
-			bytes += r.Size
-		}
-		// Past the bytes of a MemoryPrefetchObject, the ranges download to files.
-		if bytes > s.diskCache.memoryPrefetchMax {
-			if err := s.prefetchFiles(ctx, path.File, req.deletes, ranges, open); err != nil {
-				metric.FSPrefetchFailedCounter.Inc()
-				logutil.Debug("fileservice: prefetch ranges", zap.String("path", req.FilePath), zap.Error(err))
-				return
-			}
-			metric.FSPrefetchDownloadedCounter.Inc()
-			return
-		}
 		// Reads of the ranges join their flights instead of reading their bytes again.
 		if ok, err := s.diskCache.readRanges(ctx, path.File, req.deletes, SkipMemoryCacheWrites|SkipFullFilePreloads|ColumnPrefetch, ranges, open); ok {
 			if err != nil {
@@ -786,56 +770,6 @@ func (s *S3FS) prefetchRanges(ctx context.Context, req ObjectPrefetch) {
 		}
 	}
 	metric.FSPrefetchDownloadedCounter.Inc()
-}
-
-// prefetchFilesAtOnce is the most ranges of one prefetch that download at once, each
-// holding an object-storage connection.
-const prefetchFilesAtOnce = 4
-
-// errPrefetchDeleted is the error of a prefetch of an object deleted before it read all its
-// ranges.
-var errPrefetchDeleted = moerr.NewInternalErrorNoCtx("fileservice: object deleted during a prefetch")
-
-// prefetchFiles downloads each of ranges of the object at filePath as a FilePrefetchObject,
-// prefetchFilesAtOnce at a time. The prefetch counts as started once the first ranges are
-// under way; a read of a range not yet under way reads its own bytes. No range starts once
-// the object was deleted after the disk cache counted deletes deleted ones.
-func (s *S3FS) prefetchFiles(ctx context.Context, filePath string, deletes uint64, ranges []PrefetchRange, open rangeOpener) error {
-	objectPath := s.diskCache.pathForFile(filePath)
-	var running, started sync.WaitGroup
-	errs := make([]error, len(ranges))
-	workers := min(len(ranges), prefetchFilesAtOnce)
-	started.Add(workers)
-	var next atomic.Int64
-	for range workers {
-		running.Add(1)
-		go func() {
-			defer running.Done()
-			mark := sync.OnceFunc(started.Done)
-			defer mark()
-			// The prefetch counts as started once a range of it is under way.
-			underWay := func() {
-				mark()
-				downloadStarted(ctx)
-			}
-			for i := int(next.Add(1) - 1); i < len(ranges); i = int(next.Add(1) - 1) {
-				if err := ctx.Err(); err != nil {
-					errs[i] = err
-					continue
-				}
-				if s.diskCache.deletes.since(objectPath, deletes) {
-					errs[i] = errPrefetchDeleted
-					continue
-				}
-				r := ranges[i]
-				_, errs[i] = s.diskCache.prefetchFile(withDownloadStarted(ctx, underWay), filePath, r.Offset, r.Offset+r.Size, open)
-			}
-		}()
-	}
-	started.Wait()
-	downloadStarted(ctx)
-	running.Wait()
-	return errors.Join(errs...)
 }
 
 // rangesToDownload returns the ranges of req not covered by cached ranges, in order, with
