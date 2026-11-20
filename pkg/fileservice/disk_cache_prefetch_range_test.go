@@ -120,7 +120,7 @@ func TestS3FSPrefetchRangeSkipsCanceledRead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var opens atomic.Int64
-	_, reads, ok := fs.diskCache.prefetchRead(ctx, "object", 0, []IOEntry{{Offset: 5000, Size: 2}}, 5000, 5002, 4096,
+	_, reads, ok, _ := fs.diskCache.prefetchRead(ctx, "object", 0, []IOEntry{{Offset: 5000, Size: 2}}, 5000, 5002, 4096,
 		func(context.Context, int64, int64) (io.ReadCloser, error) {
 			opens.Add(1)
 			return nil, context.Canceled
@@ -542,7 +542,7 @@ func TestPrefetchReadOutlivesItsReader(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	entries := []IOEntry{{Offset: 100, Size: 10}}
-	content, reads, ok := d.prefetchRead(ctx, "object", SkipFullFilePreloads, entries, 100, 110, 128<<10, open)
+	content, reads, ok, _ := d.prefetchRead(ctx, "object", SkipFullFilePreloads, entries, 100, 110, 128<<10, open)
 	require.True(t, ok)
 	require.Equal(t, 1, reads)
 	require.Equal(t, data[100:110], content)
@@ -725,22 +725,26 @@ func TestPrefetchFlightBufferReusedAfterLastHolder(t *testing.T) {
 }
 
 // The bytes of the flights under way are a share of the memory available, measured at
-// most once per refresh, and at least one column prefetch's bytes.
+// most once per refresh, and at least one MemoryPrefetchObject's buffer per download
+// connection.
 func TestFlightBytesFollowAvailableMemory(t *testing.T) {
 	prev := memoryAvailable
 	t.Cleanup(func() { memoryAvailable = prev })
 	var calls int
-	avail := uint64(10 << 30)
+	avail := uint64(20 << 30)
 	memoryAvailable = func() (uint64, bool) { calls++; return avail, true }
-	d := &DiskCache{memoryPrefetchMax: 32 << 20}
+	d := &DiskCache{memoryPrefetchMax: 20 << 20, maxDownloadConns: 16}
 	share := int64(avail / 100 * flightMemoryPercent)
 	require.Equal(t, share, d.flightBytes())
 	avail = 1 << 20
 	require.Equal(t, share, d.flightBytes(), "measured once per refresh")
 	require.Equal(t, 1, calls)
 	d.flightBudget.at.Store(0)
-	require.Equal(t, int64(32<<20), d.flightBytes(), "at least one MemoryPrefetchObject")
+	require.Equal(t, int64(16*32<<20), d.flightBytes(), "a MemoryPrefetchObject's buffer per connection")
 	memoryAvailable = func() (uint64, bool) { return 0, false }
+	d.flightBudget.at.Store(0)
+	require.Equal(t, int64(16*32<<20), d.flightBytes())
+	d.maxDownloadConns = 0
 	d.flightBudget.at.Store(0)
 	require.Equal(t, int64(prefetchFlightBytesMax), d.flightBytes())
 	d.prefetchFlightBytes = 7
