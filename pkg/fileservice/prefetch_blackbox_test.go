@@ -347,6 +347,33 @@ func TestBlackBoxColumnReadNotHeldByFilePrefetchWaitingForConnection(t *testing.
 	require.Equal(t, data[ranges[0].Offset:ranges[0].Offset+ranges[0].Size], got)
 }
 
+// A column read of an object whose whole-object prefetch waits for a connection, held by
+// another object's download, reads its own bytes.
+func TestBlackBoxColumnReadNotHeldByWholeObjectPrefetchWaitingForConnection(t *testing.T) {
+	fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
+	ctx := context.Background()
+	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "other", Entries: []IOEntry{{Size: int64(len(data)), Data: data}},
+		Policy: SkipDiskCache | SkipMemoryCache}))
+	fs.diskCache.maxDownloadConns = 1
+	otherKey := fs.pathToKey("other")
+	g := newBlackBoxStorage(fs.storage, func(key string, _ int64) bool { return key == otherKey })
+	fs.storage = g
+	release := sync.OnceFunc(func() { close(g.gate) })
+	defer release()
+	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "other", Size: int64(len(data)), Scan: &PrefetchScan{}}))
+	require.Eventually(t, func() bool { cur, _, _ := g.counts(otherKey); return cur == 1 }, 5*time.Second, time.Millisecond,
+		"the whole download of other holds the connection")
+	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: int64(len(data)), Scan: &PrefetchScan{}}))
+	require.Eventually(t, func() bool { return fs.prefetcher.isRunning("object") }, 5*time.Second, time.Millisecond)
+	r := PrefetchRange{Offset: 40 << 10, Size: 1 << 10}
+	readCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	got, err := readColumnRange(readCtx, fs, r)
+	require.NoError(t, err)
+	require.Equal(t, data[r.Offset:r.Offset+r.Size], got)
+	require.True(t, fs.prefetcher.isRunning("object"), "the prefetch still waits")
+}
+
 // A memory-backed column prefetch whose ranges wait for a connection ends once its object
 // is deleted, while the download holding the connection still runs.
 func TestBlackBoxMemoryColumnPrefetchWaitingForConnectionEndsOnDelete(t *testing.T) {
@@ -371,6 +398,51 @@ func TestBlackBoxMemoryColumnPrefetchWaitingForConnectionEndsOnDelete(t *testing
 	require.True(t, fs.prefetcher.isRunning("other"))
 	_, _, total := g.counts(objectKey)
 	require.Zero(t, total)
+}
+
+// A whole-object prefetch waiting for a connection is listed as waiting for one, is not
+// registered, and ends on a delete of its object without reading it.
+func TestBlackBoxWholeObjectPrefetchWaitingForConnection(t *testing.T) {
+	fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
+	ctx := context.Background()
+	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "other", Entries: []IOEntry{{Size: int64(len(data)), Data: data}},
+		Policy: SkipDiskCache | SkipMemoryCache}))
+	fs.diskCache.maxDownloadConns = 1
+	objectKey, otherKey := fs.pathToKey("object"), fs.pathToKey("other")
+	g := newBlackBoxStorage(fs.storage, func(key string, _ int64) bool { return key == otherKey })
+	fs.storage = g
+	release := sync.OnceFunc(func() { close(g.gate) })
+	defer release()
+	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "other", Size: int64(len(data)), Scan: &PrefetchScan{}}))
+	require.Eventually(t, func() bool { cur, _, _ := g.counts(otherKey); return cur == 1 }, 5*time.Second, time.Millisecond,
+		"the whole download of other holds the connection")
+	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: int64(len(data)), Scan: &PrefetchScan{}}))
+	d := fs.diskCache
+	diskPath := d.pathForFile("object")
+	f := &d.prefetchObjects
+	waitingWhole := func() (waiting, registered bool) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		for o := range f.waiting {
+			if p, ok := o.(*filePrefetchObject); ok && p.whole && p.diskPath == diskPath {
+				waiting = p.state == objectWaitingConn
+			}
+		}
+		return waiting, len(f.m[diskPath]) > 0
+	}
+	require.Eventually(t, func() bool { w, _ := waitingWhole(); return w }, 5*time.Second, time.Millisecond)
+	_, registered := waitingWhole()
+	require.False(t, registered, "a whole object waiting for its connection is not registered")
+	require.NoError(t, fs.Delete(ctx, "object"))
+	require.Eventually(t, func() bool { return !fs.prefetcher.isRunning("object") }, 5*time.Second, time.Millisecond)
+	w, _ := waitingWhole()
+	require.False(t, w)
+	require.True(t, fs.prefetcher.isRunning("other"))
+	_, _, total := g.counts(objectKey)
+	require.Zero(t, total)
+	release()
+	require.Eventually(t, func() bool { return !fs.prefetcher.isRunning("other") }, 5*time.Second, time.Millisecond)
+	require.Zero(t, d.downloadConns.Load())
 }
 
 // A memory-backed column prefetch starts no range of an object deleted while its ranges

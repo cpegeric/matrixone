@@ -1713,6 +1713,10 @@ func (s *S3FS) readFullObjectToDiskCacheStreaming(
 	if deadline, ok := ctx.Deadline(); ok {
 		fillCtx, cancelFill = context.WithDeadline(fillCtx, deadline)
 	}
+	// The download is not registered after a delete of the object since the read began.
+	if len(vector.Entries) > 0 && vector.Entries[0].readDeletes > 0 {
+		fillCtx = withDeletesMark(fillCtx, vector.Entries[0].readDeletes-1)
+	}
 	stopCancelFill := context.AfterFunc(ctx, cancelFill)
 	defer stopCancelFill()
 	stopOnClose := func() bool { return false }
@@ -1728,10 +1732,8 @@ func (s *S3FS) readFullObjectToDiskCacheStreaming(
 	}
 	started := make(chan admittedDownload, 1)
 	setDone := make(chan error, 1)
-	// The download is a FilePrefetchObject of the whole object.
-	prefetchCtx, endPrefetch := s.diskCache.startFilePrefetch(fillCtx, diskPath, 0, math.MaxInt64)
 	go func() {
-		err := s.diskCache.fillFileTo(prefetchCtx, vector.FilePath, func(ctx context.Context) (io.ReadCloser, error) {
+		err := s.diskCache.fillFileTo(fillCtx, vector.FilePath, func(ctx context.Context) (io.ReadCloser, error) {
 			// The reader holds the download's file before any byte is fetched, so the
 			// bytes stay readable whatever the download does next.
 			var admitted admittedDownload
@@ -1744,7 +1746,6 @@ func (s *S3FS) readFullObjectToDiskCacheStreaming(
 			started <- admitted
 			return &lazyObjectReader{ctx: ctx, read: getReader}, nil
 		}, s.asyncUpdate, storageFill, s.prefetchedSize(file, firstNeeded(vector)), s.fillTarget(vector.Policy, vector.FilePath))
-		endPrefetch(err)
 		setDone <- err
 	}()
 	var setErr error
