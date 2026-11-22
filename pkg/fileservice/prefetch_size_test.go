@@ -138,9 +138,12 @@ func TestS3FSPrefetchRanges(t *testing.T) {
 	require.True(t, fs.prefetcher.isQueued("object"))
 }
 
-// Adjacent ranges not cached are read in one read; cached ones are not read.
+// Adjacent ranges not cached, more than a prefetch reads at once, are read in one read;
+// cached ones are not read.
 func TestS3FSPrefetchRangesJoinsAdjacent(t *testing.T) {
 	fs, storage, data := newPrefetchRangeFS(t, 256<<10, 300<<10)
+	fs.diskCache.conns.max = 4
+	require.Equal(t, 1, fs.diskCache.prefetchShare())
 	ctx := context.Background()
 	a, b, c := PrefetchRange{Offset: 1000, Size: 100}, PrefetchRange{Offset: 1100, Size: 50}, PrefetchRange{Offset: 4000, Size: 10}
 	fs.prefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: 160, Ranges: []PrefetchRange{c, b, a}})
@@ -155,26 +158,38 @@ func TestS3FSPrefetchRangesJoinsAdjacent(t *testing.T) {
 	require.Equal(t, int64(180), storage.bytes.Load())
 }
 
-// The ranges not cached are read across the Across bytes before a range when the range
-// before them ends there and those bytes are not all cached; cached ranges are dropped
-// first, so a range is never read again for its neighbor.
+// Cached ranges are dropped first, so a range is never read again for its neighbor. Ranges
+// within what a prefetch can read at once now, its share or the connections not held when
+// fewer, are read apart; past it, adjacent ones are read as one, and then, while still past
+// it, one is read across the Across bytes before it when the range before it ends there and
+// those bytes are not all cached.
 func TestS3FSPrefetchRangesReadAcrossMissed(t *testing.T) {
 	a, b := PrefetchRange{Offset: 1000, Size: 100}, PrefetchRange{Offset: 1100, Size: 50}
 	c := PrefetchRange{Offset: 1150, Size: 100, Across: 50}
 	d, e := PrefetchRange{Offset: 1250, Size: 50}, PrefetchRange{Offset: 1300, Size: 100, Across: 50}
 	for _, tc := range []struct {
 		name         string
+		conns, held  int64
+		share        int
 		cached, read []PrefetchRange
 		reads, bytes int64
 	}{
-		{"a and b cached reads only c", []PrefetchRange{a, b}, []PrefetchRange{a, c}, 1, 100},
-		{"nothing cached reads a to c in one read", nil, []PrefetchRange{a, c}, 1, 250},
-		{"the bytes between cached reads a and c apart", []PrefetchRange{b}, []PrefetchRange{a, c}, 2, 200},
-		{"a cached range between ends the read across", []PrefetchRange{c}, []PrefetchRange{a, c, e}, 2, 200},
-		{"adjacent ranges are read as one", nil, []PrefetchRange{a, b, c, d, e}, 1, 400},
+		{"a and b cached reads only c", 4, 0, 1, []PrefetchRange{a, b}, []PrefetchRange{a, c}, 1, 100},
+		{"nothing cached reads a to c in one read", 4, 0, 1, nil, []PrefetchRange{a, c}, 1, 250},
+		{"ranges within the share are read apart", 8, 0, 2, nil, []PrefetchRange{a, c}, 2, 200},
+		{"ranges past the share are read across", 8, 0, 2, nil, []PrefetchRange{a, c, e}, 1, 400},
+		{"the bytes between cached reads a and c apart", 4, 0, 1, []PrefetchRange{b}, []PrefetchRange{a, c}, 2, 200},
+		{"a cached range between ends the read across", 4, 0, 1, []PrefetchRange{c}, []PrefetchRange{a, c, e}, 2, 200},
+		{"adjacent ranges are read as one", 16, 0, 4, nil, []PrefetchRange{a, b, c, d, e}, 1, 400},
+		{"adjacent ranges within the share are read apart", 16, 0, 4, nil, []PrefetchRange{c, a, b}, 3, 250},
+		{"ranges past the connections not held are read across", 16, 14, 2, nil, []PrefetchRange{a, c, e}, 1, 400},
+		{"with one connection free one range is read at once", 16, 15, 1, nil, []PrefetchRange{a, c}, 1, 250},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs, storage, data := newPrefetchRangeFS(t, 256<<10, 300<<10)
+			fs.diskCache.conns.max = tc.conns
+			holdConns(t, fs.diskCache, tc.held)
+			require.Equal(t, tc.share, fs.diskCache.prefetchReadsNow())
 			ctx := context.Background()
 			if tc.cached != nil {
 				fs.prefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: 1, Ranges: tc.cached})

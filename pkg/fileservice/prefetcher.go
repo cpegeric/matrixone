@@ -784,9 +784,10 @@ func (s *S3FS) rangeCached(key string, offset, size int64) bool {
 	return ok
 }
 
-// rangesToDownload returns the ranges of req not covered by cached ranges, in order, each
-// joined with the one before it when that ends where it starts, or Across bytes before it
-// starts and the bytes between are not all cached.
+// rangesToDownload returns the ranges of req not covered by cached ranges. When more of
+// them remain than a prefetch can read at once now, they are in order, each joined with the one
+// before it when that ends where it starts, and, when still more remain, also when that
+// ends Across bytes before it starts and the bytes between are not all cached.
 func (s *S3FS) rangesToDownload(req ObjectPrefetch) []PrefetchRange {
 	var key string
 	if path, err := parseFilePathAtService(req.FilePath, s.name); err == nil {
@@ -801,19 +802,34 @@ func (s *S3FS) rangesToDownload(req ObjectPrefetch) []PrefetchRange {
 		}
 		out = append(out, r)
 	}
-	slices.SortFunc(out, func(a, b PrefetchRange) int { return cmp.Compare(a.Offset, b.Offset) })
-	joined := out[:0]
-	for _, r := range out {
+	share := s.diskCache.prefetchReadsNow()
+	if len(out) > share {
+		slices.SortFunc(out, func(a, b PrefetchRange) int { return cmp.Compare(a.Offset, b.Offset) })
+		out = joinRanges(out, func(end int64, r PrefetchRange) bool { return end == r.Offset })
+	}
+	if len(out) > share {
+		out = joinRanges(out, func(end int64, r PrefetchRange) bool {
+			return r.Across > 0 && end == r.Offset-r.Across && !s.rangeCached(key, end, r.Across)
+		})
+	}
+	for i := range out {
+		out[i].Across = 0
+	}
+	return out
+}
+
+// joinRanges joins each of ranges, in order, with the one before it when join reports so
+// for the end of that one, keeping the Across of the first range of each join.
+func joinRanges(ranges []PrefetchRange, join func(end int64, r PrefetchRange) bool) []PrefetchRange {
+	joined := ranges[:0]
+	for _, r := range ranges {
 		if n := len(joined); n > 0 {
 			last := &joined[n-1]
-			end := last.Offset + last.Size
-			if end == r.Offset || r.Across > 0 && end == r.Offset-r.Across && !s.rangeCached(key, end, r.Across) {
+			if join(last.Offset+last.Size, r) {
 				last.Size = r.Offset + r.Size - last.Offset
-				last.Across = 0
 				continue
 			}
 		}
-		r.Across = 0
 		joined = append(joined, r)
 	}
 	return joined

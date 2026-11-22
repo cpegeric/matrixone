@@ -728,6 +728,16 @@ func (d *DiskCache) prefetchShare() int {
 	return max(int(d.conns.max)/d.prefetchWorkers(), 1)
 }
 
+// prefetchReadsNow is the most reads of one prefetch that can be under way at once now:
+// prefetchShare, or the connections downloads do not hold when fewer; at least 1.
+func (d *DiskCache) prefetchReadsNow() int {
+	share := d.prefetchShare()
+	if d.conns.max < 1 {
+		return share
+	}
+	return max(min(share, int(d.conns.max-d.conns.held.Load())), 1)
+}
+
 // prefetchShareUnbounded is prefetchShare when downloads hold no connection.
 const prefetchShareUnbounded = 4
 
