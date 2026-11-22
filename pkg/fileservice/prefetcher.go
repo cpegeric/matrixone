@@ -50,6 +50,9 @@ type ObjectPrefetch struct {
 type PrefetchRange struct {
 	Offset int64
 	Size   int64
+	// Across is the bytes before Offset a download may read with the range that ends
+	// there, 0 for none.
+	Across int64
 }
 
 // PrefetchScan is the read prefetches are for. A nil PrefetchScan never ends.
@@ -771,8 +774,19 @@ func (s *S3FS) prefetchRanges(ctx context.Context, req ObjectPrefetch) {
 	metric.FSPrefetchDownloadedCounter.Inc()
 }
 
-// rangesToDownload returns the ranges of req not covered by cached ranges, in order, with
-// adjacent ones joined.
+// rangeCached reports whether cached ranges of the object with key hold size bytes at
+// offset.
+func (s *S3FS) rangeCached(key string, offset, size int64) bool {
+	if key == "" {
+		return false
+	}
+	_, ok := s.diskCache.ranges.covering(key, offset, size)
+	return ok
+}
+
+// rangesToDownload returns the ranges of req not covered by cached ranges, in order, each
+// joined with the one before it when that ends where it starts, or Across bytes before it
+// starts and the bytes between are not all cached.
 func (s *S3FS) rangesToDownload(req ObjectPrefetch) []PrefetchRange {
 	var key string
 	if path, err := parseFilePathAtService(req.FilePath, s.name); err == nil {
@@ -790,10 +804,16 @@ func (s *S3FS) rangesToDownload(req ObjectPrefetch) []PrefetchRange {
 	slices.SortFunc(out, func(a, b PrefetchRange) int { return cmp.Compare(a.Offset, b.Offset) })
 	joined := out[:0]
 	for _, r := range out {
-		if n := len(joined); n > 0 && joined[n-1].Offset+joined[n-1].Size == r.Offset {
-			joined[n-1].Size += r.Size
-			continue
+		if n := len(joined); n > 0 {
+			last := &joined[n-1]
+			end := last.Offset + last.Size
+			if end == r.Offset || r.Across > 0 && end == r.Offset-r.Across && !s.rangeCached(key, end, r.Across) {
+				last.Size = r.Offset + r.Size - last.Offset
+				last.Across = 0
+				continue
+			}
 		}
+		r.Across = 0
 		joined = append(joined, r)
 	}
 	return joined

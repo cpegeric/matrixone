@@ -15,11 +15,14 @@
 package readutil
 
 import (
+	"cmp"
 	"context"
 	"math"
+	"slices"
 	"sync/atomic"
 	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
@@ -124,8 +127,11 @@ func (p *ScanPrefetch) PrefetchColumns(
 }
 
 // ColumnRanges returns the ranges that hold the columns seqNums across all the blocks of
-// the object of blk, and their bytes in all. It returns false when the object stores a
-// column of seqNums without recording its range.
+// the object of blk, and their bytes in all. A range may be read with the range that
+// ends where the column before it starts, across that column, when none of the three
+// columns is big and the column between holds at most the bytes of the smaller of the
+// two. It returns false when the object stores a column of seqNums without recording
+// its range.
 func ColumnRanges(
 	ctx context.Context, fs fileservice.FileService, blk *objectio.BlockInfo, seqNums []uint16,
 ) ([]fileservice.PrefetchRange, int64, bool, error) {
@@ -135,6 +141,33 @@ func ColumnRanges(
 		return nil, 0, false, err
 	}
 	data := meta.MustDataMeta()
+	var first objectio.BlockObject
+	if data.BlockCount() > 0 {
+		first = data.GetBlockMeta(0)
+	}
+	var cols []columnExtent
+	for seq := uint16(0); seq <= data.BlockHeader().MaxSeqnum(); seq++ {
+		ext := data.MustGetColumn(seq).Location()
+		if ext.Length() == 0 {
+			continue
+		}
+		big := true
+		if first != nil && seq < first.BlockHeader().MetaColumnCount() {
+			big = bigColumn(types.T(first.ColumnMeta(seq).DataType()))
+		}
+		cols = append(cols, columnExtent{seq: seq, offset: int64(ext.Offset()), size: int64(ext.Length()), big: big})
+	}
+	slices.SortFunc(cols, func(a, b columnExtent) int { return cmp.Compare(a.offset, b.offset) })
+	across := make(map[uint16]int64, len(cols))
+	for i := 2; i < len(cols); i++ {
+		a, gap, b := cols[i-2], cols[i-1], cols[i]
+		if a.big || gap.big || b.big {
+			continue
+		}
+		if n := b.offset - (a.offset + a.size); n > 0 && n <= min(a.size, b.size) {
+			across[b.seq] = n
+		}
+	}
 	var ranges []fileservice.PrefetchRange
 	var bytes int64
 	recorded := true
@@ -147,8 +180,21 @@ func ColumnRanges(
 			recorded = false
 			continue
 		}
-		ranges = append(ranges, fileservice.PrefetchRange{Offset: int64(ext.Offset()), Size: int64(ext.Length())})
+		ranges = append(ranges, fileservice.PrefetchRange{Offset: int64(ext.Offset()), Size: int64(ext.Length()), Across: across[seq]})
 		bytes += int64(ext.Length())
 	}
 	return ranges, bytes, recorded, nil
+}
+
+// columnExtent is where the column seq of an object lies, and whether it is big.
+type columnExtent struct {
+	seq          uint16
+	offset, size int64
+	big          bool
+}
+
+// bigColumn reports whether a column of type t is not read across: a vector, blob, text
+// or json.
+func bigColumn(t types.T) bool {
+	return t.IsArray() || t == types.T_blob || t == types.T_text || t == types.T_json
 }

@@ -155,6 +155,43 @@ func TestS3FSPrefetchRangesJoinsAdjacent(t *testing.T) {
 	require.Equal(t, int64(180), storage.bytes.Load())
 }
 
+// The ranges not cached are read across the Across bytes before a range when the range
+// before them ends there and those bytes are not all cached; cached ranges are dropped
+// first, so a range is never read again for its neighbor.
+func TestS3FSPrefetchRangesReadAcrossMissed(t *testing.T) {
+	a, b := PrefetchRange{Offset: 1000, Size: 100}, PrefetchRange{Offset: 1100, Size: 50}
+	c := PrefetchRange{Offset: 1150, Size: 100, Across: 50}
+	d, e := PrefetchRange{Offset: 1250, Size: 50}, PrefetchRange{Offset: 1300, Size: 100, Across: 50}
+	for _, tc := range []struct {
+		name         string
+		cached, read []PrefetchRange
+		reads, bytes int64
+	}{
+		{"a and b cached reads only c", []PrefetchRange{a, b}, []PrefetchRange{a, c}, 1, 100},
+		{"nothing cached reads a to c in one read", nil, []PrefetchRange{a, c}, 1, 250},
+		{"the bytes between cached reads a and c apart", []PrefetchRange{b}, []PrefetchRange{a, c}, 2, 200},
+		{"a cached range between ends the read across", []PrefetchRange{c}, []PrefetchRange{a, c, e}, 2, 200},
+		{"adjacent ranges are read as one", nil, []PrefetchRange{a, b, c, d, e}, 1, 400},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, storage, data := newPrefetchRangeFS(t, 256<<10, 300<<10)
+			ctx := context.Background()
+			if tc.cached != nil {
+				fs.prefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: 1, Ranges: tc.cached})
+			}
+			reads, bytes := storage.reads.Load(), storage.bytes.Load()
+			fs.prefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: 1, Ranges: tc.read})
+			require.Equal(t, tc.reads, storage.reads.Load()-reads)
+			require.Equal(t, tc.bytes, storage.bytes.Load()-bytes)
+			reads = storage.reads.Load()
+			for _, r := range tc.read {
+				require.Equal(t, data[r.Offset:r.Offset+r.Size], readRangeOf(t, fs, ColumnPrefetch, r.Offset, r.Size))
+			}
+			require.Equal(t, reads, storage.reads.Load(), "the ranges are served from the cache")
+		})
+	}
+}
+
 // A download at a size other than the object's caches nothing.
 func TestS3FSPrefetchObjectOfWrongSizeCachesNothing(t *testing.T) {
 	for _, delta := range []int{-1000, 1000} {

@@ -322,10 +322,16 @@ way each time.
 - An object stores its data column by column: the chunks of one column for every block
   lie one after another, whatever the column's type, and the object's metadata records
   where that run starts and how long it is. Each column is one range per object.
-- A request keeps one range per column. Its download skips the columns already cached
+- A request keeps one range per column. Its download skips the ranges already cached
   and reads the others that lie next to each other, as consecutive columns of an object
-  do, in one read; each read is cached as it is, so later reads of the columns in any
-  block of the object are served from the disk cache, as from a whole object.
+  do, in one read; it also reads two of them with one column between them in one read,
+  with that column, when none of the three is a vector, blob, text or json, the column
+  between holds at most the bytes of the smaller of the two and is not cached; columns
+  are taken in their order in the object (decision 2026-11-21: a scan of every other
+  column of a wide table made one read per column, and joining columns before the cache
+  is looked up read cached columns again). Each read is cached as it is, so later reads
+  of the columns in any block of the object are served from the disk cache, as from a
+  whole object.
 - A request of ranges is skipped while cached ranges cover them or the whole object is
   cached or downloading. Requests of ranges for one object add up, and a request of the
   whole object takes over a queued request of ranges.
