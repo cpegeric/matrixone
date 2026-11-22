@@ -158,7 +158,6 @@ func (v *Vector) InstallBorrowedView(source *Vector, mp *mpool.MPool) error {
 		*v = Vector{typ: oldType, offHeap: oldOffHeap}
 		return err
 	}
-	source.CopyExpressionMetadataTo(v)
 	return nil
 }
 
@@ -174,7 +173,7 @@ func (v *Vector) PrepareDataForInplaceMutation(mp *mpool.MPool) error {
 		v.cantFreeData = false
 		return nil
 	}
-	data, err := v.allocData(mp, len(v.data))
+	data, err := mp.Alloc(len(v.data), v.offHeap)
 	if err != nil {
 		return err
 	}
@@ -220,7 +219,6 @@ func (v *Vector) MaterializeOwned(mp *mpool.MPool) error {
 	if err != nil {
 		return err
 	}
-	v.CopyExpressionMetadataTo(owned)
 	old := *v
 	*v = *owned
 	old.Free(mp)
@@ -242,7 +240,7 @@ func (v *Vector) WindowCopyingOwnedParts(start, end int, mp *mpool.MPool) (*Vect
 	}
 	view.offHeap = true
 	if !v.cantFreeData && len(view.data) > 0 {
-		owned, allocErr := view.allocOwned(mp, len(view.data), true, true)
+		owned, allocErr := mp.Alloc(len(view.data), true)
 		if allocErr != nil {
 			view.Free(mp)
 			return nil, allocErr
@@ -252,7 +250,7 @@ func (v *Vector) WindowCopyingOwnedParts(start, end int, mp *mpool.MPool) (*Vect
 		view.cantFreeData = false
 	}
 	if !v.cantFreeArea && len(view.area) > 0 {
-		owned, allocErr := view.allocOwned(mp, len(view.area), true, false)
+		owned, allocErr := mp.Alloc(len(view.area), true)
 		if allocErr != nil {
 			view.Free(mp)
 			return nil, allocErr
