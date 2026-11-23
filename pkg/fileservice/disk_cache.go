@@ -646,6 +646,7 @@ func (d *DiskCache) Read(
 		// try a cached range that contains the entry; rangeOffset is where the entry
 		// starts in it
 		var rangeOffset int64
+		fromRange := false
 		for tried := []string(nil); !openedOK; {
 			r, ok := d.ranges.containing(objectKey(), entry.Offset, entry.Size, tried)
 			if !ok {
@@ -663,7 +664,7 @@ func (d *DiskCache) Read(
 			if newlyOpened {
 				numOpenIOEntry++
 			}
-			diskPath, opened, openedOK = r.diskPath, f, true
+			diskPath, opened, openedOK, fromRange = r.diskPath, f, true, true
 			rangeOffset = entry.Offset - r.offset
 		}
 
@@ -691,7 +692,15 @@ func (d *DiskCache) Read(
 					pos = next
 				}
 				if readers != nil {
-					if err := entry.readFrom(ctx, io.MultiReader(readers...), d.cacheDataAllocator); err != nil {
+					from := &sourceErrReader{Reader: io.MultiReader(readers...)}
+					if err := entry.readFrom(ctx, from, d.cacheDataAllocator); err != nil {
+						if from.err != nil {
+							for _, r := range rs {
+								d.paths.close(r.diskPath, openedFiles[r.diskPath])
+								delete(openedFiles, r.diskPath)
+								d.dropCachedRange(ctx, r.diskPath)
+							}
+						}
 						return err
 					}
 					for _, r := range rs {
@@ -735,7 +744,13 @@ func (d *DiskCache) Read(
 			d.preloads.read(diskPath, entry.Size)
 		}
 		// Reads of a file kept open share it, so each reads at its own offset.
-		if err := entry.readFrom(ctx, io.NewSectionReader(file, readOffset, readSize), d.cacheDataAllocator); err != nil {
+		from := &sourceErrReader{Reader: io.NewSectionReader(file, readOffset, readSize)}
+		if err := entry.readFrom(ctx, from, d.cacheDataAllocator); err != nil {
+			if from.err != nil && fromRange {
+				d.paths.close(diskPath, opened)
+				delete(openedFiles, diskPath)
+				d.dropCachedRange(ctx, diskPath)
+			}
 			return err
 		}
 		fadviseDontNeed(file, readOffset, readSize)
@@ -1019,6 +1034,8 @@ func (d *DiskCache) writeFileTo(
 		var deleted func() bool
 		if whole != nil {
 			deleted = func() bool { return d.deletes.since(diskPath, *whole.needs.deletes) }
+		} else if t, ok := target.(entryFillTarget); ok {
+			deleted = t.deletedSinceRead
 		}
 		if !d.reserveAsyncFileFinalize(ctx, diskPath, deleted) {
 			return false, nil
