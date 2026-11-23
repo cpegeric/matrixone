@@ -46,7 +46,7 @@ func TestMetaCacheHitTouchesEntry(t *testing.T) {
 	t.Cleanup(func() { base.Close(ctx) })
 	mp := mpool.MustNewZero()
 	bat := batch.NewWithSize(1)
-	bat.Vecs[0] = vector.NewVec(types.T_int64.ToType())
+	bat.Vecs[0] = vector.NewVec(types.T_int64.ToType(), mp)
 	t.Cleanup(func() { bat.Clean(mp); mpool.DeleteMPool(mp) })
 	require.NoError(t, vector.AppendFixed(bat.Vecs[0], int64(42), false, mp))
 	bat.SetRowCount(1)
