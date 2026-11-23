@@ -44,7 +44,7 @@ func writeTypedObject(t *testing.T, fs fileservice.FileService, colTypes []types
 	for range 2 {
 		bat := batch.NewWithSize(len(colTypes))
 		for p, typ := range colTypes {
-			v := vector.NewVec(typ.ToType())
+			v := vector.NewVec(typ.ToType(), mp)
 			for range rows {
 				switch typ {
 				case types.T_int64:
