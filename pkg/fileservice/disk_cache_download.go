@@ -50,6 +50,7 @@ type objectDownload struct {
 	served      int64         // bytes readers took from the download before credited
 	credited    bool          // the cached file counts the bytes readers take
 	credit      func(n int64) // counts n bytes read toward the published file
+	indexFile   bool          // publishes into the index-file cache
 }
 
 // downloadPart is a range of the object a download writes from its start.
@@ -572,13 +573,11 @@ type objectLayout func(context.Context) (size, splitAt int64, err error)
 
 // bounds returns the 64KiB-aligned bounds of the parts the download of an object of size
 // bytes reads at once, or nil to read it as one range. With splitAt inside the object, a
-// part starts there, so the bytes a read needs from there come first.
+// part starts there, in place of the inner bound nearest to it, so the bytes a read needs
+// from there come first.
 func (c objectSplitConfig) bounds(size, splitAt int64) []int64 {
 	if c.parts <= 1 || size < c.min {
 		return nil
-	}
-	if at := splitAt / prefetchBlockMax * prefetchBlockMax; at > 0 && at < size {
-		return []int64{0, at, size}
 	}
 	part := (size + int64(c.parts) - 1) / int64(c.parts)
 	part = (part + prefetchBlockMax - 1) / prefetchBlockMax * prefetchBlockMax
@@ -586,7 +585,22 @@ func (c objectSplitConfig) bounds(size, splitAt int64) []int64 {
 	for pos := part; pos < size; pos += part {
 		bounds = append(bounds, pos)
 	}
-	return append(bounds, size)
+	bounds = append(bounds, size)
+	at := splitAt / prefetchBlockMax * prefetchBlockMax
+	if at <= 0 || at >= size {
+		return bounds
+	}
+	i, found := slices.BinarySearch(bounds, at)
+	switch {
+	case found:
+	case len(bounds) == 2:
+		bounds = []int64{0, at, size}
+	case i == len(bounds)-1 || (i > 1 && at-bounds[i-1] <= bounds[i]-at):
+		bounds[i-1] = at
+	default:
+		bounds[i] = at
+	}
+	return bounds
 }
 
 // rangeOpener opens the bytes [start, end) of an object, or the bytes from start on when
@@ -742,8 +756,9 @@ func (s *diskCacheDownloads) load(diskPath string) *objectDownload {
 	return nil
 }
 
-func (d *DiskCache) startDownload(diskPath, tempPath string, measured bool, bounds []int64) *objectDownload {
+func (d *DiskCache) startDownload(diskPath, tempPath string, measured, indexFile bool, bounds []int64) *objectDownload {
 	o := newObjectDownload(tempPath, measured, bounds)
+	o.indexFile = indexFile
 	o.credit = func(n int64) { d.preloads.readDownload(diskPath, o, n) }
 	d.downloads.store(diskPath, o)
 	return o
