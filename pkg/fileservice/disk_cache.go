@@ -201,7 +201,11 @@ func newDiskCache(
 			return n
 		}
 		// fallback
-		return max(capacity()-ret.trash.bytes.Load(), 0)
+		c := max(capacity()-ret.trash.bytes.Load(), 0)
+		if l := ret.trash.limit.Load(); l >= 0 {
+			c = min(c, l)
+		}
+		return c
 	}
 
 	ret = &DiskCache{
@@ -219,6 +223,7 @@ func newDiskCache(
 		preloads:             newPreloadUsage(),
 		conns:                connPool{max: int64(maxConnsPerHost / 2)},
 	}
+	ret.trash.limit.Store(-1)
 
 	postSet := func(_ context.Context, path string, _ struct{}, size int64, _ uint64) {
 		o := ret.download(path)
@@ -389,6 +394,10 @@ func (d *DiskCache) loadCache(ctx context.Context) {
 					}
 					if work.Dir {
 						size, err := cacheDirSize(work.Path)
+						if os.IsPermission(err) {
+							d.removeUnlistedDir(ctx, work.Path)
+							continue
+						}
 						if err != nil {
 							continue // ignore
 						}
@@ -396,6 +405,7 @@ func (d *DiskCache) loadCache(ctx context.Context) {
 						if err != nil {
 							continue // ignore
 						}
+						d.loadingDir(work.Path, size)
 						dirsMu.Lock()
 						dirs = append(dirs, loadedDir{path: work.Path, size: size, lastUse: info.ModTime()})
 						dirsMu.Unlock()
@@ -491,6 +501,7 @@ func (d *DiskCache) loadCache(ctx context.Context) {
 	if len(dirs) > 0 {
 		d.indexLoadedDirs(ctx, dirs)
 	}
+	d.loadingDir("", 0)
 
 	logutil.Info("disk cache info loaded",
 		zap.Any("all files", numFiles),

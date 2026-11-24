@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	iofs "io/fs"
 	"os"
@@ -53,6 +54,10 @@ func newIndexObjectFS(t *testing.T, indexCache bool) (*S3FS, *readCountingStorag
 	fs, err := NewS3FS(ctx, ObjectStorageArguments{Name: defines.SharedFileServiceName, Endpoint: "disk", Bucket: t.TempDir()}, config, nil, false, false)
 	require.NoError(t, err)
 	fs.SetAsyncUpdate(false)
+	<-fs.diskCache.load.done
+	if fs.indexFileCache != nil {
+		<-fs.indexFileCache.disk.load.done
+	}
 	// The disk cache caches exactly the entries read, so a read it serves is told apart.
 	fs.diskCache.prefetchRange = prefetchRangeConfig{}
 	t.Cleanup(func() { fs.Close(ctx) })
@@ -636,6 +641,136 @@ func TestIndexFileCacheTrashChargedAfterRestart(t *testing.T) {
 	}
 }
 
+// Trash of bytes a removal cannot measure counts against the capacity after a restart:
+// with the bytes the load measured when the entry is removed while the cache loads, or,
+// when its bytes are unknown, by holding the cache at what it used, until it is removed.
+func TestIndexFileCacheTrashOfUnknownSize(t *testing.T) {
+	for _, by := range []string{"deleted while loading", "old trash", "unlistable entry", "control"} {
+		t.Run(by, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			data := bytes.Repeat([]byte{7}, 300<<10)
+			capacity := int64(64 << 20)
+			put := func(c *IndexFileCache, name string) {
+				t.Helper()
+				written, err := c.Put(ctx, name, []IndexCacheFile{{Name: "data",
+					Open: func(context.Context) (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(data)), nil }}})
+				require.NoError(t, err)
+				require.True(t, written)
+			}
+			restart := func() *IndexFileCache {
+				c, err := newIndexFileCache(ctx, dir, fscache.ConstCapacity(capacity), "", "", 0, 0, 0)
+				require.NoError(t, err)
+				<-c.disk.load.done
+				return c
+			}
+			earlier, err := newIndexFileCache(ctx, t.TempDir(), fscache.ConstCapacity(capacity), "", "", 0, 0, 0)
+			require.NoError(t, err)
+			<-earlier.disk.load.done
+			c2 := restart()
+			var diskPath string
+			var size int64
+			for _, name := range []string{"kept", "entry"} {
+				put(earlier, name)
+				from, err := earlier.disk.pathForDir(name)
+				require.NoError(t, err)
+				if name == "entry" {
+					size, _ = earlier.disk.cache.Size(from)
+					require.Positive(t, size)
+				}
+				to, err := c2.disk.pathForDir(name)
+				require.NoError(t, err)
+				require.NoError(t, os.MkdirAll(filepath.Dir(to), 0o755))
+				require.NoError(t, os.Rename(from, to))
+				diskPath = to
+			}
+			earlier.Close(ctx)
+			trashDirs := func() []string {
+				m, err := filepath.Glob(diskPath + ".*" + cacheDirTrashSuffix)
+				require.NoError(t, err)
+				return m
+			}
+			t.Cleanup(func() {
+				for _, m := range append(trashDirs(), diskPath) {
+					_ = os.Chmod(m, 0o755)
+				}
+			})
+			switch by {
+			case "deleted while loading":
+				c2.disk.hooks.beforeIndexLoadedDirs = func() {
+					require.NoError(t, os.Chmod(diskPath, 0))
+					require.NoError(t, c2.Delete(ctx, "entry"))
+				}
+				c2.disk.loadCache(ctx)
+				c2.disk.hooks.beforeIndexLoadedDirs = nil
+			case "old trash":
+				require.NoError(t, os.Rename(diskPath, fmt.Sprintf("%s.%d-%d%s", diskPath, 1, 1, cacheDirTrashSuffix)))
+				require.NoError(t, os.Chmod(trashDirs()[0], 0))
+			case "unlistable entry":
+				require.NoError(t, os.Chmod(diskPath, 0))
+			}
+			c2.Close(ctx)
+			if by != "control" {
+				if _, err := os.ReadDir(append(trashDirs(), diskPath)[0]); err == nil {
+					t.Skip("permissions are not enforced")
+				}
+			}
+			c := restart()
+			defer c.Close(ctx)
+			used := c.disk.cache.Used()
+			if by == "control" {
+				require.Equal(t, capacity, c.disk.capacityFunc())
+				return
+			}
+			require.Len(t, trashDirs(), 1)
+			_, err = os.Stat(diskPath)
+			require.True(t, os.IsNotExist(err))
+			if by == "deleted while loading" {
+				require.Equal(t, size, c.disk.trash.bytes.Load())
+				require.Equal(t, capacity-size, c.disk.capacityFunc())
+			} else {
+				require.Zero(t, c.disk.trash.bytes.Load())
+				require.Equal(t, used, c.disk.capacityFunc(), "the cache is held at what it used")
+			}
+			require.NoError(t, os.Chmod(trashDirs()[0], 0o755))
+			c.disk.retryTrash()
+			require.Empty(t, trashDirs())
+			require.Zero(t, c.disk.trash.bytes.Load())
+			require.Equal(t, capacity, c.disk.capacityFunc())
+		})
+	}
+}
+
+// A read that finds its entry missing a file repairs it although the load indexed the
+// entry meanwhile: indexing changes no file of it.
+func TestIndexObjectRepairOutlivesLoadIndexing(t *testing.T) {
+	for _, indexed := range []bool{true, false} {
+		t.Run(map[bool]string{true: "indexed", false: "control"}[indexed], func(t *testing.T) {
+			ctx := context.Background()
+			fs, storage, data := newIndexObjectFS(t, true)
+			<-fs.indexFileCache.disk.load.done
+			cacheIndexObject(t, fs, "object", data)
+			diskPath, ok := fs.indexObjectCached("object")
+			require.True(t, ok)
+			require.NoError(t, os.Remove(filepath.Join(diskPath, IndexObjectFile)))
+			name := IndexObjectEntry("object")
+			_, read, err := fs.indexFileCache.openEntryFile(ctx, name, IndexObjectFile)
+			require.Error(t, err)
+			if indexed {
+				fs.indexFileCache.disk.indexLoadedDirs(ctx, []loadedDir{{path: diskPath}})
+			}
+			fs.indexFileCache.dropUnopened(ctx, name, IndexObjectFile, read)
+			read.done()
+			_, cached := fs.indexObjectCached("object")
+			require.False(t, cached, "the broken entry is dropped")
+			storage.reads.Store(0)
+			require.Equal(t, data[2000:2010], readIndexObjectRange(t, fs, IndexFileObject, 2000, 10))
+			require.Equal(t, data[len(data)-10:], readIndexObjectRange(t, fs, IndexFileObject, int64(len(data)-10), 10))
+			require.Equal(t, int64(1), storage.reads.Load(), "the read filled the entry again")
+		})
+	}
+}
+
 // A read whose open of a broken entry fails repairs only the entry it read: a
 // replacement published before its repair, by a read or by another cache instance on the
 // directory, is kept, also when the read could not open the entry.
@@ -669,6 +804,9 @@ func TestIndexObjectStaleOpenRepairKeepsReplacement(t *testing.T) {
 			_, read, err := fs.indexFileCache.openEntryFile(context.Background(), name, IndexObjectFile)
 			require.Error(t, err)
 			require.NotNil(t, read)
+			if by == "unopenable" {
+				require.NoError(t, os.Chmod(diskPath, 0o755))
+			}
 			switch by {
 			case "read":
 				storage.reads.Store(0)
