@@ -110,21 +110,23 @@ func (d *DiskCache) rangeObjectKey(filePath string) string {
 
 // parseRangeFile returns the object key, offset and size of the range file at diskPath
 // under the cache directory root, in either layer. The size digits run into the object
-// name, so the size is the prefix of them that equals the file's length. Only files in
-// the shard directory of their object are range files of objects whose paths have no
-// separator, the only ones indexed. A file of the meta layer has the key of its object.
+// path, so the size is the prefix of them that equals the file's length. A file of the
+// meta layer has the key of its object.
 func parseRangeFile(root, diskPath string, length int64) (key string, offset, size int64, ok bool) {
-	dir, name := filepath.Split(diskPath)
-	root = filepath.Clean(root)
-	if parent := filepath.Dir(filepath.Clean(dir)); !strings.HasSuffix(name, cacheFileSuffix) ||
-		parent != root && parent != filepath.Join(root, metaCacheDir) {
+	rel, err := filepath.Rel(root, diskPath)
+	if err != nil {
+		return "", 0, 0, false
+	}
+	rel = strings.TrimPrefix(rel, metaCacheDir+string(filepath.Separator))
+	shard, name, cut := strings.Cut(rel, string(filepath.Separator))
+	if !cut || !isDiskCacheShard(shard) || !strings.HasSuffix(name, cacheFileSuffix) {
 		return "", 0, 0, false
 	}
 	dash := strings.IndexByte(name, '-')
 	if dash <= 0 {
 		return "", 0, 0, false
 	}
-	offset, err := strconv.ParseInt(name[:dash], 10, 64)
+	offset, err = strconv.ParseInt(name[:dash], 10, 64)
 	if err != nil {
 		return "", 0, 0, false
 	}
@@ -135,16 +137,29 @@ func parseRangeFile(root, diskPath string, length int64) (key string, offset, si
 			break
 		}
 		object := strings.TrimSuffix(digits[i:], cacheFileSuffix)
-		if size == length && object != "" && diskCacheShard(fromOSPath(object)) == filepath.Base(dir) {
-			return filepath.Join(root, filepath.Base(dir), digits[i:]), offset, size, true
+		if size == length && object != "" && diskCacheShard(fromOSPath(object)) == shard {
+			return filepath.Join(root, shard, digits[i:]), offset, size, true
 		}
 	}
 	return "", 0, 0, false
 }
 
+// fullPathOfRangeKey returns the whole-object file of the object whose range files have
+// key under the cache directory root.
+func fullPathOfRangeKey(root, key string) string {
+	rel, _ := filepath.Rel(root, key)
+	shard, name, _ := strings.Cut(rel, string(filepath.Separator))
+	return filepath.Join(root, shard, "full"+name)
+}
+
 // add indexes the range file at diskPath under root, if it is one.
 func (c *cachedRanges) add(root, diskPath string) {
-	if isFullFileCachePath(diskPath) || !strings.HasSuffix(diskPath, cacheFileSuffix) {
+	if !strings.HasSuffix(diskPath, cacheFileSuffix) {
+		return
+	}
+	if rel, err := filepath.Rel(root, diskPath); err != nil {
+		return
+	} else if _, name, _ := strings.Cut(rel, string(filepath.Separator)); name == "" || name[0] < '0' || name[0] > '9' {
 		return
 	}
 	info, err := os.Stat(diskPath)
