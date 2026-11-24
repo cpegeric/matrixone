@@ -193,7 +193,7 @@ func NewS3FS(
 		}
 		if fs.diskCache != nil {
 			if args.MaxConnsPerHost > 0 {
-				fs.diskCache.conns.max = max(int64(args.MaxConnsPerHost/2), int64(minDownloadConns))
+				fs.diskCache.conns.max = int64(connsPerHost(args.MaxConnsPerHost) / 2)
 			}
 			workers := fs.diskCache.prefetchWorkers()
 			fs.prefetcher = newPrefetcher(workers, fs.prefetchQueueLimit(), fs.haveObject, fs.prefetchObject)
@@ -1926,7 +1926,9 @@ func (r *fullObjectDiskCacheReader) capture(
 		if c.size >= 0 {
 			end = c.offset + c.size
 		}
-		written, ok := download.waitFor(ctx, c.offset, end, maxIOWaitDuration)
+		// The read that started the download waits for its own bytes as long as its context
+		// allows.
+		written, ok := download.waitFor(ctx, c.offset, end, 0)
 		if ok || download.isComplete() {
 			want := written - c.offset
 			if c.size >= 0 {
