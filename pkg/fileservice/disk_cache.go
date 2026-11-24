@@ -795,6 +795,11 @@ func (d *DiskCache) Read(
 				zap.Any("path", vector.FilePath),
 				zap.Any("entry", vector.Entries[i]),
 			)
+			// A process allocation failure is not a cache miss; falling back
+			// can immediately fail another allocation in the storage path.
+			if errors.Is(err, syscall.ENOMEM) {
+				return err
+			}
 		}
 	}
 
@@ -1069,6 +1074,7 @@ func (d *DiskCache) writeFileTo(
 	// before it holds the path; each later part takes its own when it starts. A range
 	// download holds the connection its FilePrefetchObject took.
 	var bounds []int64
+	lead := 0
 	releaseConns := func() {}
 	if fill == storageFill {
 		var ok bool
@@ -1080,6 +1086,7 @@ func (d *DiskCache) writeFileTo(
 		if objectSize != nil && d.objectSplit.parts > 1 && d.downloading() < cmp.Or(d.objectSplit.downloads, DefaultDiskPrefetchObjectSplitDownloads) {
 			if size, splitAt, err := objectSize(ctx); err == nil {
 				bounds = d.objectSplit.bounds(size, splitAt)
+				lead = leadPart(bounds, splitAt)
 			}
 		}
 	}
@@ -1113,8 +1120,8 @@ func (d *DiskCache) writeFileTo(
 	var dst io.Writer = f
 	if fill != notWholeFill {
 		download = d.startDownload(diskPath, f.Name(), fill != contentFill, bounds)
-		// Its first part holds the connection the download took.
-		download.begin(0)
+		// Its lead part holds the connection the download took.
+		download.begin(lead)
 		fileDownloadStarted(ctx, download)
 		downloadStarted(ctx)
 		dst = downloadProgressWriter{w: f, download: download}
@@ -1150,7 +1157,7 @@ func (d *DiskCache) writeFileTo(
 
 	var n int64
 	if l, ok := from.(*lazyObjectReader); ok && len(bounds) > 2 {
-		n, err = copyParts(ctx, f, download, l.openRange, bounds, d.conns.take, releaseConns)
+		n, err = copyParts(ctx, f, download, l.openRange, bounds, lead, d.conns.take, releaseConns)
 	} else {
 		var buf []byte
 		put := ioBufferPool.Get(&buf)
