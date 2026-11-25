@@ -25,6 +25,33 @@ const (
 	maxMinimalRangeReadAmplification = int64(8)
 )
 
+// streams reports whether the entry writes its bytes to its caller.
+func (e *IOEntry) streams() bool {
+	return e.WriterForRead != nil || e.ReadCloserForRead != nil
+}
+
+// ranged reports whether the entry is not done and reads a known positive size.
+func (e *IOEntry) ranged() bool {
+	return !e.done && e.Size > 0
+}
+
+// materializes reports whether the entry may take its bytes from a shared source that
+// hands them over once all arrived: one that does not stream them to its caller, or
+// streams at most max bytes. A larger or read-to-end streamed entry opens its own reader.
+func (e *IOEntry) materializes(max int64) bool {
+	return !e.streams() || e.Size > 0 && e.Size <= max
+}
+
+// materializes reports whether every entry not done materializes under max.
+func (i *IOVector) materializes(max int64) bool {
+	for j := range i.Entries {
+		if e := &i.Entries[j]; !e.done && !e.materializes(max) {
+			return false
+		}
+	}
+	return true
+}
+
 func (i *IOVector) allDone() bool {
 	for _, entry := range i.Entries {
 		if !entry.done {
@@ -87,7 +114,7 @@ func (i *IOVector) ReleaseReadResultOnError() {
 func (i *IOVector) ReleaseReadBuffers() {
 	for idx := range i.Entries {
 		e := &i.Entries[idx]
-		if e.CachedData == nil || e.ToCacheData == nil || e.WriterForRead != nil || e.ReadCloserForRead != nil {
+		if e.CachedData == nil || e.ToCacheData == nil || e.streams() {
 			continue
 		}
 		if e.releaseData != nil {
@@ -99,7 +126,7 @@ func (i *IOVector) ReleaseReadBuffers() {
 }
 
 func (i *IOVector) readRange() (min *int64, max *int64, readFull bool) {
-	readFull = i.Policy.CacheFullFile() &&
+	readFull = i.Policy.wholeRead() &&
 		!i.Policy.Any(SkipDiskCache)
 
 	if readFull {
@@ -215,7 +242,8 @@ func (i *IOVector) shouldSplitSparseRead(min, max *int64) bool {
 		if entry.done {
 			continue
 		}
-		if misses == 4 || entry.WriterForRead != nil || entry.ReadCloserForRead != nil ||
+		if misses == 4 || entry.streams() ||
+
 			(misses > 0 && entry.Offset < previousOffset) {
 			return false
 		}

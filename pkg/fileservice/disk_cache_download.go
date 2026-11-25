@@ -15,8 +15,10 @@
 package fileservice
 
 import (
+	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -117,6 +119,17 @@ func (o *objectDownload) acquire() (*os.File, bool) {
 	}
 	o.readers++
 	return o.file, true
+}
+
+// with calls fn with the download's file while it holds it, reporting false once the
+// file is closed.
+func (o *objectDownload) with(fn func(*os.File) error) (bool, error) {
+	f, ok := o.acquire()
+	if !ok {
+		return false, nil
+	}
+	defer o.release()
+	return true, fn(f)
 }
 
 // hold holds the download as a reader, as acquire does, without taking its file.
@@ -295,12 +308,27 @@ func (o *objectDownload) endWith(complete bool, err error) {
 	o.mu.Unlock()
 }
 
-// joinedReadError is the failed read of object storage by a download a read of the disk
-// cache joined: unlike an error of the cache itself, it fails the read, with err.
-type joinedReadError struct{ err error }
+// failingReadError is an error of a read of the disk cache that, unlike an error of the
+// cache itself, fails the read, with err: the failed read of object storage by a download
+// it joined, or an error of its entry.
+type failingReadError struct{ err error }
 
-func (e *joinedReadError) Error() string { return e.err.Error() }
-func (e *joinedReadError) Unwrap() error { return e.err }
+func (e *failingReadError) Error() string { return e.err.Error() }
+func (e *failingReadError) Unwrap() error { return e.err }
+
+// readEntryFrom fills entry from r, read from a cache file. It returns the error of r,
+// which leaves the read to take the bytes elsewhere, with err, or a failingReadError of
+// the entry's own error.
+func (d *DiskCache) readEntryFrom(ctx context.Context, entry *IOEntry, r io.Reader) (local, err error) {
+	from := &sourceErrReader{Reader: r}
+	if err := entry.readFrom(ctx, from, d.cacheDataAllocator); err != nil {
+		if from.err != nil {
+			return err, err
+		}
+		return nil, &failingReadError{err: err}
+	}
+	return nil, nil
+}
 
 // objectReadError returns err as a read of the object at filePath of its own reports it:
 // a short object is an unexpected end of the file.
@@ -309,6 +337,36 @@ func objectReadError(err error, filePath string) error {
 		return moerr.NewUnexpectedEOFNoCtx(filePath)
 	}
 	return err
+}
+
+// errOrigin is where an error a read gets from a source of its bytes comes from.
+type errOrigin int
+
+const (
+	// fromSource is an error of a shared source of the bytes, or of object storage.
+	fromSource errOrigin = iota
+	// fromLocalCache is an error of a cache file.
+	fromLocalCache
+	// fromConsumer is an error of the read's entry: its decode, allocation or writer.
+	fromConsumer
+)
+
+// readFailure returns the error that fails a read of the object at filePath for err from
+// origin, or nil when the read takes its bytes elsewhere.
+func readFailure(ctx context.Context, filePath string, origin errOrigin, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	switch {
+	case origin == fromConsumer:
+		return err
+	case origin == fromLocalCache, errors.Is(err, errPrefetchMissed), errors.Is(err, errPrefetchClosed), errors.Is(err, errPrefetchDeleted):
+		return nil
+	}
+	return objectReadError(err, filePath)
 }
 
 // failure returns the failed read of object storage that ended the download, or nil.
@@ -395,6 +453,9 @@ func (o *objectDownload) waitFor(ctx context.Context, off, end int64, timeout ti
 var sourceIdleTimeout = readWriteTimeout
 
 var errSourceIdle = moerr.NewInternalErrorNoCtx("fileservice: no bytes from the source within the idle timeout")
+
+// errSourceShort is the error of a source that ended before the range it was read for.
+var errSourceShort = fmt.Errorf("fileservice: source ended before its range: %w", io.ErrUnexpectedEOF)
 
 // idleReader reads r, which reads through ctx, and cancels ctx when a Read waits for
 // bytes past sourceIdleTimeout while it is not attached. While attached, a Read is
@@ -723,7 +784,7 @@ func copyPart(ctx context.Context, f *os.File, download *objectDownload, open ra
 		return err
 	}
 	if n != end-start {
-		return &diskCacheSourceError{err: io.ErrUnexpectedEOF}
+		return &diskCacheSourceError{err: errSourceShort}
 	}
 	return nil
 }
@@ -737,6 +798,27 @@ type diskCacheDownloads struct {
 func (s *diskCacheDownloads) store(diskPath string, o *objectDownload) {
 	if _, loaded := s.m.Swap(diskPath, o); !loaded {
 		s.n.Add(1)
+	}
+}
+
+// storeTaken registers o, which take counted.
+func (s *diskCacheDownloads) storeTaken(diskPath string, o *objectDownload) {
+	if _, loaded := s.m.Swap(diskPath, o); loaded {
+		s.n.Add(-1)
+	}
+}
+
+// take counts a download about to register while fewer than limit are counted, so a
+// decision bounded by the downloads in flight and the registration are one step.
+func (s *diskCacheDownloads) take(limit int64) bool {
+	for {
+		n := s.n.Load()
+		if n >= limit {
+			return false
+		}
+		if s.n.CompareAndSwap(n, n+1) {
+			return true
+		}
 	}
 }
 
@@ -756,11 +838,17 @@ func (s *diskCacheDownloads) load(diskPath string) *objectDownload {
 	return nil
 }
 
-func (d *DiskCache) startDownload(diskPath, tempPath string, measured, indexFile bool, bounds []int64) *objectDownload {
+// startDownload registers the download of a cache file; taken is set when
+// diskCacheDownloads.take counted it already.
+func (d *DiskCache) startDownload(diskPath, tempPath string, measured, indexFile bool, bounds []int64, taken bool) *objectDownload {
 	o := newObjectDownload(tempPath, measured, bounds)
 	o.indexFile = indexFile
 	o.credit = func(n int64) { d.preloads.readDownload(diskPath, o, n) }
-	d.downloads.store(diskPath, o)
+	if taken {
+		d.downloads.storeTaken(diskPath, o)
+	} else {
+		d.downloads.store(diskPath, o)
+	}
 	return o
 }
 
@@ -900,6 +988,13 @@ func (d *DiskCache) readFromDownload(ctx context.Context, diskPath string, entry
 			return false, false, nil
 		}
 	}
+	return d.readDownloadEntry(ctx, diskPath, o, base, whole, entry, vector)
+}
+
+// readDownloadEntry is readFromDownload of entry from o, whose bytes start at base in the
+// object, a whole-object download when whole is set.
+func (d *DiskCache) readDownloadEntry(ctx context.Context, diskPath string, o *objectDownload, base int64, whole bool, entry *IOEntry, vector *IOVector) (downloading, filled bool, err error) {
+	end := entry.Offset + entry.Size
 	behind, wait := o.estimate(entry.Offset-base, end-base)
 	if wait == 0 {
 		metric.FSDiskCacheDownloadReadWrittenCounter.Inc()
@@ -920,28 +1015,35 @@ func (d *DiskCache) readFromDownload(ctx context.Context, diskPath string, entry
 				return true, false, nil
 			}
 		}
-		// The read waits for the download it chose until its bytes are written or it ends.
-		if _, ok := o.waitFor(ctx, entry.Offset-base, end-base, maxIOWaitDuration); !ok {
-			if err := o.failure(); err != nil {
-				return true, false, &joinedReadError{err: objectReadError(err, vector.FilePath)}
+		// The read waits for the download it chose until its bytes are written or it ends:
+		// for a whole-object download at most the I/O wait bound, for the download of a
+		// FilePrefetchObject as long as its context allows.
+		timeout := time.Duration(0)
+		if whole {
+			timeout = maxIOWaitDuration
+		}
+		if _, ok := o.waitFor(ctx, entry.Offset-base, end-base, timeout); !ok {
+			if err := readFailure(ctx, vector.FilePath, fromSource, cmp.Or(ctx.Err(), o.failure())); err != nil {
+				return true, false, &failingReadError{err: err}
 			}
 			metric.FSDiskCacheDownloadReadTimedOutCounter.Inc()
 			return true, false, nil
 		}
 		metric.FSDiskCacheDownloadReadWaitedCounter.Inc()
 	}
-	f, ok := o.acquire()
-	if !ok {
+	held, err := o.with(func(f *os.File) error {
+		if _, err := d.readEntryFrom(ctx, entry, io.NewSectionReader(f, entry.Offset-base, entry.Size)); err != nil {
+			return err
+		}
+		// Only bytes delivered successfully count toward read share. Eviction accounting
+		// waits for active readers, so publication and eviction cannot lose this read.
+		o.serve(entry.Size)
+		return nil
+	})
+	if !held {
 		return false, false, nil
 	}
-	defer o.release()
-	if err := entry.readFrom(ctx, io.NewSectionReader(f, entry.Offset-base, entry.Size), d.cacheDataAllocator); err != nil {
-		return true, false, err
-	}
-	// Only bytes delivered successfully count toward read share. Eviction accounting
-	// waits for active readers, so publication and eviction cannot lose this read.
-	o.serve(entry.Size)
-	return true, true, nil
+	return true, err == nil, err
 }
 
 const (

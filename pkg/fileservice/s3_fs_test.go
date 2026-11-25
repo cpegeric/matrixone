@@ -4188,7 +4188,7 @@ func TestS3FSSparseDiskFallbackErrors(t *testing.T) {
 			short, cancel, hit      bool
 			stream, writer, convert bool
 			sameOffset, bodyError   bool
-			unexpected              bool
+			unexpected, ok          bool
 			opens, closes           int
 			offsets                 []int64
 		}{
@@ -4198,7 +4198,8 @@ func TestS3FSSparseDiskFallbackErrors(t *testing.T) {
 			{name: "cached first 416", first: 9 << 20, second: 25 << 20, firstErr: rangeStatusError{}, hit: true, opens: 1},
 			{name: "cached later 416", first: 9 << 20, second: 25 << 20, secondErr: rangeStatusError{}, hit: true, unexpected: true, opens: 2, closes: 1},
 			{name: "same offset 416", first: 9 << 20, second: 9 << 20, secondErr: rangeStatusError{}, sameOffset: true, opens: 2, closes: 1},
-			{name: "short", first: 9 << 20, second: 25 << 20, short: true, unexpected: true, opens: 2, closes: 2},
+			// A source that ends short leaves the read to read the range itself.
+			{name: "short", first: 9 << 20, second: 25 << 20, short: true, ok: true, opens: 3, closes: 3, offsets: []int64{9 << 20, 25 << 20, 25 << 20}},
 			{name: "body 416", first: 9 << 20, second: 25 << 20, bodyError: true, opens: 2, closes: 2},
 			{name: "cancel", first: 9 << 20, second: 25 << 20, cancel: true, opens: 1, closes: 1},
 			{name: "converter 416", first: 9 << 20, second: 25 << 20, convert: true, opens: 2, closes: 2},
@@ -4278,6 +4279,7 @@ func TestS3FSSparseDiskFallbackErrors(t *testing.T) {
 					vector.Entries = append(vector.Entries, IOEntry{Offset: 25 << 20, Size: 4096})
 				}
 				t.Cleanup(vector.ReleaseReadResultOnError)
+				before := registeredPrefetchObjects(disk)
 				err = fs.Read(ctx, vector)
 				if stream != nil {
 					closeErr := stream.Close()
@@ -4289,10 +4291,11 @@ func TestS3FSSparseDiskFallbackErrors(t *testing.T) {
 				wantOpens, wantCloses := tc.opens, tc.closes
 				if tc.cancel {
 					// The first range's object closes its reader, canceling the read, before
-					// or after the second range is opened; every opened reader is closed.
+					// or after the second range is opened; once the prefetch objects the read
+					// started end, every opened reader is closed.
 					require.Eventually(t, func() bool {
 						opens, closes, _ := storage.counts()
-						return opens >= 1 && opens == closes
+						return opens >= 1 && opens == closes && registeredPrefetchObjects(disk).subsetOf(before)
 					}, 10*time.Second, time.Millisecond)
 					wantOpens, _, _ = storage.counts()
 					wantCloses = wantOpens
@@ -4312,6 +4315,8 @@ func TestS3FSSparseDiskFallbackErrors(t *testing.T) {
 					unexpected, tc.offsets = true, []int64{9 << 20, 25 << 20}
 				}
 				switch {
+				case tc.ok:
+					require.NoError(t, err)
 				case tc.cancel:
 					if err != nil {
 						require.ErrorIs(t, err, context.Canceled)
@@ -4353,4 +4358,34 @@ func TestS3FSSparseDiskFallbackErrors(t *testing.T) {
 			})
 		}
 	}
+}
+
+// prefetchObjectSet is a set of prefetch objects, registered or waiting.
+type prefetchObjectSet map[any]struct{}
+
+// registeredPrefetchObjects returns the prefetch objects d holds, registered or waiting for
+// their resources.
+func registeredPrefetchObjects(d *DiskCache) prefetchObjectSet {
+	f := &d.prefetchObjects
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	set := prefetchObjectSet{}
+	for _, objects := range f.m {
+		for _, o := range objects {
+			set[o] = struct{}{}
+		}
+	}
+	for o := range f.waiting {
+		set[o] = struct{}{}
+	}
+	return set
+}
+
+func (s prefetchObjectSet) subsetOf(t prefetchObjectSet) bool {
+	for o := range s {
+		if _, ok := t[o]; !ok {
+			return false
+		}
+	}
+	return true
 }

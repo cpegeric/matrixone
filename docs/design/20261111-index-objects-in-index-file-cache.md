@@ -17,7 +17,15 @@ as index files beside HNSW and fulltext ones, apart from the shared disk cache.
   only where the finished file is published differs. Reads of the object during the
   download join it and are served as its bytes arrive, as for any download of the disk
   cache, so a search never waits for an object to be loaded before reading it. The
-  download takes no room in the disk cache. A scan preloads an object the cache does not
+  download takes no room in the disk cache, nor do the ranges and entries a read of the
+  object downloads, also when the index-file cache cannot be written: the bytes of an
+  index object are cached on disk only in the index-file cache. A read or prefetch that
+  skips disk-cache writes still loads it there; one that skips every cache write loads it
+  into neither cache. A download of the object into the disk cache does not load it into
+  the index-file cache, nor the reverse: a prefetch or fill of it into one cache that comes
+  during a download into the other downloads it again once that one ends. A prefetch of
+  ranges of an index object prefetches nothing: no cache holds its ranges. A write of the index-file cache that finds the
+  disk full frees room in the index-file cache, never in the disk cache. A scan preloads an object the cache does not
   hold whatever its read policy, as for a filtered search, so a CN without a disk cache
   does not keep index objects. An object deleted after its download started
   is not published. The IVF-Flat search's scan of the entries table holds the entries of
@@ -29,8 +37,9 @@ as index files beside HNSW and fulltext ones, apart from the shared disk cache.
   index-file cache holds is served from there, and the decoded data still enters the
   memory cache; concurrent reads of an entry share its decode as reads of an object the
   disk cache holds do. A prefetch with it, through the prefetcher or the IO pipeline, of an
-  object the cache holds is not downloaded into the disk cache. Anything else takes the
-  normal path.
+  object the cache holds is not downloaded into the disk cache; an entry whose file is
+  missing does not hold the object, and a prefetch or fill of it loads it again. Anything
+  else takes the normal path.
 - **Eviction.** An object's entry is an index file like any other: the cache's LRU evicts
   it, and the next scan that needs it reads it again. A held entry is not evicted, and the
   release of a hold, or a read, marks it used.

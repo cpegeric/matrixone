@@ -20,6 +20,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -76,11 +77,68 @@ func (s *S3FS) cachesIndexObjects() bool {
 	return s.indexFileCache != nil && s.diskCache != nil
 }
 
+// indexObject reports whether policy marks a read of an object the index-file cache keeps.
+func (s *S3FS) indexObject(policy Policy) bool {
+	return policy.Any(IndexFileObject) && s.cachesIndexObjects()
+}
+
+// indexObjectReadable reports whether a read under policy reads the index-file cache: a
+// read that skips every cache read, not only the disk cache's, skips it.
+func (s *S3FS) indexObjectReadable(policy Policy) bool {
+	return s.indexObject(policy) && policy&SkipCacheReads != SkipCacheReads
+}
+
+// indexObjectFillable reports whether a fill under policy fills the index-file cache: one
+// that skips every cache write skips it. A fill of an index object never fills the disk
+// cache.
+func (s *S3FS) indexObjectFillable(policy Policy) bool {
+	return s.indexObject(policy) && policy&SkipCacheWrites != SkipCacheWrites
+}
+
+// cacheTier is the cache on disk the bytes a read takes from object storage are cached in.
+type cacheTier int
+
+const (
+	noTier cacheTier = iota
+	diskTier
+	indexTier
+)
+
+// tierOf returns the cache on disk of a read under policy: the index-file cache for an
+// index object, whatever the skips of the disk cache, otherwise the disk cache; none when
+// the read skips its writes.
+func (s *S3FS) tierOf(policy Policy) cacheTier {
+	switch {
+	case s.indexObject(policy):
+		if s.indexObjectFillable(policy) {
+			return indexTier
+		}
+	case s.diskCache != nil && !policy.Any(SkipDiskCacheWrites):
+		return diskTier
+	}
+	return noTier
+}
+
+// readRange returns the range a read of vector reads from object storage, and whether it
+// reads the whole object to fill its tier: an index object whenever its policy caches
+// whole files, any other object when it also uses the disk cache.
+func (s *S3FS) readRange(vector *IOVector) (min, max *int64, readFull bool) {
+	p := vector.Policy
+	if !s.indexObject(p) {
+		return vector.readRange()
+	}
+	if p.wholeRead() && s.tierOf(p) == indexTier {
+		return ptrTo[int64](0), nil, true
+	}
+	min, max = vector.readMinimalRange()
+	return min, max, false
+}
+
 // fillTarget returns where a whole-object fill of the object at filePath for a read
 // under policy publishes: the index-file cache for an IndexFileObject read of an object it
 // keeps, otherwise the disk cache (nil).
 func (s *S3FS) fillTarget(policy Policy, filePath string) fillTarget {
-	if !policy.Any(IndexFileObject) || !s.cachesIndexObjects() {
+	if !s.indexObjectFillable(policy) {
 		return nil
 	}
 	p, err := parseFilePathAtService(filePath, s.name)
@@ -100,19 +158,19 @@ type indexFillTarget struct {
 }
 
 func (t indexFillTarget) heldBeforeLock(context.Context) bool {
-	_, ok := t.s.indexObjectCached(t.filePath)
-	return ok
+	return t.s.indexObjectHeld(t.filePath)
 }
 
 func (t indexFillTarget) held(context.Context) (bool, error) {
-	_, ok := t.s.indexObjectCached(t.filePath)
-	return ok, nil
+	return t.s.indexObjectHeld(t.filePath), nil
 }
 
 // reserve makes no room: the index-file cache evicts when the entry is put.
 func (t indexFillTarget) reserve(context.Context, int64) {}
 
 func (t indexFillTarget) noteWritten(int64) {}
+
+func (t indexFillTarget) cache() *DiskCache { return t.s.indexFileCache.disk }
 
 // createTemp creates the file in the index-file cache's directory, so publishing it is a
 // rename on one file system.
@@ -159,9 +217,26 @@ func (s *S3FS) indexObjectCached(filePath string) (string, bool) {
 	return diskPath, d.dirCached(diskPath)
 }
 
+// indexObjectHeld reports whether the index-file cache holds the object at filePath with
+// its file, so that a fill or prefetch of it has nothing to do.
+func (s *S3FS) indexObjectHeld(filePath string) bool {
+	diskPath, ok := s.indexObjectCached(filePath)
+	if !ok {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(diskPath, IndexObjectFile))
+	return err == nil
+}
+
 // readIndexObject fills the entries of vector not done from the object's entry in the
 // index-file cache, when it holds the object.
 func (s *S3FS) readIndexObject(ctx context.Context, vector *IOVector) error {
+	// The download registry is read before the cache, so an entry its download published
+	// in between is found in the cache; the entries a download no longer serves are read
+	// from the file it published.
+	if err := s.readIndexDownload(ctx, vector); err != nil || vector.allDone() {
+		return err
+	}
 	diskPath, ok := s.indexObjectCached(vector.FilePath)
 	if !ok {
 		return nil
@@ -171,6 +246,12 @@ func (s *S3FS) readIndexObject(ctx context.Context, vector *IOVector) error {
 		return nil
 	}
 	name := IndexObjectEntry(p.File)
+	// The read holds the entry, so it is not evicted while the read uses it, and the
+	// release of its hold is a use of it.
+	d := s.indexFileCache.disk
+	defer s.touchIndexObject(diskPath)
+	d.holdDir(diskPath)
+	defer d.releaseDir(diskPath, false)
 	file, entry, err := s.indexFileCache.openEntryFile(ctx, name, IndexObjectFile)
 	if err != nil {
 		if entry != nil {
@@ -205,7 +286,7 @@ func (s *S3FS) readIndexObject(ctx context.Context, vector *IOVector) error {
 		}
 		if e.Size < 0 {
 			// The entry's file cannot tell its end from the object's: storage reads it.
-			return nil
+			continue
 		}
 		from := &sourceErrReader{Reader: io.NewSectionReader(file, e.Offset, e.Size)}
 		if err := e.readFrom(ctx, from, s); err != nil {
@@ -230,6 +311,39 @@ func (s *S3FS) readIndexObject(ctx context.Context, vector *IOVector) error {
 		perfcounter.Update(ctx, func(counter *perfcounter.CounterSet) {
 			counter.FileService.DiskReadSize.Add(read)
 		})
+	}
+	return nil
+}
+
+// readIndexDownload fills the entries of vector not done from the download of the object
+// into the index-file cache under way, as a read of the disk cache does, whatever the
+// read's skip of disk-cache reads.
+func (s *S3FS) readIndexDownload(ctx context.Context, vector *IOVector) error {
+	p, err := parseFilePathAtService(vector.FilePath, s.name)
+	if err != nil || isDownload(ctx) {
+		return nil
+	}
+	d := s.diskCache
+	diskPath := d.pathForFile(p.File)
+	// The read takes every entry from the download it found, which is into the
+	// index-file cache, even once another download of the object replaces it.
+	o := d.download(diskPath)
+	if o == nil || !o.indexFile {
+		return nil
+	}
+	for i := range vector.Entries {
+		e := &vector.Entries[i]
+		if !e.ranged() || !e.materializes(d.memoryPrefetchMax) {
+			continue
+		}
+		_, filled, err := d.readDownloadEntry(ctx, diskPath, o, 0, true, e, vector)
+		var failing *failingReadError
+		if errors.As(err, &failing) {
+			return failing.err
+		}
+		if filled {
+			e.done, e.fromCache = true, d
+		}
 	}
 	return nil
 }
