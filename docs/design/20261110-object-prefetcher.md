@@ -166,7 +166,8 @@ the read's whole span took about 80 s against about 68 s). Both kinds:
 - are joined by every read of their bytes, which waits for its own bytes, not for the
   whole prefetch object. A FilePrefetchObject is joined only when its bytes arrive no more
   than `disk-download-max-extra-wait` later than a range read could fetch them. A read
-  that caches its bytes joins only prefetch objects that cache theirs; one that caches
+  that caches its bytes joins only prefetch objects whose bytes end cached, by the object
+  or by the read that started it, in every lookup it joins through; one that caches
   nothing joins any;
 - leave a read to fetch its bytes itself when they end without them, as when stopped by
   another query, a delete or a close, or when their source ends short of their bytes; a
@@ -264,7 +265,10 @@ The merged entry keeps the sooner due time and the larger share, and serves both
 scans. It is dropped only when both scans have ended. A request for bytes the running
 download of its object does not download is queued once that download ends (decision
 2026-11-18, v9): before, it was counted as merged and lost, and its scan read those
-columns block by block. Such a request is kept only within the queue's bytes, which the
+columns block by block. Only the bytes it asks for that the running download's ranges,
+together, do not hold are queued and counted; the cache check of a queued request drops
+it only when the bytes it found cached hold all the request then asks for. Such a request
+is kept only within the queue's bytes, which the
 requests deferred behind all running downloads count toward, and only for scans that have
 not ended; one whose scans all ended gives up its bytes to a request that needs them, before a live queued download is dropped, and is not merged into a later request.
 
