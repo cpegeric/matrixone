@@ -960,7 +960,8 @@ func TestIndexObjectMissingFileRepairWaitsForNoPublication(t *testing.T) {
 	storage.reads.Store(0)
 	done := make(chan []byte, 1)
 	go func() {
-		done <- readIndexObjectRange(t, fs, IndexFileObject|SkipDiskCacheWrites, 2000, 10)
+		// The read fills no cache, so the dropped entry stays dropped.
+		done <- readIndexObjectRange(t, fs, IndexFileObject|SkipCacheWrites, 2000, 10)
 	}()
 	select {
 	case got := <-done:
@@ -987,7 +988,8 @@ func TestIndexObjectMissingFileOwnedIsKept(t *testing.T) {
 	require.True(t, ok)
 	mark := fs.indexFileCache.DeleteMark()
 	storage.reads.Store(0)
-	vec := &IOVector{FilePath: "object", Policy: IndexFileObject | SkipMemoryCache | SkipDiskCacheWrites,
+	// The read fills no cache, so it does not wait for the holder to publish.
+	vec := &IOVector{FilePath: "object", Policy: IndexFileObject | SkipMemoryCache | SkipCacheWrites,
 		Entries: []IOEntry{{Offset: 2000, Size: 10}}}
 	require.NoError(t, fs.Read(context.Background(), vec))
 	require.Equal(t, data[2000:2010], vec.Entries[0].Data)

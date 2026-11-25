@@ -80,7 +80,7 @@ flowchart TB
 
   subgraph res["Resources, taken before registering"]
     budget["Flight budget<br/>min(5% of available memory,<br/>memory-max × connections);<br/>one buffer when none in flight"]
-    conns["Download connections<br/>half the host's connections"]
+    conns["Download connections<br/>half of min(host's connections,<br/>storage concurrency)"]
     slots["Prefetch share<br/>connections / workers objects<br/>of one prefetch at once"]
   end
 
@@ -152,16 +152,26 @@ The choice is made from the request, before any byte is downloaded. Every range 
 that misses the cache takes its bytes from a prefetch object under way, or starts a
 MemoryPrefetchObject of its own when its range is at most `disk-prefetch-memory-max`; a
 larger read reads directly, through a FilePrefetchObject of its own that takes its
-connection from the same pool. A MemoryPrefetchObject a read starts caches nothing: the read
+connection from the same pool. A FilePrefetchObject of a read that declined the download
+of its range does not wait for that download's cache file, and caches nothing; one that
+found no download of its range under way waits for its cache file and reads its
+publication. An entry a
+read streams to its caller, through a writer or a reader, takes its bytes from a prefetch
+object, a queued download or a download in the disk cache only when it is at most
+`disk-prefetch-memory-max` bytes; a larger one, or one read to the end of the object,
+opens its own reader, so its caller gets its bytes as they arrive. A MemoryPrefetchObject a read starts caches nothing: the read
 caches its entries as its policy says, unless the prefetch object it joined caches its
 bytes (decision 2026-11-13: with 8 concurrent TPC-H sessions on a 4 GB disk cache, caching
 the read's whole span took about 80 s against about 68 s). Both kinds:
 - are joined by every read of their bytes, which waits for its own bytes, not for the
   whole prefetch object. A FilePrefetchObject is joined only when its bytes arrive no more
-  than `disk-download-max-extra-wait` later than a range read could fetch them;
+  than `disk-download-max-extra-wait` later than a range read could fetch them. A read
+  that caches its bytes joins only prefetch objects that cache theirs; one that caches
+  nothing joins any;
 - leave a read to fetch its bytes itself when they end without them, as when stopped by
-  another query, a delete or a close; a failed read of object storage fails the reads
-  waiting on it;
+  another query, a delete or a close, or when their source ends short of their bytes; a
+  failed read of object storage fails the reads waiting on it, as a read of their own
+  would fail;
 - wait in the prefetch queue and move to the live queue when a read reaches them before
   they start (below);
 - end the same way on a delete of their object: the delete cancels them before it
@@ -212,8 +222,12 @@ not cache its range, so no callback waits for capacity held by callbacks. The wr
 asynchronous updates run in the order the updates were submitted, whichever is
 published first; an update that publishes nothing holds no place in that order. A read
 that skips disk-cache reads reads object storage itself; it does not join a prefetch
-object. A read of an index-file object reads the index-file cache, which a skip of
-disk-cache reads does not apply to; a read that skips every cache skips it too. A MemoryPrefetchObject
+object. A read of an index-file object reads the index-file cache, and joins a download
+into it under way, which a skip of disk-cache reads does not apply to; a read that skips
+every cache read skips it too. A fill
+of an index-file object fills only the index-file cache, never the disk cache, also when
+the index-file cache cannot be written, and a fill that skips every cache write fills
+neither. A MemoryPrefetchObject
 caches its range before it ends, so the reads after it find the range cached, unless
 the copy for its written callbacks does not fit (above); a read then finds the range
 missing and reads it itself. A download
@@ -271,7 +285,8 @@ loses little by reading its ranges.
   live queue and joins it.
 - A full-object read does not wait for another read of the same object to finish. It
   looks in the disk cache again once, because that other read's download may have
-  started by then.
+  started by then. A read whose own whole-object fill stops or is skipped looks in the
+  caches again before it reads object storage.
 
 ### The queue is bounded (decision)
 
@@ -283,7 +298,9 @@ earlier bound of 30 seconds at a configured network rate, with requests due soon
 from it, was never reached there and is removed.
 
 When a new request does not fit:
-- A request larger than the bound is dropped, and the queue is left unchanged.
+- A request larger than the bound is dropped, and the queue is left unchanged. A request
+  for an object already queued still merges its due time and share into the queued entry,
+  which keeps its bytes: that scan needs them as soon as it asks (decision 2026-11-24).
 - Otherwise, entries whose scans have all ended are dropped first.
 - Then the last entry in download order is dropped, if the new request orders before it.
   If not, the new request is dropped.
@@ -324,7 +341,8 @@ exactly its entries and never a whole object. Object metadata and bloom filter l
 exactly their extents in every scan: a prefetch range around them would hold the last
 columns of the object. Probes that read a few columns of an object to check keys or
 visibility, as the CN's insert and upsert dedup, the TN's precommit dedup and MVCC loads,
-read exactly their entries and never the whole object. A
+read exactly their entries and never the whole object; so does every read marked
+`ExactRead`, whatever its other policy. A
 row fetch never reads the bytes of a column it does not read, such as the vector column
 (decision 2026-11-12). The reads a prefetch object makes for itself join no prefetch
 object.
@@ -385,7 +403,8 @@ object.
   (default 16 MiB) reads `disk-prefetch-object-split` parts at once (default 2, at most
   4), aligned to 64 KiB, into one cache file. This happens only when the object's size
   is known and fewer than `disk-prefetch-object-split-downloads` (default 8) downloads
-  are in flight.
+  are in flight; a download that splits counts as in flight from that decision on, so
+  concurrent downloads never split past the limit.
 - A read-started download splits at the read's first needed block, so that read does
   not wait for the bytes before it.
 - The download takes its first part's object-storage connection before it starts; each
@@ -395,11 +414,12 @@ object.
 - The size is the one the prefetch passed. When no prefetch passed a size, the
   download is one stream and makes no size request.
 - The last part reads to the object's end, so a wrong size makes the download fail.
-  Any failed part fails the whole download, which publishes nothing.
-- Downloads hold at most half of the host's object-storage connections, so range
-  reads always keep connections of their own. A download that cannot reserve its
-  parts runs as one stream; one that cannot reserve even one connection waits until
-  a connection is free (decision 2026-11-13).
+  Any failed part fails the whole download, which publishes nothing. A download whose
+  source ends short of its range leaves the reads waiting for it to read their own bytes.
+- Downloads hold at most half of the smaller of the host's object-storage connections
+  and the storage concurrency, so range reads always keep connections of their own. A
+  download that cannot reserve its parts runs as one stream; one that cannot reserve
+  even one connection waits until a connection is free (decision 2026-11-13).
 
 ### A download waited for is bounded by its readers (decision 2026-11-16)
 
@@ -411,9 +431,10 @@ object.
   reads its own bytes. The stop frees the download's connection, its prefetch memory and
   its cache-write slot.
 - A read that joins a whole-object download gives up after the I/O wait bound and reads
-  its own bytes. The read that started a download, and the reads of a prefetch range read,
-  wait until their context ends: with a source that stalls, as before the timeout existed,
-  such a read waits as long as its context allows.
+  its own bytes. The read that started a download, the reads of a prefetch range read, and
+  the reads that join a FilePrefetchObject of ranges, wait until their context ends: with a
+  source that stalls, as before the timeout existed, such a read waits as long as its
+  context allows.
 - A download that stops for the timeout fails no read: the read that started it reads its
   own ranges.
 
@@ -432,7 +453,7 @@ idle timeout" ([#32792](https://github.com/matrixorigin/matrixone/issues/32792))
 | Buffers of MemoryPrefetchObjects under way or held by reads | the disk cache | 5% of the memory available on the node, at most one buffer of `disk-prefetch-memory-max` bytes, rounded up to a power of two, for each object-storage connection downloads may hold, and one buffer when none is under way; past it a prefetch object, a read's included, waits until buffers are freed; each range of a prefetch is its own prefetch object, admitted in order, that waits, holding nothing, for its buffer and one of the object-storage connections downloads may hold before reads can join it; a prefetch of ranges counts as started once every range is under way or one waits, and a read of a range not under way reads its own bytes; a prefetch starts none once its object was deleted |
 | FilePrefetchObjects under way | the prefetcher's workers, or the reads that start them | the worker count, and one per range a live read waits for: one a read starts is shared by every read of its range and stopped when no read waits for it before its download starts; one prefetch has at most its share of prefetch objects, of both kinds, waiting or under way at once (below); one of a run waits, holding nothing, for its connection before it registers, and one that then finds another holding its bytes joins it, so concurrent reads download a run once; a prefetch starts none once its object was deleted; the object-storage connections they hold count with whole-object downloads |
 | Deleted objects remembered for cache writes | the disk cache | a fixed number of entries; when cleared, entries read before are not cached |
-| Object-storage connections held by downloads | the disk cache | half the host's connections; a configured `max-conns-per-host` below 64 is rejected (decision 2026-11-24); past it a download waits |
+| Object-storage connections held by downloads | the disk cache | half of the smaller of the host's connections and the storage concurrency; a configured `max-conns-per-host` below 64 is rejected (decision 2026-11-24), and a configured `concurrency` below 64 (decision 2026-11-25); past it a download waits |
 | Cache files kept open for reads, and paths found without a file | the disk cache, and apart the index-file cache | `disk-open-files-max` files each, default 128, 0 keeping none and noting no path missing; past it the least recently read file no read holds is closed; a change or eviction of a path closes its file once no read holds it; a path found without a file is not opened again until it changes, with a fixed number of such paths, forgotten when full; the bound counts against the process's open-file limit, shared by every service of a process, which it must stay well below; warm TPC-H SF10 read as fast at 128 as at 512 or 1024 (decision 2026-11-18, v9: column ranges are cached as separate files, and warm reads opened each again) |
 
 ## Alternatives
@@ -505,6 +526,12 @@ idle timeout" ([#32792](https://github.com/matrixorigin/matrixone/issues/32792))
   misconfiguration for a database: every table read, write, listing, delete and
   download waits on the same few connections. 0 keeps the default pool. A released
   configuration that sets 1–63 must be changed to 0 or to at least 64 before upgrading.
+- **`concurrency` below 64 is rejected at startup (decision 2026-11-25, won't change).**
+  An object-storage client running fewer than 64 operations at once is a misconfiguration
+  for a database; downloads hold at most half of the smaller of the host's connections and
+  the storage concurrency, so foreground reads keep at least 32. 0 keeps the default. A
+  released configuration that sets 1–63 must be changed to 0 or to at least 64 before
+  upgrading.
 - Upgrade is by full shutdown; no mixed-version behavior is involved.
 - **Fallback:** there is no runtime switch for the prefetcher itself. Splitting can be
   turned off by configuration.

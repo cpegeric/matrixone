@@ -617,6 +617,9 @@ func (d *DiskCache) Read(
 		if entry.done {
 			return nil
 		}
+		if entry.Size == 0 {
+			return &failingReadError{err: moerr.NewEmptyRangeNoCtx(path.File)}
+		}
 		if entry.Size < 0 {
 			// ignore size unknown entry
 			return nil
@@ -642,7 +645,10 @@ func (d *DiskCache) Read(
 			// try full file
 			diskPath = objectPath()
 			var filled bool
-			downloading, filled, err = d.readFromDownload(ctx, diskPath, entry, vector)
+			// The reads of a download join no other, nor does a large streamed entry.
+			if !isDownload(ctx) && entry.materializes(d.memoryPrefetchMax) {
+				downloading, filled, err = d.readFromDownload(ctx, diskPath, entry, vector)
+			}
 			if err != nil {
 				return err
 			}
@@ -712,9 +718,8 @@ func (d *DiskCache) Read(
 					pos = next
 				}
 				if readers != nil {
-					from := &sourceErrReader{Reader: io.MultiReader(readers...)}
-					if err := entry.readFrom(ctx, from, d.cacheDataAllocator); err != nil {
-						if from.err != nil {
+					if local, err := d.readEntryFrom(ctx, entry, io.MultiReader(readers...)); err != nil {
+						if local != nil {
 							for _, r := range rs {
 								d.paths.close(r.diskPath, openedFiles[r.diskPath])
 								delete(openedFiles, r.diskPath)
@@ -764,9 +769,8 @@ func (d *DiskCache) Read(
 			d.preloads.read(diskPath, entry.Size)
 		}
 		// Reads of a file kept open share it, so each reads at its own offset.
-		from := &sourceErrReader{Reader: io.NewSectionReader(file, readOffset, readSize)}
-		if err := entry.readFrom(ctx, from, d.cacheDataAllocator); err != nil {
-			if from.err != nil && fromRange {
+		if local, err := d.readEntryFrom(ctx, entry, io.NewSectionReader(file, readOffset, readSize)); err != nil {
+			if local != nil && fromRange {
 				d.paths.close(diskPath, opened)
 				delete(openedFiles, diskPath)
 				d.dropCachedRange(ctx, diskPath)
@@ -784,11 +788,11 @@ func (d *DiskCache) Read(
 
 	for i := range vector.Entries {
 		if err := fillEntry(&vector.Entries[i]); err != nil {
-			// A failed read of object storage by a download the read joined fails the read;
-			// an error of the cache itself is ignored.
-			var joined *joinedReadError
-			if errors.As(err, &joined) {
-				return joined.err
+			// A failed read of object storage by a download the read joined, and an error
+			// of the entry, fail the read; an error of the cache itself is ignored.
+			var failing *failingReadError
+			if errors.As(err, &failing) {
+				return failing.err
 			}
 			numError++
 			logutil.Warn(
@@ -1045,7 +1049,7 @@ func (d *DiskCache) writeFileTo(
 	}
 	callerCtx := ctx
 	defer func() {
-		d.evictForDiskFull(callerCtx, err)
+		target.cache().evictForDiskFull(callerCtx, err)
 	}()
 	// A whole-object download is a FilePrefetchObject, not registered after a delete of
 	// the object since the mark of ctx.
@@ -1076,7 +1080,7 @@ func (d *DiskCache) writeFileTo(
 	// before it holds the path; each later part takes its own when it starts. A range
 	// download holds the connection its FilePrefetchObject took.
 	var bounds []int64
-	lead := 0
+	lead, taken := 0, false
 	releaseConns := func() {}
 	if fill == storageFill {
 		var ok bool
@@ -1085,20 +1089,36 @@ func (d *DiskCache) writeFileTo(
 		}
 		ctx, releaseConns = whole.ctx, whole.releaseConn
 		w.releaseConns = releaseConns
-		if objectSize != nil && d.objectSplit.parts > 1 && d.downloading() < cmp.Or(d.objectSplit.downloads, DefaultDiskPrefetchObjectSplitDownloads) {
+		// A download splits only when fewer than the limit are in flight once it is counted.
+		if objectSize != nil && d.objectSplit.parts > 1 {
 			if size, splitAt, err := objectSize(ctx); err == nil {
-				bounds = d.objectSplit.bounds(size, splitAt)
-				lead = leadPart(bounds, splitAt)
+				if b := d.objectSplit.bounds(size, splitAt); b != nil &&
+					d.downloads.take(int64(cmp.Or(d.objectSplit.downloads, DefaultDiskPrefetchObjectSplitDownloads))) {
+					bounds, lead, taken = b, leadPart(b, splitAt), true
+					defer func() {
+						if taken {
+							d.downloads.n.Add(-1)
+						}
+					}()
+				}
 			}
 		}
 	}
 
 	cleanup := func() error { return d.removeUnindexedFile(diskPath) }
+	// The download of a FilePrefetchObject a read started does not wait for the download
+	// of its path the read declined: it then publishes nothing.
+	p, readStarted := ctx.Value(fileDownloadKey{}).(*filePrefetchObject)
+	unpublished := false
 	if asyncFinalize {
 		var ok bool
 		if w.owner, ok = d.paths.tryAcquire(diskPath, cleanup); !ok {
 			return false, nil
 		}
+	} else if readStarted && p.declined {
+		var ok bool
+		w.owner, ok = d.paths.tryAcquire(diskPath, cleanup)
+		unpublished = !ok
 	} else if w.owner, err = d.paths.acquire(ctx, diskPath, cleanup); err != nil {
 		return false, err
 	}
@@ -1122,13 +1142,19 @@ func (d *DiskCache) writeFileTo(
 	var dst io.Writer = f
 	if fill != notWholeFill {
 		_, indexFile := target.(indexFillTarget)
-		download = d.startDownload(diskPath, f.Name(), fill != contentFill, indexFile, bounds)
+		if unpublished {
+			download = newObjectDownload(f.Name(), false, bounds)
+			defer download.retire()
+		} else {
+			download = d.startDownload(diskPath, f.Name(), fill != contentFill, indexFile, bounds, taken)
+			taken = false
+			w.owner.first(func() { d.finishDownload(diskPath, download) })
+		}
 		// Its lead part holds the connection the download took.
 		download.begin(lead)
 		fileDownloadStarted(ctx, download)
 		downloadStarted(ctx)
 		dst = downloadProgressWriter{w: f, download: download}
-		w.owner.first(func() { d.finishDownload(diskPath, download) })
 	}
 
 	readCtx, idle := newIdleReader(ctx)
@@ -1181,6 +1207,9 @@ func (d *DiskCache) writeFileTo(
 		return false, err
 	}
 
+	if unpublished {
+		return false, nil
+	}
 	if download != nil && fill != rangeFill {
 		target.noteWritten(n)
 	}
@@ -1217,19 +1246,22 @@ func (d *DiskCache) writeFileTo(
 }
 
 // sourceFailure returns err when it is a failed read of object storage by a fill whose
-// context readCtx did not end: it fails the reads waiting for the fill. A fill stopped
-// (idle, delete, close, its query), or whose object is gone, leaves them to read their own
-// bytes.
+// context readCtx did not end: it fails the reads waiting for the fill with the error of
+// object storage itself, as a read of their own would. A fill stopped (idle, delete,
+// close, its query) leaves them to read their own bytes.
 func sourceFailure(readCtx context.Context, err error) error {
 	var source *diskCacheSourceError
-	if err == nil || readCtx.Err() != nil || !errors.As(err, &source) || errors.Is(err, errSourceIdle) {
+	if err == nil || readCtx.Err() != nil || !errors.As(err, &source) || sourceStopped(err) {
 		return nil
 	}
-	if me := (*moerr.Error)(nil); errors.As(err, &me) && me.ErrorCode() == moerr.ErrFileNotFound {
-		return nil
-	}
-	// The reads get the error of object storage itself, as a read of their own would.
 	return source.err
+}
+
+// sourceStopped reports whether err ends a source without failing the reads of its
+// bytes: it was canceled, sent no bytes within the idle timeout, or ended short of its
+// range, so the reads read their own bytes.
+func sourceStopped(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, errSourceIdle) || errors.Is(err, errSourceShort)
 }
 
 // fileWrite is what a write of a cache file holds until it publishes the file or hands it

@@ -89,8 +89,12 @@ func (r ObjectPrefetch) merge(o ObjectPrefetch) ObjectPrefetch {
 	return r
 }
 
-// covers reports whether the download of r downloads every byte o asks for.
+// covers reports whether the download of r downloads every byte o asks for into the cache
+// o asks for: a download into the disk cache covers no download into the index-file cache.
 func (r ObjectPrefetch) covers(o ObjectPrefetch) bool {
+	if o.indexObject && !r.indexObject {
+		return false
+	}
 	if len(r.Ranges) == 0 {
 		return true
 	}
@@ -278,6 +282,11 @@ func (p *prefetcher) add(req ObjectPrefetch) {
 	have := p.have(req)
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.addLocked(req, have)
+}
+
+// addLocked is add of req, of which have reports whether it is cached or downloading.
+func (p *prefetcher) addLocked(req ObjectPrefetch, have bool) {
 	if p.closed {
 		return
 	}
@@ -522,18 +531,30 @@ func (p *prefetcher) startQueueLocked(q *fetchQueue) {
 		p.wg.Add(1)
 		go func() {
 			defer func() {
+				// The deferred request is queued, joinable, as the download ends, and dropped
+				// once found cached, before the worker takes its next download.
 				p.mu.Lock()
 				p.forgetLocked(e)
 				e.start()
 				next, scans := p.takeDeferredLocked(e)
-				p.mu.Unlock()
-				// The deferred request is queued before the worker takes its next download.
+				var deferred *prefetchEntry
+				for _, s := range scans {
+					req := *next
+					req.Scan = s
+					p.addLocked(req, false)
+				}
 				if next != nil {
-					for _, s := range scans {
-						req := *next
-						req.Scan = s
-						p.add(req)
+					deferred = p.entries[next.FilePath]
+				}
+				p.mu.Unlock()
+				if deferred != nil && p.have(*next) {
+					p.mu.Lock()
+					// Unless it started, or another request grew it, meanwhile.
+					if p.entries[next.FilePath] == deferred && deferred.queue != nil && deferred.req.Size == next.Size {
+						metric.FSPrefetchCachedCounter.Inc()
+						p.removeLocked(deferred)
 					}
+					p.mu.Unlock()
 				}
 				p.mu.Lock()
 				q.running--
@@ -669,12 +690,17 @@ func (s *S3FS) PrefetchObject(ctx context.Context, req ObjectPrefetch) error {
 		return nil
 	}
 	req.FilePath = path.File
-	// An object the index-file cache holds is not downloaded into the disk cache.
-	if GetFileServicePolicy(ctx).Any(IndexFileObject) && s.cachesIndexObjects() {
-		if _, ok := s.indexObjectCached(req.FilePath); ok {
+	// An object the index-file cache holds is not downloaded into the disk cache, nor one
+	// that cannot fill it.
+	if policy := GetFileServicePolicy(ctx); s.indexObject(policy) {
+		if s.indexObjectReadable(policy) && s.indexObjectHeld(req.FilePath) {
 			return nil
 		}
-		req.indexObject = len(req.Ranges) == 0
+		// No cache holds the ranges of an index object.
+		if len(req.Ranges) > 0 || !s.indexObjectFillable(policy) {
+			return nil
+		}
+		req.indexObject = true
 	}
 	if s.prefetcher != nil && req.Size > 0 {
 		req.deletes = s.diskCache.deletes.now()
@@ -698,11 +724,11 @@ func (s *S3FS) haveObject(req ObjectPrefetch) bool {
 	}
 	// A download into the index-file cache is had only once that cache holds the object.
 	if req.indexObject && s.cachesIndexObjects() {
-		_, ok := s.indexObjectCached(req.FilePath)
-		return ok
+		return s.indexObjectHeld(req.FilePath)
 	}
+	// A download into the index-file cache does not fill the disk cache.
 	diskPath := s.diskCache.pathForFile(path.File)
-	if s.diskCache.download(diskPath) != nil {
+	if o := s.diskCache.download(diskPath); o != nil && !o.indexFile {
 		return true
 	}
 	ctx := context.Background()
@@ -770,13 +796,21 @@ func (s *S3FS) prefetchObject(ctx context.Context, req ObjectPrefetch) {
 	if req.indexObject {
 		ctx = WithFileServicePolicy(ctx, GetFileServicePolicy(ctx)|IndexFileObject)
 	}
-	err = s.PrefetchFile(ctx, req.FilePath)
-	if err != nil {
+	s.countPrefetch(req, s.PrefetchFile(ctx, req.FilePath))
+}
+
+// countPrefetch counts the outcome of the prefetch of req that ended with err: a prefetch
+// of an object deleted since it was asked for ended.
+func (s *S3FS) countPrefetch(req ObjectPrefetch, err error) {
+	switch {
+	case err == nil:
+		metric.FSPrefetchDownloadedCounter.Inc()
+	case s.diskCache.deletes.since(s.diskCache.pathForFile(req.FilePath), req.deletes):
+		metric.FSPrefetchEndedCounter.Inc()
+	default:
 		metric.FSPrefetchFailedCounter.Inc()
 		logutil.Debug("fileservice: prefetch object", zap.String("path", req.FilePath), zap.Error(err))
-		return
 	}
-	metric.FSPrefetchDownloadedCounter.Inc()
 }
 
 // prefetchRanges reads into the disk cache the ranges of req not cached, those that are
@@ -790,12 +824,7 @@ func (s *S3FS) prefetchRanges(ctx context.Context, req ObjectPrefetch) {
 		}
 		// Reads of the ranges join their flights instead of reading their bytes again.
 		if ok, err := s.diskCache.readRanges(ctx, path.File, req.deletes, SkipMemoryCacheWrites|SkipFullFilePreloads|ColumnPrefetch, ranges, open); ok {
-			if err != nil {
-				metric.FSPrefetchFailedCounter.Inc()
-				logutil.Debug("fileservice: prefetch ranges", zap.String("path", req.FilePath), zap.Error(err))
-				return
-			}
-			metric.FSPrefetchDownloadedCounter.Inc()
+			s.countPrefetch(req, err)
 			return
 		}
 	}
@@ -808,12 +837,11 @@ func (s *S3FS) prefetchRanges(ctx context.Context, req ObjectPrefetch) {
 		err := s.Read(ctx, vector)
 		vector.Release()
 		if err != nil {
-			metric.FSPrefetchFailedCounter.Inc()
-			logutil.Debug("fileservice: prefetch ranges", zap.String("path", req.FilePath), zap.Error(err))
+			s.countPrefetch(req, err)
 			return
 		}
 	}
-	metric.FSPrefetchDownloadedCounter.Inc()
+	s.countPrefetch(req, nil)
 }
 
 // rangesToDownload returns the ranges of req not covered by cached ranges, in order, with

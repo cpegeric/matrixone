@@ -43,6 +43,8 @@ type filePrefetchObject struct {
 	// before its download is registered.
 	holds       int
 	readStarted bool
+	// declined is set on one a read started past the download of its range it declined.
+	declined bool
 	// holdStarter is set when the download holds a reader for the read that started p,
 	// which reads it through readOwnAt, so that its file is not closed before that read
 	// copies its bytes: starterHeld while it holds one, starterDone once the read no longer
@@ -279,23 +281,31 @@ func (r *objectEndReader) Read(b []byte) (int, error) {
 	r.at += int64(n)
 	if err == io.EOF && r.at < r.end {
 		r.objectEnd.Store(r.at)
-		err = io.ErrUnexpectedEOF
+		err = errSourceShort
 	}
 	return n, err
 }
 
-// fileDownload returns the download of a FilePrefetchObject of the object at objectPath
-// holding the bytes [lo, hi), and where its bytes start in the object.
+// fileDownload returns the download of the live FilePrefetchObject of the object at
+// objectPath holding the bytes [lo, hi) whose bytes arrive first, and where its bytes
+// start in the object.
 func (d *DiskCache) fileDownload(objectPath string, lo, hi int64) (*objectDownload, int64) {
 	f := &d.prefetchObjects
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	var best *objectDownload
+	var base int64
+	var bestWait time.Duration
 	for _, o := range f.m[objectPath] {
-		if p, ok := o.(*filePrefetchObject); ok && p.start <= lo && hi <= p.end {
-			if download := p.joinableDownload(); download != nil {
-				return download, p.start
+		p, ok := o.(*filePrefetchObject)
+		if !ok || p.start > lo || hi > p.end || p.ctx.Err() != nil {
+			continue
+		}
+		if download := p.joinableDownload(); download != nil {
+			if _, wait := download.estimate(lo-p.start, hi-p.start); best == nil || wait < bestWait {
+				best, base, bestWait = download, p.start, wait
 			}
 		}
 	}
-	return nil, 0
+	return best, base
 }
