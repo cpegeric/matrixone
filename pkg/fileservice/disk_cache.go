@@ -306,22 +306,47 @@ func newDiskCache(
 
 // loadFile indexes the cache file at diskPath found at startup, unless its object was
 // deleted since the cache was created: the delete may have missed a file not yet
-// indexed, so the file is removed instead. As for the publication of an entry, a delete
-// counted later finds the file indexed.
+// indexed, so the file is removed instead (see removeLoadedFile). As for the publication
+// of an entry, a delete counted later finds the file indexed.
 func (d *DiskCache) loadFile(ctx context.Context, diskPath string, info fs.FileInfo) {
 	objectPath := diskPath
 	if key, _, _, ok := parseRangeFile(d.path, diskPath, info.Size()); ok {
 		objectPath = fullPathOfRangeKey(d.path, key)
 	}
 	runPathHook(d.hooks.beforeLoadFile, diskPath)
+	if !d.indexLoadedFile(ctx, objectPath, diskPath, info) {
+		d.removeLoadedFile(ctx, diskPath, info)
+	}
+}
+
+// indexLoadedFile indexes the file at diskPath found at startup and reports true, unless
+// the object at objectPath was deleted since the cache was created.
+func (d *DiskCache) indexLoadedFile(ctx context.Context, objectPath, diskPath string, info fs.FileInfo) bool {
 	stripe := d.deletes.stripe(objectPath)
 	stripe.RLock()
 	defer stripe.RUnlock()
 	if d.deletes.since(objectPath, 0) {
-		_ = os.Remove(diskPath)
-		return
+		return false
 	}
 	d.cache.SetOldest(ctx, diskPath, struct{}{}, int64(fileSize(info)))
+	return true
+}
+
+// removeLoadedFile removes the file at diskPath found at startup while, under the owner of
+// the path, it is not indexed and is still the file info describes.
+func (d *DiskCache) removeLoadedFile(ctx context.Context, diskPath string, info fs.FileInfo) {
+	owner, err := d.paths.acquire(ctx, diskPath, nil)
+	if err != nil {
+		return
+	}
+	defer owner.release()
+	if d.cache.Contains(diskPath) {
+		return
+	}
+	if cur, err := os.Lstat(diskPath); err != nil || !os.SameFile(info, cur) {
+		return
+	}
+	_ = os.Remove(diskPath)
 }
 
 // reindexRead indexes the cache file at diskPath that a read opened and the cache does
@@ -1027,6 +1052,18 @@ func (d *DiskCache) writeFileWithFinalizeMode(
 
 // writeFileTo writes the file of the object at diskPath and publishes it into target, the
 // disk cache when nil. copied, when set, is called once the bytes are read.
+type prefetchFillKey struct{}
+
+// withPrefetchFill returns ctx under which a whole-object fill is a prefetch's.
+func withPrefetchFill(ctx context.Context) context.Context {
+	return context.WithValue(ctx, prefetchFillKey{}, true)
+}
+
+func prefetchFill(ctx context.Context) bool {
+	_, ok := ctx.Value(prefetchFillKey{}).(bool)
+	return ok
+}
+
 func (d *DiskCache) writeFileTo(
 	ctx context.Context,
 	diskPath string,
@@ -1105,10 +1142,9 @@ func (d *DiskCache) writeFileTo(
 	// of its path the read declined: it then publishes nothing.
 	p, readStarted := ctx.Value(fileDownloadKey{}).(*filePrefetchObject)
 	unpublished := false
-	// A fill of the index-file cache waits for the path a pending publication of the
-	// object into the disk cache holds, and fills its own cache after it.
-	_, index := target.(indexFillTarget)
-	if asyncFinalize && !index {
+	// A prefetch's fill waits for the path a fill of the object into either cache holds,
+	// and fills its own cache after it; a read's async fill does not wait for it.
+	if asyncFinalize && !prefetchFill(ctx) {
 		var ok bool
 		if w.owner, ok = d.paths.tryAcquire(diskPath, cleanup); !ok {
 			return false, nil
@@ -1591,7 +1627,7 @@ func (d *DiskCache) DeletePaths(
 	if err != nil {
 		return err
 	}
-	var errs []error
+	errs := make([]error, 0, len(canonical))
 	for _, path := range canonical {
 		errs = append(errs, d.deletePath(ctx, path))
 	}
@@ -1660,8 +1696,9 @@ func (d *DiskCache) removeOnePath(ctx context.Context, path string) (err error) 
 // removeRangeFiles deletes the cached range files of the object at path, each one
 // whatever the others return, and returns their errors joined.
 func (d *DiskCache) removeRangeFiles(ctx context.Context, path string) error {
-	var errs []error
-	for _, r := range d.ranges.of(d.rangeObjectKey(path)) {
+	ranges := d.ranges.of(d.rangeObjectKey(path))
+	errs := make([]error, 0, len(ranges))
+	for _, r := range ranges {
 		errs = append(errs, d.removeRangeFile(ctx, r.diskPath))
 	}
 	return errors.Join(errs...)
@@ -1673,10 +1710,10 @@ func (d *DiskCache) removeRangeFile(ctx context.Context, diskPath string) error 
 		return err
 	}
 	defer owner.release()
-	d.ranges.remove(diskPath)
 	if err := os.Remove(diskPath); err != nil && !os.IsNotExist(err) {
 		return err
 	}
+	d.ranges.remove(diskPath)
 	d.cache.Delete(ctx, diskPath)
 	return nil
 }
