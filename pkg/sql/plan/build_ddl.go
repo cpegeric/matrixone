@@ -9746,11 +9746,10 @@ const (
 
 func inferHivePartitionColumns(ctx context.Context, param *tree.ExternParam) ([]string, error) {
 	basePath := normalizeHiveInferPath(param.Filepath)
-	listDir, closeListDir, err := newHiveInferListDir(param, basePath)
+	listDir, err := newHiveInferListDir(param, basePath)
 	if err != nil {
 		return nil, err
 	}
-	defer closeListDir()
 
 	currentPrefixes := []string{basePath}
 	inferred := make([]string, 0)
@@ -9811,35 +9810,25 @@ func inferHivePartitionColumns(ctx context.Context, param *tree.ExternParam) ([]
 
 type hiveInferListDirFunc func(ctx context.Context, prefix string) iter.Seq2[*fileservice.DirEntry, error]
 
-// newHiveInferListDir returns the func that lists a directory under basePath and the func
-// that closes the file service it holds.
-func newHiveInferListDir(param *tree.ExternParam, basePath string) (hiveInferListDirFunc, func(), error) {
+func newHiveInferListDir(param *tree.ExternParam, basePath string) (hiveInferListDirFunc, error) {
 	if param.ScanType == tree.S3 {
 		fs, baseReadPath, err := GetForETLWithType(param, basePath)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		return func(ctx context.Context, prefix string) iter.Seq2[*fileservice.DirEntry, error] {
-				return fs.List(ctx, deriveHiveInferReadPath(basePath, baseReadPath, prefix))
-			}, func() {
-				CloseETLWithType(param, basePath, fs)
-			}, nil
+			return fs.List(ctx, deriveHiveInferReadPath(basePath, baseReadPath, prefix))
+		}, nil
 	}
 	return func(ctx context.Context, prefix string) iter.Seq2[*fileservice.DirEntry, error] {
-		return func(yield func(*fileservice.DirEntry, error) bool) {
-			fs, readPath, err := GetForETLWithType(param, prefix)
-			if err != nil {
+		fs, readPath, err := GetForETLWithType(param, prefix)
+		if err != nil {
+			return func(yield func(*fileservice.DirEntry, error) bool) {
 				yield(nil, err)
-				return
-			}
-			defer CloseETLWithType(param, prefix, fs)
-			for entry, err := range fs.List(ctx, readPath) {
-				if !yield(entry, err) {
-					return
-				}
 			}
 		}
-	}, func() {}, nil
+		return fs.List(ctx, readPath)
+	}, nil
 }
 
 func normalizeHiveInferPath(p string) string {

@@ -55,8 +55,11 @@ func NewFileServiceWriterWithFileService(fileService FileService, moPath string,
 		return nil, err
 	}
 	w := &FileServiceWriter{
-		ctx:   ctx,
-		owned: OwnsETLPath(path),
+		ctx: ctx,
+		// GetForETL creates a local service for an empty service component and
+		// a dynamic service for argumented paths. A named service is borrowed
+		// from the caller's registry and must remain open after this writer.
+		owned: path.Service == "" || len(path.ServiceArguments) > 0,
 	}
 
 	w.Filepath = moPath

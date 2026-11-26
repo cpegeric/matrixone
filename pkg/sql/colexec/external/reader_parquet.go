@@ -120,7 +120,6 @@ func (r *ParquetReader) Close() error {
 				r.h.pages[i] = nil
 			}
 		}
-		r.h.closeFS()
 		r.h = nil
 	}
 	r.param = nil

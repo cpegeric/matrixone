@@ -2595,7 +2595,7 @@ func removeFileIgnoreError(ctx context.Context, service, filePath string) {
 		if etlFS, targetPath, err = fileservice.GetForETL(ctx, nil, filePath); err != nil {
 			return
 		}
-		defer fileservice.CloseOwnedETL(ctx, filePath, etlFS)
+		defer etlFS.Close(ctx)
 		targetFS = etlFS
 	}
 
@@ -3275,7 +3275,7 @@ func validateOutputDirPath(ctx context.Context, ses *Session, dirPath string) (e
 			return
 		}
 		targetFS = etlFS
-		defer fileservice.CloseOwnedETL(ctx, dirPath, targetFS)
+		defer targetFS.Close(ctx)
 	}
 
 	if len(strings.Trim(targetPath, "/")) == 0 {

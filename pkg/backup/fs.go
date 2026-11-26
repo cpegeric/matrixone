@@ -26,7 +26,7 @@ import (
 // setupFilesystem returns a FileService for ETL which the reader outside the matrixone
 // can read the content. a FileService for Backup which only the matrixone
 // can read the content.
-func setupFilesystem(ctx context.Context, path string, forETL bool, backend string) (res fileservice.FileService, closeFS func(), err error) {
+func setupFilesystem(ctx context.Context, path string, forETL bool, backend string) (res fileservice.FileService, readPath string, err error) {
 	return setupFileservice(ctx, &pathConfig{
 		isS3:             false,
 		forETL:           forETL,
@@ -38,7 +38,7 @@ func setupFilesystem(ctx context.Context, path string, forETL bool, backend stri
 // setupS3 returns a FileService for ETL which the reader outside the matrixone
 // can read the content.a FileService for Backup which only the matrixone
 // can read the content.
-func setupS3(ctx context.Context, s3 *s3Config, forETL bool) (res fileservice.FileService, closeFS func(), err error) {
+func setupS3(ctx context.Context, s3 *s3Config, forETL bool) (res fileservice.FileService, readPath string, err error) {
 	return setupFileservice(ctx, &pathConfig{
 		isS3:     true,
 		forETL:   forETL,
@@ -46,36 +46,42 @@ func setupS3(ctx context.Context, s3 *s3Config, forETL bool) (res fileservice.Fi
 	})
 }
 
-// setupFileservice returns the file service conf names and the func that closes it.
-func setupFileservice(ctx context.Context, conf *pathConfig) (res fileservice.FileService, closeFS func(), err error) {
+func setupFileservice(ctx context.Context, conf *pathConfig) (res fileservice.FileService, readPath string, err error) {
 	var s3opts string
 	if conf.isS3 {
 		s3opts, err = makeS3Opts(&conf.s3Config)
 		if err != nil {
-			return nil, nil, err
+			return nil, "", err
 		}
 		if conf.forETL {
 			s3path := fileservice.JoinPath(s3opts, etlFSDir(conf.filepath))
-			res, _, err = fileservice.GetForETL(ctx, nil, s3path)
+			res, readPath, err = fileservice.GetForETL(ctx, nil, s3path)
+			if err != nil {
+				return nil, "", err
+			}
 		} else {
 			s3path := fileservice.JoinPath(s3opts, conf.filepath)
 			res, err = fileservice.GetForBackup(ctx, s3path, conf.backend)
+			if err != nil {
+				return nil, "", err
+			}
 		}
-		if err != nil {
-			return nil, nil, err
-		}
-		owned := res
-		return fileservice.SubPath(res, conf.filepath), func() { owned.Close(ctx) }, nil
-	}
-	if conf.forETL {
-		res, _, err = fileservice.GetForETL(ctx, nil, etlFSDir(conf.path))
+		res = fileservice.SubPath(res, conf.filepath)
 	} else {
-		res, err = fileservice.GetForBackup(ctx, conf.path, conf.backend)
+		if conf.forETL {
+			res, readPath, err = fileservice.GetForETL(ctx, nil, etlFSDir(conf.path))
+			if err != nil {
+				return nil, "", err
+			}
+		} else {
+			res, err = fileservice.GetForBackup(ctx, conf.path, conf.backend)
+			if err != nil {
+				return nil, "", err
+			}
+		}
 	}
-	if err != nil {
-		return nil, nil, err
-	}
-	return res, func() { res.Close(ctx) }, nil
+
+	return res, readPath, err
 }
 
 func makeS3Opts(s3 *s3Config) (string, error) {

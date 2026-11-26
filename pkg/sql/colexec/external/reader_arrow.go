@@ -181,10 +181,8 @@ func observeArrowError(err error) {
 // current record; borrowed MO vectors retain only the ArrayData/range leases
 // they reference and therefore safely outlive the next IPC Next call.
 type ArrowReader struct {
-	param  *ExternalParam
-	reader arrowio.Reader
-	// ownedFS is the file service Open created for the file, closed by Close.
-	ownedFS               fileservice.FileService
+	param                 *ExternalParam
+	reader                arrowio.Reader
 	plan                  *arrowbridge.Plan
 	pending               arrow.RecordBatch
 	rowOffset             int64
@@ -275,9 +273,6 @@ func (r *ArrowReader) Open(param *ExternalParam, proc *process.Process) (_ bool,
 	fs, readPath, err := plan2.GetForETLWithType(param.Extern, param.Fileparam.Filepath)
 	if err != nil {
 		return false, err
-	}
-	if plan2.OwnsETLWithType(param.Extern, param.Fileparam.Filepath) {
-		r.ownedFS = fs
 	}
 	container, err := arrowContainer(param.Extern.ArrowContainer)
 	if err != nil {
@@ -745,17 +740,12 @@ func (r *ArrowReader) Close() error {
 	r.pending = nil
 	r.rowOffset = 0
 	r.plan = nil
-	var err error
-	if r.reader != nil {
-		reader := r.reader
-		r.reader = nil
-		err = reader.Close()
+	if r.reader == nil {
+		return nil
 	}
-	if r.ownedFS != nil {
-		r.ownedFS.Close(context.Background())
-		r.ownedFS = nil
-	}
-	return err
+	reader := r.reader
+	r.reader = nil
+	return reader.Close()
 }
 
 func arrowContainer(value string) (arrowio.Container, error) {

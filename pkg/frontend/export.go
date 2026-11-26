@@ -1703,7 +1703,6 @@ func writeParquetToFile(ep *ExportConfig, data []byte) error {
 		if err != nil {
 			return err
 		}
-		defer fileservice.CloseOwnedETL(ep.ctx, filePath, fs)
 	}
 
 	// Write the parquet data to file service

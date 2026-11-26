@@ -302,7 +302,7 @@ by time since its last use, not by which index generation or snapshot names it.
 - A file's last use is when it was published or when its last hold was released, as for
   eviction.
 - A file with no holds whose last use is older than the idle TTL is deleted by a periodic
-  collection in each CN. The TTL is configurable, 0 by default; 0 turns idle collection
+  collection in each CN. The TTL is configurable, 1 hour by default; 0 turns idle collection
   off, leaving eviction and the free-space collection below. A hold taken while a file is being collected either keeps
   it or finds it missing and rebuilds it from the rows; a collection never removes a file
   that is held.
@@ -471,12 +471,7 @@ Every statement in "Contract" is checked by a test that would fail if it were fa
 - two cache instances sharing a directory never serve a partial entry, and exactly one
   publishes an entry both write;
 - cached entries are reused after a restart, and leftover temporary and trash directories
-  are removed; files a removal fails to remove count against the capacity, also after
-  a restart, until the collector removes them, and while their bytes cannot be known
-  the cache holds no more than it used when they were found, publishing nothing until
-  the load has indexed the entries it found; an entry the load cannot list is removed,
-  unless it was replaced; a read that cannot open an entry's directory keeps
-  the entry and reads from storage;
+  are removed;
 - the index-file cache gets its configured capacity, or the default when unset, and a
   capacity of zero disables it; the table-data cache keeps its own capacity, and a runtime
   resize changes only that; only a CN's SHARED file service gets the cache; an
