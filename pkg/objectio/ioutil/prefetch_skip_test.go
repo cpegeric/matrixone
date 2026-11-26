@@ -59,3 +59,34 @@ func TestMergePrefetchKeepsPolicy(t *testing.T) {
 	require.Equal(t, fileservice.Policy(fileservice.IndexFileObject|fileservice.NarrowRead),
 		merged[prefetchTarget{name: loc.Name().String(), index: true}].policy)
 }
+
+func TestPipelinePrefetchKeepsCacheTargetsSeparate(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		secondPolicy fileservice.Policy
+		wantPolicies []fileservice.Policy
+	}{
+		{name: "baseline_same_cache_target", wantPolicies: []fileservice.Policy{0}},
+		{
+			name:         "same_object_two_cache_targets",
+			secondPolicy: fileservice.IndexFileObject,
+			wantPolicies: []fileservice.Policy{0, fileservice.IndexFileObject},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := types.Objectid{2}
+			stats := objectio.NewObjectStatsWithObjectID(&id, false, true, true)
+			block := stats.ConstructBlockInfo(0)
+			loc := block.MetaLocation()
+			merged := mergePrefetch([]PrefetchParams{
+				{key: loc, typ: PrefetchFileType},
+				{key: loc, typ: PrefetchFileType, policy: tc.secondPolicy},
+			})
+			policies := make([]fileservice.Policy, 0, len(merged))
+			for _, req := range merged {
+				policies = append(policies, req.policy)
+			}
+			require.ElementsMatch(t, tc.wantPolicies, policies, "the pipeline schedules one job per cache target")
+		})
+	}
+}

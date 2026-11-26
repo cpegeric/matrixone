@@ -17,8 +17,11 @@ package plan
 import (
 	"testing"
 
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	pb "github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/stretchr/testify/require"
 )
 
@@ -84,6 +87,45 @@ func TestScanOfSomeColumnsReadsColumnRanges(t *testing.T) {
 				require.Equal(t, tc.columns, got.Any(fileservice.SkipFullFilePreloads), "policy %b", got)
 			}
 			require.NotZero(t, scans)
+		})
+	}
+}
+
+func TestOneVisibleColumnKeepsWholeObjectPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		column string
+	}{
+		{name: "visible_column", column: "id"},
+		{name: "only_hidden_row_id", column: catalog.Row_ID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opt := newCheckAlterOptimizer(t, "create table one_visible_column (id bigint primary key)")
+			opt.ctxt.isDml = true // keep the row ID in the mock catalog as the engine does
+			table := opt.ctxt.tables["one_visible_column"]
+			if _, ok := table.Name2ColIndex[catalog.Row_ID]; !ok {
+				if table.Name2ColIndex == nil {
+					table.Name2ColIndex = map[string]int32{"id": 0}
+				}
+				table.Name2ColIndex[catalog.Row_ID] = int32(len(table.Cols))
+				table.Cols = append(table.Cols, &pb.ColDef{
+					Name: catalog.Row_ID, Hidden: true, Typ: pb.Type{Id: int32(types.T_Rowid)},
+				})
+			}
+			p, err := runOneStmt(opt, t, "select "+tc.column+" from one_visible_column")
+			require.NoError(t, err)
+			scans := 0
+			for _, node := range p.GetQuery().Nodes {
+				if node.NodeType != pb.Node_TABLE_SCAN {
+					continue
+				}
+				scans++
+				require.Len(t, node.TableDef.Cols, 1)
+				require.Equal(t, tc.column, node.TableDef.Cols[0].Name)
+				require.False(t, fileservice.Policy(node.ReadPolicy).Any(fileservice.ColumnPrefetch, fileservice.SkipFullFilePreloads),
+					"a table with one visible column should keep whole-object prefetch")
+			}
+			require.Equal(t, 1, scans)
 		})
 	}
 }

@@ -16,10 +16,9 @@ package readutil
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/require"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
@@ -29,6 +28,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
+	"github.com/stretchr/testify/require"
 )
 
 type objectPrefetchRecordingFS struct {
@@ -133,4 +133,20 @@ func TestRemoteDataSourcePrefetchesColumns(t *testing.T) {
 			require.Nil(t, ds.prefetch.scan, "the scan's prefetches end with it")
 		})
 	}
+}
+
+// A scan uses the pace of scans until it has read enough to measure its own, which then
+// counts toward the pace of scans.
+func TestScanPace(t *testing.T) {
+	saved := scanPaces.Load()
+	t.Cleanup(func() { scanPaces.Store(saved) })
+	scanPaces.Store(math.Float64bits(100))
+
+	now := time.Now()
+	var p ScanPrefetch
+	require.Equal(t, 100.0, p.Pace(now, 0), "nothing read yet")
+	require.Equal(t, 100.0, p.Pace(now.Add(time.Second), scanPaceMinBlocks-1), "too few blocks")
+
+	require.InDelta(t, 200.0, p.Pace(now.Add(2*time.Second), 400), 1e-9)
+	require.InDelta(t, (1-scanPaceWeight)*100+scanPaceWeight*200, math.Float64frombits(scanPaces.Load()), 1e-9)
 }

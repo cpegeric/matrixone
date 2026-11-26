@@ -23,8 +23,13 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
 	"github.com/stretchr/testify/require"
 )
@@ -271,5 +276,1027 @@ func TestCachedRangesMatchFullScan(t *testing.T) {
 			all = slices.Delete(all, i, i+1)
 			check()
 		}
+	}
+}
+
+// A size told before a delete of its object is never stored after it, however the store
+// and the delete interleave; a delete of another object does not drop it.
+func TestPrefetchedSizeStoredOnlyWithoutDelete(t *testing.T) {
+	ctx := context.Background()
+	d, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1<<20), nil, false, nil, "")
+	require.NoError(t, err)
+	defer d.Close(ctx)
+	path := d.objectKey("object")
+	deleteObject := func(p string) {
+		d.deletes.deleted(p)
+		d.prefetched.forget(p)
+	}
+
+	told := d.deletes.now()
+	deleteObject(path)
+	d.storePrefetchedSize(path, 10, told)
+	_, known := d.prefetched.size(path)
+	require.False(t, known)
+
+	told = d.deletes.now()
+	deleteObject(d.objectKey("unrelated"))
+	d.storePrefetchedSize(path, 20, told)
+	size, known := d.prefetched.size(path)
+	require.True(t, known, "a delete of another object keeps the size")
+	require.Equal(t, int64(20), size)
+
+	other := d.objectKey("other")
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				deleteObject(other)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				d.storePrefetchedSize(other, 1, d.deletes.now())
+			}
+		}()
+	}
+	wg.Wait()
+	deleteObject(other)
+	_, known = d.prefetched.size(other)
+	require.False(t, known)
+}
+
+// A delete is seen by the reads begun before it and only for its object; once the
+// remembered deletes are forgotten, every read begun before then counts as deleted.
+func TestObjectDeletesSince(t *testing.T) {
+	var o objectDeletes
+	start := o.now()
+	require.False(t, o.since("a", start))
+	o.deleted("a")
+	require.True(t, o.since("a", start))
+	require.False(t, o.since("b", start))
+	require.False(t, o.since("a", o.now()))
+
+	before := o.now()
+	for i := range objectDeletesMax {
+		o.deleted(strconv.Itoa(i))
+	}
+	o.deleted("c")
+	require.True(t, o.since("b", before), "the deletes since are forgotten")
+	require.False(t, o.since("b", o.now()))
+}
+
+// While the cache loads its files no delete is forgotten, so a file of an object not
+// deleted is still found not deleted since the cache was created; once loaded, deletes
+// past the bound are forgotten again.
+func TestObjectDeletesKeptWhileLoading(t *testing.T) {
+	var o objectDeletes
+	o.setLoading(true)
+	for i := range objectDeletesMax + 1 {
+		o.deleted(strconv.Itoa(i))
+	}
+	require.False(t, o.since("kept", 0))
+	require.True(t, o.since("0", 0))
+
+	o.setLoading(false)
+	o.deleted("next")
+	require.True(t, o.since("kept", 0), "past the bound once loaded, deletes are forgotten")
+}
+
+// heldStorage reads the first read's bytes at once and returns them when released.
+type heldStorage struct {
+	ObjectStorage
+	once     sync.Once
+	read     chan struct{}
+	released chan struct{}
+}
+
+func (h *heldStorage) Read(ctx context.Context, key string, min, max *int64) (io.ReadCloser, error) {
+	r, err := h.ObjectStorage.Read(ctx, key, min, max)
+	if err != nil {
+		return nil, err
+	}
+	held := false
+	h.once.Do(func() { held = true })
+	if !held {
+		return r, nil
+	}
+	defer r.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return nil, err
+	}
+	close(h.read)
+	select {
+	case <-h.released:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return io.NopCloser(bytes.NewReader(data)), nil
+}
+
+// A column range download that read an object before it was deleted and recreated does
+// not cache the old bytes after the delete, which cancels it: a later read returns the
+// new object.
+func TestColumnRangeReadBeforeDeleteIsNotCached(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		fs, _, data := newPrefetchRangeFS(t, 64<<10, 300<<10)
+		fs.SetAsyncUpdate(async)
+		ctx := context.Background()
+		held := &heldStorage{ObjectStorage: fs.server.raw, read: make(chan struct{}), released: make(chan struct{})}
+		fs.server.raw = held
+		req := ObjectPrefetch{FilePath: "object", Size: 10, Ranges: []PrefetchRange{{Offset: 100, Size: 10}}}
+		done := make(chan struct{})
+		go func() { defer close(done); fs.prefetchObject(ctx, req) }()
+		<-held.read
+
+		require.NoError(t, fs.Delete(ctx, "object"))
+		recreated := slices.Clone(data)
+		for i := range recreated {
+			recreated[i] ^= 0xff
+		}
+		require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(recreated)), Data: recreated}}, Policy: SkipAllCache}))
+		close(held.released)
+		<-done
+		fs.diskCache.flushAsyncUpdates(ctx)
+
+		require.Equal(t, recreated[102:107], readRangeOf(t, fs, ColumnPrefetch, 102, 5), "async %v", async)
+		_, cached := fs.diskCache.ranges.covering(fs.diskCache.objectKey("object"), 100, 10)
+		require.False(t, cached, "the old range is not cached, async %v", async)
+	}
+}
+
+// A read that skips disk cache reads is not served from cached prefetch ranges.
+func TestPrefetchRangeSkipsDiskCacheReads(t *testing.T) {
+	fs, storage, data := newPrefetchRangeFS(t, 4096, 64<<10)
+	require.Equal(t, data[5000:5002], readRangeOf(t, fs, 0, 5000, 2))
+	require.Equal(t, int64(1), storage.reads.Load())
+	require.Equal(t, data[5010:5012], readRangeOf(t, fs, SkipDiskCacheReads, 5010, 2))
+	require.Equal(t, int64(2), storage.reads.Load(), "read from object storage")
+}
+
+// A read whose prefetch range run does not fit the memory budget reads its prefetch range
+// at once through a file fill, never waiting for memory.
+func TestPrefetchRangeRunsAreBounded(t *testing.T) {
+	fs, storage, data := newPrefetchRangeFS(t, 4096, 64<<10)
+	// A run's buffer is at least 64 KiB, the bytes it counts for.
+	fs.server.memoryLimit = 64 << 10
+	require.True(t, fs.server.takeMemory(1, foregroundRequest))
+	require.Equal(t, data[5000:5002], readRangeOf(t, fs, 0, 5000, 2))
+	require.Equal(t, int64(4096), storage.bytes.Load(), "the prefetch range")
+	fs.diskCache.prefetchObjects.reads.Wait()
+	require.Equal(t, int64(1), heldMemory(fs.diskCache), "the run took no memory")
+	fs.server.freeMemory(1, foregroundRequest)
+}
+
+// A probe of a few columns reads exactly their entries, never the whole object, even when
+// the entries lie far apart; policy 0 downloads the whole object.
+func TestExactColumnsReadNeverDownloadsTheObject(t *testing.T) {
+	for _, policy := range []Policy{ExactColumnsRead, 0} {
+		fs, storage, data := newPrefetchRangeFS(t, 4096, 300<<10)
+		vec := &IOVector{FilePath: "object", Policy: policy | SkipMemoryCache,
+			Entries: []IOEntry{{Offset: 100, Size: 10}, {Offset: 200 << 10, Size: 10}}}
+		require.NoError(t, fs.Read(context.Background(), vec))
+		require.Equal(t, data[100:110], vec.Entries[0].Data)
+		require.Equal(t, data[200<<10:200<<10+10], vec.Entries[1].Data)
+		vec.Release()
+		if policy == ExactColumnsRead {
+			require.Equal(t, int64(2), storage.reads.Load())
+			require.Equal(t, int64(20), storage.bytes.Load(), "only the entries")
+		} else {
+			require.True(t, fs.diskCache.cache.Contains(fs.diskCache.wholePath("object", int64(len(data)))), "policy 0 caches the whole object")
+		}
+	}
+}
+
+// firstReadGate holds the first read until released; later reads pass.
+type firstReadGate struct {
+	ObjectStorage
+	once    sync.Once
+	started chan struct{}
+	release chan struct{}
+}
+
+func (g *firstReadGate) Read(ctx context.Context, key string, min, max *int64) (io.ReadCloser, error) {
+	first := false
+	g.once.Do(func() { first = true })
+	if first {
+		close(g.started)
+		select {
+		case <-g.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return g.ObjectStorage.Read(ctx, key, min, max)
+}
+
+// A column read of bytes a column range download is reading waits for the download
+// instead of reading them from object storage again, and so do further downloads of them.
+func TestColumnReadJoinsRangeDownload(t *testing.T) {
+	fs, storage, data := newPrefetchRangeFS(t, 64<<10, 300<<10)
+	gate := &firstReadGate{ObjectStorage: fs.server.raw, started: make(chan struct{}), release: make(chan struct{})}
+	fs.server.raw = gate
+	ctx := context.Background()
+	req := ObjectPrefetch{FilePath: "object", Size: 64 << 10, Ranges: []PrefetchRange{{Offset: 0, Size: 64 << 10}}}
+	downloaded := make(chan struct{})
+	go func() { defer close(downloaded); fs.prefetchObject(ctx, req) }()
+	<-gate.started
+
+	read := make(chan []byte, 1)
+	go func() { read <- readRangeOf(t, fs, ColumnPrefetch, 100, 10) }()
+	again := make(chan struct{})
+	go func() { defer close(again); fs.prefetchObject(ctx, req) }()
+	require.Never(t, func() bool { return len(read) > 0 }, 100*time.Millisecond, 5*time.Millisecond,
+		"the read waits for the download")
+	close(gate.release)
+	require.Equal(t, data[100:110], <-read)
+	<-downloaded
+	<-again
+	require.Equal(t, int64(1), storage.reads.Load(), "one read of object storage")
+	require.Equal(t, data[200:210], readRangeOf(t, fs, ColumnPrefetch, 200, 10))
+	require.Equal(t, int64(1), storage.reads.Load(), "served from the cached range")
+}
+
+// An entry read before a delete is never found by a read after the delete returns: a
+// delete before its publication is claimed refuses it, and one after waits for the
+// publication to end and removes the entry.
+func TestDeleteWaitsForPublicationOfEarlierRead(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		for _, claimed := range []bool{false, true} {
+			fs, _, data := newPrefetchRangeFS(t, 64<<10, 300<<10)
+			d := fs.diskCache
+			ctx := context.Background()
+			key := d.objectKey("object")
+			entry := IOEntry{Offset: 100, Size: 10, Data: slices.Clone(data[100:110]), readDeletes: d.readDeletes()}
+
+			deleted := make(chan struct{})
+			var deleteErr error
+			deleteObject := func() { defer close(deleted); deleteErr = d.DeletePaths(ctx, []string{"object"}) }
+			var published, seenAfterDelete atomic.Bool
+			if claimed {
+				d.hooks.afterPublicationClaim = func() {
+					go deleteObject()
+					select {
+					case <-deleted:
+					case <-time.After(100 * time.Millisecond):
+					}
+				}
+				d.hooks.afterFilePublication = func() {
+					published.Store(true)
+					select {
+					case <-deleted:
+						if _, cached := d.ranges.covering(key, 100, 10); cached {
+							seenAfterDelete.Store(true)
+						}
+					default:
+					}
+				}
+			} else {
+				d.hooks.beforeFilePublication = deleteObject
+				d.hooks.afterFilePublication = func() { published.Store(true) }
+			}
+			require.NoError(t, d.Update(ctx, &IOVector{FilePath: "object", Entries: []IOEntry{entry}}, async))
+			d.flushAsyncUpdates(ctx)
+			<-deleted
+			require.NoError(t, deleteErr)
+
+			require.Equal(t, claimed, published.Load(), "async %v claimed %v", async, claimed)
+			require.False(t, seenAfterDelete.Load(), "a read after the delete found the entry, async %v", async)
+			_, cached := d.ranges.covering(key, 100, 10)
+			require.False(t, cached, "async %v claimed %v", async, claimed)
+		}
+	}
+}
+
+func readTestEntry(t *testing.T, ctx context.Context, cache *DiskCache, path string, size int64) ([]byte, bool) {
+	t.Helper()
+	vec := &IOVector{FilePath: path, Entries: []IOEntry{{Offset: 0, Size: size}}}
+	require.NoError(t, cache.Read(ctx, vec))
+	defer vec.Release()
+	if !vec.Entries[0].done {
+		return nil, false
+	}
+	return append([]byte(nil), vec.Entries[0].Data...), true
+}
+
+// A read keeps the cache file it opened open, and the next read of the file reads
+// through it instead of opening it again.
+func TestDiskCacheReadKeepsFileOpen(t *testing.T) {
+	ctx := context.Background()
+	cache, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1<<20), nil, false, nil, "")
+	require.NoError(t, err)
+	defer cache.Close(ctx)
+	data := []byte("0123456789")
+	require.NoError(t, cache.Update(ctx, &IOVector{FilePath: "foo", Entries: []IOEntry{{Offset: 0, Size: 10, Data: data}}}, false))
+	diskPath := cache.pathForIOEntry("foo", IOEntry{Offset: 0, Size: 10})
+
+	got, ok := readTestEntry(t, ctx, cache, "foo", 10)
+	require.True(t, ok)
+	require.Equal(t, data, got)
+	cache.paths.L.Lock()
+	kept := cache.paths.openFiles.m[diskPath]
+	cache.paths.L.Unlock()
+	require.NotNil(t, kept, "the read keeps its file open")
+	require.Zero(t, kept.refs)
+
+	got, ok = readTestEntry(t, ctx, cache, "foo", 10)
+	require.True(t, ok)
+	require.Equal(t, data, got)
+	cache.paths.L.Lock()
+	defer cache.paths.L.Unlock()
+	require.Same(t, kept, cache.paths.openFiles.m[diskPath], "the next read reads the kept file")
+	require.Zero(t, kept.refs)
+}
+
+// A delete of a cached object drops and closes the files kept open for it; the cache's
+// close closes the others.
+func TestDiskCacheKeptFileClosedOnDeleteAndClose(t *testing.T) {
+	ctx := context.Background()
+	cache, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1<<20), nil, false, nil, "")
+	require.NoError(t, err)
+	for _, p := range []string{"foo", "bar"} {
+		require.NoError(t, cache.Update(ctx, &IOVector{FilePath: p, Entries: []IOEntry{{Offset: 0, Size: 3, Data: []byte(p)}}}, false))
+		_, ok := readTestEntry(t, ctx, cache, p, 3)
+		require.True(t, ok)
+	}
+	keptOf := func(p string) *openCacheFile {
+		cache.paths.L.Lock()
+		defer cache.paths.L.Unlock()
+		return cache.paths.openFiles.m[cache.pathForIOEntry(p, IOEntry{Offset: 0, Size: 3})]
+	}
+	foo, bar := keptOf("foo"), keptOf("bar")
+	require.NotNil(t, foo)
+	require.NotNil(t, bar)
+
+	require.NoError(t, cache.DeletePaths(ctx, []string{"foo"}))
+	require.Nil(t, keptOf("foo"))
+	_, err = foo.file.Stat()
+	require.ErrorIs(t, err, os.ErrClosed)
+	_, ok := readTestEntry(t, ctx, cache, "foo", 3)
+	require.False(t, ok, "a deleted entry is not read through its kept file")
+
+	cache.Close(ctx)
+	_, err = bar.file.Stat()
+	require.ErrorIs(t, err, os.ErrClosed)
+}
+
+// Past the most files kept, the least recently taken file no read holds is closed for a
+// new one; with every file held, a new file is not kept.
+func TestOpenFilePoolLimit(t *testing.T) {
+	dir := t.TempDir()
+	open := func(name string) *os.File {
+		f, err := os.Create(filepath.Join(dir, name))
+		require.NoError(t, err)
+		return f
+	}
+	o := openFilePool{limit: 2}
+	a, closeA := o.keepLocked("a", open("a"))
+	require.Nil(t, closeA)
+	b, _ := o.keepLocked("b", open("b"))
+	o.releaseLocked(a)
+	o.releaseLocked(b)
+	require.NotNil(t, o.takeLocked("a"))
+	o.releaseLocked(a)
+
+	c, closeFile := o.keepLocked("c", open("c"))
+	require.NotNil(t, c)
+	require.Same(t, b.file, closeFile, "the least recently taken file is closed")
+	require.NoError(t, closeFile.Close())
+	require.Nil(t, o.m["b"])
+
+	require.NotNil(t, o.takeLocked("a"))
+	d := open("d")
+	defer d.Close()
+	kept, closeFile := o.keepLocked("d", d)
+	require.Nil(t, kept, "with every file held, none is kept")
+	require.Nil(t, closeFile)
+
+	// A dropped file a read holds is closed when the read releases it.
+	require.Nil(t, o.releaseLocked(c))
+	dropped := o.dropAllLocked()
+	require.Equal(t, []*os.File{c.file}, dropped)
+	require.NoError(t, c.file.Close())
+	require.Same(t, a.file, o.releaseLocked(a))
+	require.NoError(t, a.file.Close())
+}
+
+// Reads of an entry at once share its kept file and read its bytes while its object is
+// deleted and cached again.
+func TestDiskCacheConcurrentReadsOfKeptFile(t *testing.T) {
+	ctx := context.Background()
+	cache, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1<<20), nil, false, nil, "")
+	require.NoError(t, err)
+	defer cache.Close(ctx)
+	data := []byte("0123456789abcdef")
+	update := func() {
+		require.NoError(t, cache.Update(ctx, &IOVector{FilePath: "foo", Entries: []IOEntry{{Offset: 0, Size: 16, Data: data}}}, false))
+	}
+	update()
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				vec := &IOVector{FilePath: "foo", Entries: []IOEntry{{Offset: 0, Size: 16}}}
+				if err := cache.Read(ctx, vec); err != nil {
+					t.Errorf("read: %v", err)
+					return
+				}
+				if vec.Entries[0].done && !bytes.Equal(vec.Entries[0].Data, data) {
+					t.Errorf("read %q, want %q", vec.Entries[0].Data, data)
+				}
+				vec.Release()
+			}
+		}()
+	}
+	for i := 0; i < 50; i++ {
+		require.NoError(t, cache.DeletePaths(ctx, []string{"foo"}))
+		update()
+	}
+	close(stop)
+	wg.Wait()
+}
+
+// A read that finds no file at a path notes it missing and does not open it again; a write
+// of the path forgets that, so the next read finds the file.
+func TestDiskCacheMissingPathForgottenOnWrite(t *testing.T) {
+	ctx := context.Background()
+	cache, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1<<20), nil, false, nil, "")
+	require.NoError(t, err)
+	defer cache.Close(ctx)
+	diskPath := cache.pathForIOEntry("foo", IOEntry{Offset: 0, Size: 3})
+	_, ok := readTestEntry(t, ctx, cache, "foo", 3)
+	require.False(t, ok)
+	cache.paths.L.Lock()
+	require.True(t, cache.paths.openFiles.missingLocked(diskPath))
+	cache.paths.L.Unlock()
+
+	require.NoError(t, cache.Update(ctx, &IOVector{FilePath: "foo", Entries: []IOEntry{{Offset: 0, Size: 3, Data: []byte("abc")}}}, false))
+	got, ok := readTestEntry(t, ctx, cache, "foo", 3)
+	require.True(t, ok)
+	require.Equal(t, []byte("abc"), got)
+}
+
+// disk-open-files-max bounds the files kept open by the disk cache and by the index-file
+// cache; unset, it is DefaultDiskOpenFilesMax.
+func TestDiskOpenFilesMaxConfig(t *testing.T) {
+	config := indexCacheConfig(t, 64<<20, 64<<20)
+	require.Equal(t, DefaultDiskOpenFilesMax, config.diskOpenFilesMax())
+	limit := 3
+	config.DiskOpenFilesMax = &limit
+	caches := newTestFileServiceCaches(t, config)
+	require.Equal(t, 3, caches.disk.paths.openFiles.limit)
+	require.Equal(t, 3, caches.index.disk.paths.openFiles.limit)
+}
+
+// disk-open-files-max 0 keeps no file open and notes no path missing: every read opens the
+// files it reads.
+func TestDiskOpenFilesMaxZeroDisablesPool(t *testing.T) {
+	config := indexCacheConfig(t, 64<<20, 64<<20)
+	zero := 0
+	config.DiskOpenFilesMax = &zero
+	cache := newTestFileServiceCaches(t, config).disk
+	ctx := context.Background()
+	_, ok := readTestEntry(t, ctx, cache, "foo", 3)
+	require.False(t, ok)
+	require.NoError(t, cache.Update(ctx, &IOVector{FilePath: "foo", Entries: []IOEntry{{Offset: 0, Size: 3, Data: []byte("abc")}}}, false))
+	got, ok := readTestEntry(t, ctx, cache, "foo", 3)
+	require.True(t, ok)
+	require.Equal(t, []byte("abc"), got)
+	cache.paths.L.Lock()
+	defer cache.paths.L.Unlock()
+	require.Empty(t, cache.paths.openFiles.m)
+	require.Empty(t, cache.paths.openFiles.missing)
+}
+
+func (d *DiskCache) startUpdate(path string) func() {
+	o, _ := d.paths.acquire(context.Background(), path, nil)
+	return func() { _ = o.release() }
+}
+
+func (d *DiskCache) startUpdateWithCleanup(path string, cleanup func() error) func() error {
+	o, _ := d.paths.acquire(context.Background(), path, cleanup)
+	return o.release
+}
+
+func (d *DiskCache) startUpdateContext(ctx context.Context, path string) (func(), error) {
+	o, err := d.paths.acquire(ctx, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	return func() { _ = o.release() }, nil
+}
+
+func (d *DiskCache) isUpdating(path string) bool {
+	d.paths.L.Lock()
+	defer d.paths.L.Unlock()
+	return d.paths.owners[path] != nil
+}
+
+func TestIndexEvictionWithRenameFailureOverCapacity(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		readOnly bool
+	}{
+		{name: "writable_directory"},
+		{name: "read_only_directory", readOnly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.readOnly && !permissionsEnforced(t) {
+				t.Skip("filesystem permissions are not enforced")
+			}
+			ctx := context.Background()
+			var capacity atomic.Int64
+			capacity.Store(1 << 20)
+			c, err := NewIndexFileCache(ctx, t.TempDir(), capacity.Load, "", 0)
+			require.NoError(t, err)
+			t.Cleanup(func() { c.Close(ctx) })
+			<-c.disk.load.done
+
+			written, err := c.Put(ctx, "entry", recoveryFiles(bytes.Repeat([]byte{1}, 128<<10)))
+			require.NoError(t, err)
+			require.True(t, written)
+			entry, err := c.disk.pathForDir("entry")
+			require.NoError(t, err)
+			parent := filepath.Dir(entry)
+			if tc.readOnly {
+				require.NoError(t, os.Chmod(parent, 0o500))
+				t.Cleanup(func() { require.NoError(t, os.Chmod(parent, 0o755)) })
+			}
+
+			attempts := 0
+			var restoreErr error
+			c.disk.hooks.beforeEvictionStart = func(path string) {
+				if path != entry {
+					return
+				}
+				attempts++
+				if tc.readOnly && attempts == 3 {
+					// Release the forced failure after observing that eviction retries
+					// the same path with no change in capacity or permissions.
+					restoreErr = os.Chmod(parent, 0o755)
+				}
+			}
+			t.Cleanup(func() { c.disk.hooks.beforeEvictionStart = nil })
+			require.Positive(t, c.disk.cache.Used())
+			capacity.Store(0)
+			c.disk.Evict(ctx, nil)
+			require.NoError(t, restoreErr)
+			require.Equal(t, 1, attempts, "eviction should finish after one attempt at the same path")
+		})
+	}
+}
+
+func TestColumnPrefetchRefillsMissingFileRegardlessOfRangeOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		coldFirst bool
+	}{
+		{name: "missing_range_first"},
+		{name: "cold_range_first", coldFirst: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			fs, storage, _ := newPrefetchRangeFS(t, 0, 300<<10)
+			<-fs.diskCache.load.done
+			missing := PrefetchRange{Offset: 40 << 10, Size: 4 << 10}
+			cold := PrefetchRange{Offset: 80 << 10, Size: 4 << 10}
+			prefetch := func(ranges ...PrefetchRange) {
+				t.Helper()
+				require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{
+					FilePath: "object", Size: int64(len(ranges)) * missing.Size, Ranges: ranges,
+				}))
+				waitPrefetcherIdle(t, fs)
+			}
+
+			prefetch(missing)
+			path := fs.diskCache.pathForIOEntry("object", missing.entry())
+			require.FileExists(t, path)
+			require.NoError(t, os.Remove(path))
+			require.True(t, fs.diskCache.cache.Contains(path))
+			before := storage.reads.Load()
+
+			if tc.coldFirst {
+				prefetch(cold, missing)
+			} else {
+				prefetch(missing, cold)
+			}
+			require.FileExists(t, fs.diskCache.pathForIOEntry("object", cold.entry()))
+			_, err := os.Stat(path)
+			require.NoError(t, err, "a prefetch of both ranges should restore the missing file")
+			require.Equal(t, int64(2), storage.reads.Load()-before)
+		})
+	}
+}
+
+func TestColumnReadPropagatesJoinedPrefetchSourceError(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		fileBacked bool
+	}{
+		{name: "memory_prefetch"},
+		{name: "file_prefetch", fileBacked: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			t.Cleanup(cancel)
+			fs, storage, _ := newPrefetchRangeFS(t, 0, 300<<10)
+			<-fs.diskCache.load.done
+			r := PrefetchRange{Offset: 40 << 10, Size: 4 << 10}
+			if tc.fileBacked {
+				fs.diskCache.memoryPrefetchMax = r.Size - 1
+			}
+			s := &failOnceStorage{ObjectStorage: storage, fail: r.Offset, gate: make(chan struct{})}
+			fs.server.raw = s
+			release := sync.OnceFunc(func() { close(s.gate) })
+			t.Cleanup(release)
+			require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{
+				FilePath: "object", Size: r.Size, Ranges: []PrefetchRange{r},
+			}))
+			require.Eventually(t, s.failed.Load, 5*time.Second, time.Millisecond, "prefetch entered storage")
+
+			finished := make(chan struct{})
+			defer func() {
+				release()
+				cancel()
+				<-finished
+			}()
+			result := make(chan error, 1)
+			go func() {
+				defer close(finished)
+				_, err := readColumnRange(ctx, fs, r)
+				result <- err
+			}()
+			diskPath := fs.diskCache.objectKey("object")
+			require.Eventually(t, func() bool {
+				if !tc.fileBacked {
+					return memoryWaiters(fs, diskPath) == 1
+				}
+				o, _ := fs.diskCache.fileDownload(diskPath, r.Offset, r.Offset+r.Size)
+				if o == nil {
+					return false
+				}
+				o.mu.Lock()
+				defer o.mu.Unlock()
+				return len(o.waiters) == 1
+			}, 5*time.Second, time.Millisecond, "the foreground read joined the stalled prefetch")
+			release()
+			err := <-result
+			waitPrefetcherIdle(t, fs)
+			require.ErrorContains(t, err, "probe: storage failed",
+				"the joined read should receive the source error (successful fallback opens: %d)", storage.reads.Load())
+			require.Zero(t, storage.reads.Load())
+		})
+	}
+}
+
+func TestIndexObjectReadRejectsEmptyRange(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		name := "index_cache_miss"
+		if cached {
+			name = "index_cache_hit"
+		}
+		t.Run(name, func(t *testing.T) {
+			fs, storage, data := newIndexObjectFS(t, true)
+			if cached {
+				cacheIndexObject(t, fs, "object", data)
+				require.Equal(t, data[100:110], readIndexObjectRange(t, fs, IndexFileObject, 100, 10))
+				require.Zero(t, storage.reads.Load())
+			}
+			vector := &IOVector{
+				FilePath: "object",
+				Policy:   IndexFileObject | SkipMemoryCache | SkipFullFilePreloads,
+				Entries:  []IOEntry{{Offset: 100, Size: 0}},
+			}
+			defer vector.Release()
+			err := fs.Read(context.Background(), vector)
+			require.True(t, moerr.IsMoErrCode(err, moerr.ErrEmptyRange), "expected ErrEmptyRange, got %v", err)
+		})
+	}
+}
+
+func TestRangeIndexSurvivesOlderEviction(t *testing.T) {
+	for _, tc := range []struct {
+		name                  string
+		reindexDuringEviction bool
+	}{
+		{name: "evict_without_reindex"},
+		{name: "evict_after_read_reindexes", reindexDuringEviction: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			fs, storage, data := newPrefetchRangeFS(t, 0, 300<<10)
+			d := fs.diskCache
+			<-d.load.done
+			r := PrefetchRange{Offset: 40 << 10, Size: 4 << 10}
+			require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{
+				FilePath: "object", Size: r.Size, Ranges: []PrefetchRange{r},
+			}))
+			waitPrefetcherIdle(t, fs)
+			path := d.pathForIOEntry("object", r.entry())
+			key := d.objectKey("object")
+			require.True(t, d.cache.Contains(path))
+			require.FileExists(t, path)
+
+			d.hooks.beforeEvictionStart = func(evicted string) {
+				if evicted != path || !tc.reindexDuringEviction {
+					return
+				}
+				require.False(t, d.cache.Contains(path), "old cache index record was removed")
+				vector := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads, Entries: []IOEntry{r.entry()}}
+				defer vector.Release()
+				require.NoError(t, d.Read(ctx, vector))
+				if vector.Entries[0].done {
+					require.Equal(t, data[r.Offset:r.Offset+r.Size], vector.Entries[0].Data)
+				}
+				t.Logf("read reindexed old file: %t", d.cache.Contains(path))
+			}
+			t.Cleanup(func() { d.hooks.beforeEvictionStart = nil })
+			d.cache.ForceEvict(ctx, d.cache.Used())
+			if !d.cache.Contains(path) {
+				// A completed eviction need not keep the range. Refill it to
+				// establish the same warm postcondition as a successful reindex.
+				require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{
+					FilePath: "object", Size: r.Size, Ranges: []PrefetchRange{r},
+				}))
+				waitPrefetcherIdle(t, fs)
+			}
+			require.True(t, d.cache.Contains(path))
+			require.FileExists(t, path)
+			want := PrefetchRange{Offset: r.Offset + 1, Size: r.Size - 2}
+			_, indexed := d.ranges.containing(key, want.Offset, want.Size, nil)
+			before := storage.reads.Load()
+			got, err := readColumnRange(ctx, fs, want)
+			require.NoError(t, err)
+			require.Equal(t, data[want.Offset:want.Offset+want.Size], got)
+			require.Equal(t, before, storage.reads.Load(),
+				"a warm subrange should not open storage (range indexed before read: %t)", indexed)
+		})
+	}
+}
+
+// A read of a known size is served from a warm index-file entry. A read to the end is read
+// from storage, so a truncated entry file cannot shorten it.
+func TestIndexObjectReadToEndReadsWholeTail(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		readToEnd bool
+		truncate  bool
+	}{
+		{name: "known_size"},
+		{name: "read_to_end", readToEnd: true},
+		{name: "read_to_end_truncated_entry", readToEnd: true, truncate: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, storage, data := newIndexObjectFS(t, true)
+			cacheIndexObject(t, fs, "object", data)
+			if tc.truncate {
+				diskPath, ok := fs.indexObjectCached("object")
+				require.True(t, ok)
+				require.NoError(t, os.Truncate(filepath.Join(diskPath, IndexObjectFile), 1024))
+			}
+			offset := int64(1000)
+			size := int64(len(data)) - offset
+			if tc.readToEnd {
+				size = -1
+			}
+			got := readIndexObjectRange(t, fs, IndexFileObject|SkipFullFilePreloads, offset, size)
+			require.Equal(t, data[offset:], got, "the read returns the whole object tail")
+			if !tc.readToEnd {
+				require.Zero(t, storage.reads.Load(), "a warm index-file entry serves the read")
+			}
+		})
+	}
+}
+
+func TestIndexObjectReadRefreshesIdleTTL(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		sinceUse time.Duration
+	}{
+		{name: "outside_touch_interval", sinceUse: 2 * indexObjectTouch},
+		{name: "inside_touch_interval", sinceUse: time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			fs, storage, data := newIndexObjectFS(t, true)
+			cacheIndexObject(t, fs, "object", data)
+			require.Equal(t, data[10:20], readIndexObjectRange(t, fs, IndexFileObject, 10, 10))
+			path, ok := fs.indexObjectCached("object")
+			require.True(t, ok)
+			c := fs.indexFileCache
+			c.idleTTL = 2 * time.Second
+
+			// Age the previous use in both places without waiting for the touch interval.
+			lastRead := time.Now().Add(-tc.sinceUse)
+			require.NoError(t, os.Chtimes(path, lastRead, lastRead))
+			fs.indexObjects.mu.Lock()
+			fs.indexObjects.touched[path] = lastRead
+			fs.indexObjects.mu.Unlock()
+
+			require.Equal(t, data[20:30], readIndexObjectRange(t, fs, IndexFileObject, 20, 10))
+			require.Zero(t, storage.reads.Load())
+			removed, err := c.collectIdle(ctx, time.Now().Add(1500*time.Millisecond))
+			require.NoError(t, err)
+			require.Zero(t, removed, "idle collection should keep the index object that was just read")
+		})
+	}
+}
+
+func TestReadStartedSplitDownloadWaitsForItsPart(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		delays bool
+	}{
+		{name: "part_arrives_before_join_deadline"},
+		{name: "part_arrives_after_join_deadline", delays: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				const partSize = prefetchBlockMax
+				download := &objectDownload{parts: []downloadPart{
+					{end: partSize}, {start: partSize, end: 2 * partSize},
+				}}
+				download.begin(1)
+				reader := newFullObjectDiskCacheReader(&IOVector{Entries: []IOEntry{{Offset: partSize, Size: 8}}})
+				source := bytes.Repeat([]byte{3}, 2*partSize)
+				type result struct {
+					captured bool
+					err      error
+				}
+				done := make(chan result, 1)
+				go func() {
+					captured, err := reader.capture(ctx, download, bytes.NewReader(source), "object")
+					done <- result{captured, err}
+				}()
+				synctest.Wait()
+				download.mu.Lock()
+				waiters := len(download.waiters)
+				download.mu.Unlock()
+				require.Equal(t, 1, waiters, "the initiating read is waiting for its bytes")
+				if tc.delays {
+					// The clock is simulated. Advance past the bound for a joining read
+					// while both parts are still gated.
+					time.Sleep(maxIOWaitDuration + time.Nanosecond)
+				}
+				download.advance(1, 8)
+				got := <-done
+				require.NoError(t, got.err)
+				require.True(t, got.captured, "the initiating read should take its bytes while the other part is still pending")
+				require.Equal(t, source[partSize:partSize+8], reader.captures[0].data.Bytes())
+			})
+		})
+	}
+}
+
+// A read that streams an entry gets its reader while the body is still being read.
+func TestReadCloserReturnsBeforeReadingBody(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		policy Policy
+	}{
+		{name: "bypass_disk_reads", policy: SkipDiskCacheReads},
+		{name: "eligible_for_range_sharing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			fs, _, data := newPrefetchRangeFS(t, 0, 1024)
+			// A streamed entry past the bytes a prefetch object buffers opens its own reader.
+			fs.diskCache.memoryPrefetchMax = 32
+			<-fs.diskCache.load.done
+			storage := &stallingStorage{ObjectStorage: fs.server.raw, stalled: make(chan struct{}), release: make(chan struct{})}
+			fs.server.raw = storage
+			unblock := sync.OnceFunc(func() { close(storage.release) })
+			readDone := make(chan struct{})
+			defer func() {
+				unblock()
+				<-readDone
+			}()
+			type result struct {
+				reader io.ReadCloser
+				err    error
+			}
+			results := make(chan result, 1)
+			go func() {
+				defer close(readDone)
+				var reader io.ReadCloser
+				vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | tc.policy,
+					Entries: []IOEntry{{Size: 64, ReadCloserForRead: &reader}}}
+				defer vec.Release()
+				err := fs.Read(ctx, vec)
+				results <- result{reader: reader, err: err}
+			}()
+
+			var got result
+			select {
+			case got = <-results:
+			case <-ctx.Done():
+				t.Fatal("Read waited for the remote body before handing the ReadCloser to the caller")
+			}
+			require.NoError(t, got.err)
+			require.NotNil(t, got.reader)
+			defer got.reader.Close()
+			unblock()
+			content, err := io.ReadAll(got.reader)
+			require.NoError(t, err)
+			require.Equal(t, data[:64], content)
+		})
+	}
+}
+
+// A Delete waits for no publication I/O of a put, only for its publishing rename.
+func TestIndexFileCacheDeleteReturnsWhilePutIsStalled(t *testing.T) {
+	for _, protectedPut := range []bool{false, true} {
+		name := "ordinary_put"
+		if protectedPut {
+			name = "put_with_delete_mark"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			fs, _, data := newIndexObjectFS(t, true)
+			cache := fs.indexFileCache
+			blocked := make(chan struct{})
+			resume := make(chan struct{})
+			unblock := sync.OnceFunc(func() { close(resume) })
+			defer unblock()
+			cache.disk.hooks.beforeFilePublication = func() {
+				close(blocked)
+				<-resume
+			}
+			putDone := make(chan error, 1)
+			go func() {
+				var err error
+				if protectedPut {
+					_, err = cache.PutUnlessDeleted(ctx, "entry", cache.DeleteMark(), recoveryFiles(data[:64]))
+				} else {
+					_, err = cache.Put(ctx, "entry", recoveryFiles(data[:64]))
+				}
+				putDone <- err
+			}()
+			defer func() {
+				unblock()
+				require.NoError(t, <-putDone)
+			}()
+			select {
+			case <-blocked:
+			case <-time.After(5 * time.Second):
+				t.Fatal("put never reached publication")
+			}
+
+			deleteCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+			defer cancel()
+			deleted := make(chan error, 1)
+			go func() { deleted <- cache.Delete(deleteCtx, "entry") }()
+			select {
+			case err := <-deleted:
+				require.ErrorIs(t, err, context.DeadlineExceeded)
+			case <-time.After(time.Second):
+				unblock()
+				require.ErrorIs(t, <-deleted, context.DeadlineExceeded)
+				t.Fatal("Delete stayed blocked past its deadline until the put resumed")
+			}
+		})
+	}
+}
+
+// A read that joins a queued prefetch is served by it, from the cache it fills.
+func TestReadRechecksCachesAfterQueuedPublication(t *testing.T) {
+	for _, index := range []bool{false, true} {
+		name := "table_disk_cache"
+		if index {
+			name = "index_file_cache"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			fs, storage, data := newIndexObjectFS(t, index)
+			busyFills(t, fs)
+
+			policy := Policy(SkipMemoryCache)
+			if index {
+				policy |= IndexFileObject
+			}
+			ctx = WithFileServicePolicy(ctx, policy)
+			require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: int64(len(data))}))
+			require.True(t, fs.diskCache.isQueued("object"))
+			vec := &IOVector{FilePath: "object", Policy: policy, Entries: []IOEntry{{Offset: 32, Size: 16}}}
+			defer vec.Release()
+			require.NoError(t, fs.Read(ctx, vec))
+			require.Equal(t, data[32:48], vec.Entries[0].Data)
+			require.EqualValues(t, 1, storage.reads.Load(), "the read should use the just-published object")
+		})
 	}
 }

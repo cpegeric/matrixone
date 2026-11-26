@@ -18,17 +18,17 @@ import (
 	"context"
 	"testing"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae/logtailreplay"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/readutil"
+	"github.com/stretchr/testify/require"
 )
 
 type columnPrefetchFS struct {
@@ -142,6 +142,110 @@ func TestColumnPrefetchRangesOrWholeObject(t *testing.T) {
 			if tc.overHalf {
 				require.GreaterOrEqual(t, req.Size*2, int64(stats.Size()))
 			}
+		})
+	}
+}
+
+func TestSmallLocalScanPrefetchesColumnsOnReach(t *testing.T) {
+	for _, small := range []bool{false, true} {
+		name := "four_blocks"
+		if small {
+			name = "three_blocks"
+		}
+		t.Run(name, func(t *testing.T) {
+			ls, fs, stats := newColumnPrefetchSource(t, true)
+			defer ls.Close()
+			ctx := context.Background()
+			if !small {
+				other, otherFS, otherStats := newColumnPrefetchSource(t, true)
+				defer other.Close()
+				// Add a readable block from a second object to exceed the local window cutoff.
+				vec := &fileservice.IOVector{FilePath: otherStats.ObjectName().String(), Entries: []fileservice.IOEntry{{Size: -1}}}
+				defer vec.Release()
+				require.NoError(t, otherFS.Read(ctx, vec))
+				require.NoError(t, fs.Write(ctx, *vec))
+				ls.rangeSlice.AppendBlockInfo(other.rangeSlice.Get(0))
+			}
+			ls.table = &txnTable{db: &txnDatabase{}}
+			ls.SetOrderBy(nil) // Apply the same four-block cutoff as NewLocalDataSource.
+			ctx = fileservice.WithFileServicePolicy(ctx, fileservice.ExactColumnsRead|fileservice.ColumnPrefetch)
+			blk, state, err := ls.Next(ctx, []string{"key"}, nil, []uint16{0}, 0, &readutil.MemPKFilter{}, nil, nil)
+			require.NoError(t, err)
+			require.Equal(t, engine.Persisted, state)
+			require.NotNil(t, blk)
+			var requests int
+			for _, req := range fs.reqs {
+				if req.FilePath == stats.ObjectName().String() {
+					require.Len(t, req.Ranges, 1)
+					requests++
+				}
+			}
+			require.Positive(t, requests, "entering a narrow scan's first object should request its column range")
+		})
+	}
+}
+
+func TestSmallLocalScanPrefetchesColumnsAhead(t *testing.T) {
+	for _, columns := range []bool{false, true} {
+		name := "whole_object"
+		if columns {
+			name = "column_ranges"
+		}
+		t.Run(name, func(t *testing.T) {
+			ls, fs, stats := newColumnPrefetchSource(t, true)
+			defer ls.Close()
+			ls.SetOrderBy(nil)
+			var policy fileservice.Policy
+			if columns {
+				policy = fileservice.SkipFullFilePreloads | fileservice.ColumnPrefetch
+			}
+			ls.batchPrefetch(fileservice.WithFileServicePolicy(context.Background(), policy), []uint16{0})
+			var requests int
+			for _, req := range fs.reqs {
+				if req.FilePath == stats.ObjectName().String() {
+					require.Len(t, req.Ranges, 1)
+					requests++
+				}
+			}
+			if columns {
+				require.Equal(t, 1, requests, "a three-block scan prefetches its column ranges ahead")
+			} else {
+				require.Zero(t, requests, "a three-block scan does not prefetch whole objects")
+			}
+		})
+	}
+}
+
+func TestOrderedLocalScanSkipsColumnPrefetch(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		limit uint64
+	}{
+		{name: "unlimited_ordered_scan"},
+		{name: "ordered_scan_with_limit", limit: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ls, fs, _ := newColumnPrefetchSource(t, true)
+			defer ls.Close()
+			typ := types.T_int32.ToType()
+			ls.table = &txnTable{db: &txnDatabase{}, tableDef: &plan.TableDef{
+				Cols: []*plan.ColDef{{Name: "k", Typ: plan.Type{Id: int32(typ.Oid)}, Seqnum: 0}},
+			}}
+			ls.Limit = tc.limit
+			ls.SetOrderBy([]*plan.OrderBySpec{{Expr: &plan.Expr{
+				Typ:  plan.Type{Id: int32(typ.Oid)},
+				Expr: &plan.Expr_Col{Col: &plan.ColRef{Name: "k"}},
+			}}})
+			ctx := fileservice.WithFileServicePolicy(context.Background(), fileservice.ColumnPrefetch|fileservice.SkipFullFilePreloads)
+			mp := mpool.MustNewZero()
+			defer mpool.DeleteMPool(mp)
+			out := batch.NewWithSize(1)
+			defer out.Clean(mp)
+			block, state, err := ls.Next(ctx, []string{"k"}, []types.Type{typ}, []uint16{0}, 0, &readutil.MemPKFilter{}, mp, out)
+			require.NoError(t, err)
+			require.Equal(t, engine.Persisted, state)
+			require.NotNil(t, block)
+			require.Empty(t, fs.reqs, "an ordered scan should issue zero column prefetches, got %d", len(fs.reqs))
 		})
 	}
 }
