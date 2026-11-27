@@ -1253,14 +1253,16 @@ func TestReadDoesNotWaitForPublication(t *testing.T) {
 }
 
 // An evicted range file is removed by the publisher, after the publications of its object
-// taken before; once the publisher is idle no file of the path is left unindexed. The
-// control holds no publication.
+// taken before; once the publisher is idle the file is gone. The control holds no
+// publication. The load of the cache directory ends first: it would index the file it
+// finds.
 func TestEvictionRemovesFileOnPublisher(t *testing.T) {
 	for _, held := range []bool{true, false} {
 		t.Run(map[bool]string{true: "held", false: "control"}[held], func(t *testing.T) {
 			ctx := context.Background()
 			fs, _, _ := newPrefetchRangeFS(t, 0, 64<<10)
 			d := fs.diskCache
+			<-d.load.done
 			path := cacheRange(t, fs, 100, 10)
 			release := func() {}
 			if held {
@@ -1273,10 +1275,8 @@ func TestEvictionRemovesFileOnPublisher(t *testing.T) {
 			}
 			release()
 			d.Flush(ctx)
-			// A file left is one published again since, and indexed.
-			if _, err := os.Stat(path); err == nil {
-				require.True(t, d.cache.Contains(path), "a file left on disk is indexed")
-			}
+			require.NoFileExists(t, path)
+			require.False(t, d.cache.Contains(path))
 		})
 	}
 }
