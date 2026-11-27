@@ -1672,7 +1672,7 @@ func TestJoinProbeJoinedWaitingFillRunsFirst(t *testing.T) {
 // the object is read once for each.
 func TestJoinProbeCachesNeverJoinEachOther(t *testing.T) {
 	type sequence struct{ first, second, hold string }
-	var sequences []sequence
+	sequences := make([]sequence, 0, 9)
 	for _, sq := range []sequence{
 		{"disk object", "index object", "download"},
 		{"index object", "disk object", "download"},

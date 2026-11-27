@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -1881,4 +1882,14 @@ func TestServerPromoteOfAdmittedWaiterIsNoop(t *testing.T) {
 	_, waiting := g.counts()
 	require.Zero(t, waiting[foregroundRequest]+waiting[backgroundRequest])
 	require.Zero(t, heldRoom(g))
+}
+
+// No request type has a function-typed field.
+func TestServerRequestsHoldNoFunctions(t *testing.T) {
+	for _, req := range requestTypes {
+		typ := reflect.TypeOf(req)
+		for i := range typ.NumField() {
+			require.NotEqual(t, reflect.Func, typ.Field(i).Type.Kind(), "%s.%s", typ.Name(), typ.Field(i).Name)
+		}
+	}
 }
