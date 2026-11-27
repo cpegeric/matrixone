@@ -546,8 +546,9 @@ func readDownload(ctx context.Context, o *objectDownload, off int64, dst []byte)
 // objects holding them: it joins each prefetch object under way holding some of them, and
 // takes the bytes none holds, and those of a joined prefetch object that ended without
 // them, through fetchPiece. It reports whether it returned them, and whether the prefetch
-// objects cache them. A read whose cache is the index-file cache, index, joins and starts
-// prefetch objects of that cache.
+// objects cache them; it returns false when a delete of the object was counted since it
+// began. A read whose cache is the index-file cache, index, joins and starts prefetch
+// objects of that cache.
 func (d *DiskCache) fetchRange(
 	ctx context.Context,
 	filePath string,
@@ -562,9 +563,16 @@ func (d *DiskCache) fetchRange(
 	if err := ctx.Err(); err != nil {
 		return nil, false, false, err
 	}
+	// Bytes copied across a delete of the object may be of two objects at the path.
+	key, deletes := d.objectKey(filePath), d.deletes.now()
+	defer func() {
+		if ok && d.deletes.since(key, deletes) {
+			content, ok, cached = nil, false, false
+		}
+	}()
 	f := &d.prefetchObjects
 	f.mu.Lock()
-	pieces := f.coverLocked(d.objectKey(filePath), index, start, end, policy.CacheIOEntry() && !policy.Any(SkipDiskCacheWrites))
+	pieces := f.coverLocked(key, index, start, end, policy.CacheIOEntry() && !policy.Any(SkipDiskCacheWrites))
 	if len(pieces) == 1 {
 		f.mu.Unlock()
 		return d.fetchPiece(ctx, filePath, policy, index, start, end, src)

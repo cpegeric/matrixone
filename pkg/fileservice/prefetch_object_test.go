@@ -2168,3 +2168,114 @@ func assertEventuallyBytes(t *testing.T, fs *S3FS, want int64) bool {
 	return assert.Eventually(t, func() bool { return prefetchBytes(fs) == want }, 2*time.Second, time.Millisecond,
 		"the buffer of the copied, ended flight is still charged: %d", prefetchBytes(fs))
 }
+
+// offsetGateStorage blocks the first read at offset 0 until open0 is closed, and every
+// read at offset gated until openGated is closed, or their contexts end.
+type offsetGateStorage struct {
+	ObjectStorage
+	gated     int64
+	first0    atomic.Bool
+	open0     chan struct{}
+	openGated chan struct{}
+	started   chan int64
+}
+
+func (s *offsetGateStorage) Read(ctx context.Context, key string, min, max *int64) (io.ReadCloser, error) {
+	var gate chan struct{}
+	switch {
+	case min != nil && *min == 0 && s.first0.CompareAndSwap(false, true):
+		gate = s.open0
+	case min != nil && *min == s.gated:
+		gate = s.openGated
+	}
+	if gate != nil {
+		s.started <- *min
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return s.ObjectStorage.Read(ctx, key, min, max)
+}
+
+// A read joining two prefetch objects, one of which a delete and rewrite of the object
+// stops, returns the bytes of one version of the object, not the first object's bytes
+// of the old version followed by the new version read in place of the stopped one.
+func TestReadJoiningPrefetchObjectsAcrossDeleteReturnsOneVersion(t *testing.T) {
+	const half = 16 << 10
+	ctx := context.Background()
+	fs, _, v1 := newPrefetchRangeFS(t, 0, 2*half)
+	v2 := slices.Clone(v1)
+	for i := range v2 {
+		v2[i]++
+	}
+	storage := &offsetGateStorage{ObjectStorage: fs.server.raw, gated: half,
+		open0: make(chan struct{}), openGated: make(chan struct{}), started: make(chan int64, 16)}
+	fs.server.raw = storage
+	d := fs.diskCache
+	read := func(offset, size int64) ([]byte, error) {
+		vec := &IOVector{FilePath: "object", Policy: ColumnPrefetch | SkipFullFilePreloads | SkipMemoryCache,
+			Entries: []IOEntry{{Offset: offset, Size: size}}}
+		defer vec.Release()
+		if err := fs.Read(ctx, vec); err != nil {
+			return nil, err
+		}
+		return slices.Clone(vec.Entries[0].Data), nil
+	}
+	type result struct {
+		data []byte
+		err  error
+	}
+	start := func(offset, size int64) chan result {
+		ch := make(chan result, 1)
+		go func() {
+			data, err := read(offset, size)
+			ch <- result{data, err}
+		}()
+		return ch
+	}
+	// Each half is read by a prefetch object of its own, held in object storage.
+	first := start(0, half)
+	<-storage.started
+	second := start(half, half)
+	<-storage.started
+	key := d.objectKey("object")
+	refs := func() []int {
+		f := &d.prefetchObjects
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		out := make([]int, 0, len(f.m[key]))
+		for _, o := range f.m[key] {
+			m := o.(*memoryPrefetchObject)
+			m.mu.Lock()
+			out = append(out, m.refs)
+			m.mu.Unlock()
+		}
+		return out
+	}
+	before := refs()
+	require.Len(t, before, 2)
+	// The read of both halves joins both.
+	both := start(0, 2*half)
+	require.Eventually(t, func() bool {
+		now := refs()
+		return len(now) == 2 && now[0] == before[0]+1 && now[1] == before[1]+1
+	}, diskCacheLifecycleTestTimeout, time.Millisecond)
+	// The first half arrives; then the object is deleted and rewritten before the second
+	// half is read again.
+	close(storage.open0)
+	r := <-first
+	require.NoError(t, r.err)
+	require.Equal(t, v1[:half], r.data)
+	require.NoError(t, fs.Delete(ctx, "object"))
+	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(v2)), Data: v2}},
+		Policy: SkipDiskCache | SkipMemoryCache}))
+	close(storage.openGated)
+	<-second
+	r = <-both
+	require.NoError(t, r.err)
+	require.True(t, bytes.Equal(r.data, v1) || bytes.Equal(r.data, v2),
+		"the bytes of one version: first half v1 %v, second half v2 %v",
+		bytes.Equal(r.data[:half], v1[:half]), bytes.Equal(r.data[half:], v2[half:]))
+}

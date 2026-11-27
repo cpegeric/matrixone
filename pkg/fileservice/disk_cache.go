@@ -1529,8 +1529,10 @@ func (d *DiskCache) DeletePaths(
 
 func (d *DiskCache) deletePath(ctx context.Context, path string) error {
 	key := d.objectKey(path)
-	// Counted first: an entry read before it and cached after it is retracted.
+	// Counted first: an entry read before it and cached after it is retracted. Counted
+	// again once done: bytes read while it runs are of no version after it.
 	d.deletes.deleted(key)
+	defer d.deletes.deleted(key)
 	// No prefetch object of the object caches its bytes after the delete; one under
 	// way is canceled rather than waited for.
 	if err := d.dropPrefetches(ctx, key); err != nil {
