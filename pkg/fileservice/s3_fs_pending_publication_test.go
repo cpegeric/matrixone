@@ -349,6 +349,7 @@ func TestS3FSDefaultPolicyReadWhileFullObjectPublicationPending(t *testing.T) {
 				if mode == "read-to-end" {
 					wantBytes = 4096
 					wantOpens = 1
+					require.Equal(t, int64(len(data))-secondOffset, follower.Entries[0].Size)
 				}
 				t.Logf("consumed_bytes=%d object_reads=%d", storage.bytes.Load()-before, storage.opens.Load()-opensBefore)
 				require.Equal(t, wantBytes, storage.bytes.Load()-before, "pending publication must not trigger another full-object read")
