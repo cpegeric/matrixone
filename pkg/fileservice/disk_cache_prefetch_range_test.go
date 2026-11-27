@@ -1237,7 +1237,11 @@ func TestS3FSRangeFillWaitsForPublisherRoom(t *testing.T) {
 			fs, storage, data := newPrefetchRangeFS(t, 4096, 64<<10)
 			fs.server.raw = keepOnDeleteStorage{storage}
 			d := fs.diskCache
-			if !tc.memory {
+			if tc.memory {
+				// The first fill holds the last of the memory: the others and the reads
+				// use files.
+				fs.server.memoryLimit = flightBufSize(4096)
+			} else {
 				d.memoryPrefetchMax = 1
 			}
 			shrinkPublisher(d, 1)

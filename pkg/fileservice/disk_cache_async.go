@@ -272,28 +272,33 @@ func (p *publisher) submit(ctx context.Context, pub *publication) bool {
 	}
 	start := time.Now()
 	metric.FSDiskCachePublisherWaiting.Inc()
-	queued := false
-	select {
-	case p.jobs <- pub:
-		queued = true
-		metric.FSDiskCachePublisherQueued.Inc()
-	case <-ctx.Done():
-	case <-p.ctx.Done():
+	long := time.NewTimer(publisherLongWait)
+	defer long.Stop()
+	queued, waiting := false, true
+	for waiting {
+		select {
+		case p.jobs <- pub:
+			queued, waiting = true, false
+			metric.FSDiskCachePublisherQueued.Inc()
+		case <-ctx.Done():
+			waiting = false
+		case <-p.ctx.Done():
+			waiting = false
+		case <-long.C:
+			p.logger.WarnWithConfig(
+				publisherLongWaitLogKey,
+				"disk cache publisher queue full",
+				logutil.RateLimitConfig{Interval: diskCacheWriteErrorLogPeriod, BurstCount: 1},
+				zap.Duration("wait", time.Since(start)),
+				zap.Int("queued", len(p.jobs)),
+				zap.String("path", pub.diskPath),
+				zap.String("cache-path", p.d.path),
+			)
+			long.Reset(publisherLongWait)
+		}
 	}
 	metric.FSDiskCachePublisherWaiting.Dec()
-	waited := time.Since(start)
-	metric.FSDiskCachePublisherWaitDuration.Observe(waited.Seconds())
-	if waited >= publisherLongWait {
-		p.logger.WarnWithConfig(
-			publisherLongWaitLogKey,
-			"disk cache publisher queue full",
-			logutil.RateLimitConfig{Interval: diskCacheWriteErrorLogPeriod, BurstCount: 1},
-			zap.Duration("wait", waited),
-			zap.Bool("queued", queued),
-			zap.String("path", pub.diskPath),
-			zap.String("cache-path", p.d.path),
-		)
-	}
+	metric.FSDiskCachePublisherWaitDuration.Observe(time.Since(start).Seconds())
 	if queued {
 		p.submitters.Done()
 	}
