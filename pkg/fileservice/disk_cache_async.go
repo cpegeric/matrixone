@@ -690,13 +690,24 @@ func (t diskFillTarget) createTemp() (*os.File, error) {
 }
 
 func (t diskFillTarget) publish(ctx context.Context, tempPath string, size int64) error {
-	err := os.Rename(tempPath, t.diskPath)
+	err := t.rename(tempPath)
 	t.d.files.changed(t.diskPath)
 	if err != nil {
 		return err
 	}
 	t.index(ctx, size)
 	return nil
+}
+
+// rename moves the file at tempPath to diskPath, in its directory, which stays while the
+// file is moved into it.
+func (t diskFillTarget) rename(tempPath string) error {
+	t.d.directoryMu.RLock()
+	defer t.d.directoryMu.RUnlock()
+	if err := os.MkdirAll(filepath.Dir(t.diskPath), 0755); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, t.diskPath)
 }
 
 // index indexes the file published at diskPath, of size bytes.
@@ -711,18 +722,17 @@ func (t diskFillTarget) index(ctx context.Context, size int64) {
 }
 
 // wholeFillTarget publishes a whole object into the disk cache as the range [0, size) of
-// filePath, at the size its fill finds.
+// filePath, at the size its fill finds; diskPath is that range file, once the fill holds
+// it.
 type wholeFillTarget struct {
-	d        *DiskCache
+	diskFillTarget
 	filePath string
 	key      string
 	// mark is the delete count the size of the object is stored at.
 	mark uint64
-	// size is the object's size, once known; path is the range file of [0, size), once
-	// the fill holds it.
+	// size is the object's size, once known.
 	size     int64
 	sized    bool
-	path     string
 	download *objectDownload
 }
 
@@ -737,7 +747,7 @@ func (d *DiskCache) newWholeFillTarget(ctx context.Context, filePath string) *wh
 	if !ok {
 		mark = d.deletes.now()
 	}
-	t := &wholeFillTarget{d: d, filePath: filePath, key: d.objectKey(filePath), mark: mark}
+	t := &wholeFillTarget{diskFillTarget: diskFillTarget{d: d}, filePath: filePath, key: d.objectKey(filePath), mark: mark}
 	t.size, t.sized = d.prefetched.size(t.key)
 	return t
 }
@@ -761,50 +771,23 @@ func (t *wholeFillTarget) cached(ctx context.Context) bool {
 
 func (t *wholeFillTarget) held(ctx context.Context) bool { return t.cached(ctx) }
 
-func (t *wholeFillTarget) reserve(ctx context.Context, size int64) {
-	t.d.cache.Evict(ctx, nil, size)
-}
-
-func (t *wholeFillTarget) noteWritten(size int64) {
-	t.d.noteWholeFile(size)
-}
-
 func (t *wholeFillTarget) createTemp() (*os.File, error) {
 	return t.d.createCacheTempFile(filepath.Join(t.d.path, diskCacheShard(pathpkg.Clean(t.filePath))))
 }
-
-func (t *wholeFillTarget) cache() *DiskCache { return t.d }
 
 // place makes the file of the fill the range [0, n). It reports false when the range file
 // is cached.
 func (t *wholeFillTarget) place(ctx context.Context, n int64) bool {
 	t.sizeAt(n)
-	t.path = t.d.pathForIOEntry(t.filePath, IOEntry{Size: n})
+	t.diskPath = t.d.pathForIOEntry(t.filePath, IOEntry{Size: n})
 	t.d.storePrefetchedSize(t.key, n, t.mark)
-	return !(diskFillTarget{d: t.d, diskPath: t.path}).held(ctx)
+	return !t.diskFillTarget.held(ctx)
 }
 
 func (t *wholeFillTarget) publish(ctx context.Context, tempPath string, size int64) error {
 	if t.download != nil {
-		t.d.wholePublications.Store(t.path, wholePublication{key: t.key, download: t.download})
-		defer t.d.wholePublications.Delete(t.path)
+		t.d.wholePublications.Store(t.diskPath, wholePublication{key: t.key, download: t.download})
+		defer t.d.wholePublications.Delete(t.diskPath)
 	}
-	err := t.rename(tempPath)
-	t.d.files.changed(t.path)
-	if err != nil {
-		return err
-	}
-	diskFillTarget{d: t.d, diskPath: t.path}.index(ctx, size)
-	return nil
-}
-
-// rename moves the file at tempPath to the range file, in its directory, which stays
-// while the file is moved into it.
-func (t *wholeFillTarget) rename(tempPath string) error {
-	t.d.directoryMu.RLock()
-	defer t.d.directoryMu.RUnlock()
-	if err := os.MkdirAll(filepath.Dir(t.path), 0755); err != nil {
-		return err
-	}
-	return os.Rename(tempPath, t.path)
+	return t.diskFillTarget.publish(ctx, tempPath, size)
 }

@@ -1069,14 +1069,13 @@ func (d *DiskCache) writeFileTo(
 		if !t.place(ctx, n) {
 			return false, nil
 		}
+		mark = readMark{object: t.key, deletes: t.mark, set: true}
 	}
 	if download != nil && fill != rangeFill {
 		target.noteWritten(n)
 	}
 	if whole != nil {
 		mark = readMark{object: diskPath, deletes: *whole.needs.deletes, set: true}
-	} else if t, ok := target.(*wholeFillTarget); ok {
-		mark = readMark{object: t.key, deletes: t.mark, set: true}
 	}
 	object := mark.object
 	if t, ok := target.(indexFillTarget); ok {
