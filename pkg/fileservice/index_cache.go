@@ -669,24 +669,28 @@ func (d *DiskCache) dirCached(diskPath string) bool {
 	return err == nil
 }
 
-// Delete removes entry name at once, held or not; files already open stay readable. A
-// PutUnlessDeleted of content read before the delete publishes nothing.
+// Delete removes entry name, held or not, after every publication of it queued before;
+// files already open stay readable. A PutUnlessDeleted of content read before the delete
+// publishes nothing.
 func (c *IndexFileCache) Delete(ctx context.Context, name string) error {
 	diskPath, err := c.disk.pathForDir(name)
 	if err != nil {
 		return err
 	}
 	c.disk.deletes.deleted(diskPath)
-	owner, err := c.disk.paths.acquire(ctx, diskPath, nil)
-	if err != nil {
-		return err
-	}
-	defer owner.release()
-	if err := c.disk.removeCacheDir(diskPath); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	c.disk.cache.Delete(ctx, diskPath)
-	return nil
+	return c.disk.pub.remove(ctx, diskPath, func() error {
+		ctx := context.Background()
+		owner, err := c.disk.paths.acquire(ctx, diskPath, nil)
+		if err != nil {
+			return err
+		}
+		defer owner.release()
+		if err := c.disk.removeCacheDir(diskPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		c.disk.cache.Delete(ctx, diskPath)
+		return nil
+	})
 }
 
 // dropBroken removes entry name while gen, the generation of the read that found it
@@ -1000,6 +1004,7 @@ func (d *DiskCache) putDir(ctx context.Context, diskPath string, mark uint64, fi
 	dir := tmp
 	job := &publication{
 		diskPath: diskPath,
+		object:   diskPath,
 		publish: func(ctx context.Context) (bool, error) {
 			return d.publishDir(ctx, diskPath, dir, mark, files, size)
 		},
@@ -1056,13 +1061,8 @@ func (d *DiskCache) publishDir(ctx context.Context, diskPath, tmp string, mark u
 	if !d.pub.claim() {
 		return false, nil
 	}
-	// The hold and a delete counted since mark are checked under the locks that set them,
-	// so no publication starts once either is set; a delete waits only for this rename.
-	var stripe *sync.RWMutex
-	if mark > 0 {
-		stripe = d.deletes.stripe(diskPath)
-		stripe.RLock()
-	}
+	// The hold is checked under the lock that sets it, so no publication starts once it is
+	// set. A delete of the entry queued later removes it.
 	d.trash.mu.Lock()
 	held := d.trashHoldsPublicationsLocked() || mark > 0 && d.deletes.since(diskPath, mark-1)
 	var renameErr error
@@ -1070,9 +1070,6 @@ func (d *DiskCache) publishDir(ctx context.Context, diskPath, tmp string, mark u
 		renameErr = os.Rename(tmp, diskPath)
 	}
 	d.trash.mu.Unlock()
-	if stripe != nil {
-		stripe.RUnlock()
-	}
 	if held {
 		return false, nil
 	}
@@ -1611,15 +1608,21 @@ func (s *S3FS) fillTarget(policy Policy, filePath string) fillTarget {
 	if err != nil {
 		return nil
 	}
-	return indexFillTarget{s: s, filePath: filePath, name: IndexObjectEntry(p.File), mark: s.indexFileCache.DeleteMark()}
+	name := IndexObjectEntry(p.File)
+	dir, err := s.indexFileCache.disk.pathForDir(name)
+	if err != nil {
+		return nil
+	}
+	return indexFillTarget{s: s, filePath: filePath, name: name, dir: dir, mark: s.indexFileCache.DeleteMark()}
 }
 
 // indexFillTarget publishes the object at filePath into the index-file cache, as entry
-// name, unless the object was deleted after mark.
+// name at the entry directory dir, unless the object was deleted after mark.
 type indexFillTarget struct {
 	s        *S3FS
 	filePath string
 	name     string
+	dir      string
 	mark     uint64
 }
 
@@ -1648,10 +1651,7 @@ func (t indexFillTarget) createTemp() (*os.File, error) {
 // into a temporary entry directory and publishes it as the object's entry.
 func (t indexFillTarget) publish(ctx context.Context, tempPath string, size int64) error {
 	c := t.s.indexFileCache
-	diskPath, err := c.disk.pathForDir(t.name)
-	if err != nil {
-		return err
-	}
+	diskPath := t.dir
 	if t.mark > 0 && c.disk.deletes.since(diskPath, t.mark-1) {
 		return nil
 	}

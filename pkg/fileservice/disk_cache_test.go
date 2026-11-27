@@ -1686,8 +1686,7 @@ func TestColumnReadJoinsRangeDownload(t *testing.T) {
 }
 
 // An entry read before a delete is never found by a read after the delete returns: a
-// delete before its publication is claimed refuses it, and one after waits for the
-// publication to end and removes the entry.
+// delete during its publication waits for the publication to end and removes the entry.
 func TestDeleteWaitsForPublicationOfEarlierRead(t *testing.T) {
 	for _, async := range []bool{false, true} {
 		for _, claimed := range []bool{false, true} {
@@ -1720,15 +1719,22 @@ func TestDeleteWaitsForPublicationOfEarlierRead(t *testing.T) {
 					}
 				}
 			} else {
-				d.hooks.beforeFilePublication = deleteObject
-				d.hooks.afterFilePublication = func() { published.Store(true) }
+				d.hooks.beforeFilePublication = func() {
+					counted := d.deletes.now()
+					go deleteObject()
+					for d.deletes.now() == counted {
+						time.Sleep(time.Millisecond)
+					}
+				}
 			}
 			require.NoError(t, d.Update(ctx, &IOVector{FilePath: "object", Entries: []IOEntry{entry}}, async))
 			d.Flush(ctx)
 			<-deleted
 			require.NoError(t, deleteErr)
 
-			require.Equal(t, claimed, published.Load(), "async %v claimed %v", async, claimed)
+			if claimed {
+				require.True(t, published.Load(), "async %v", async)
+			}
 			require.False(t, seenAfterDelete.Load(), "a read after the delete found the entry, async %v", async)
 			_, cached := d.ranges.covering(key, 100, 10)
 			require.False(t, cached, "async %v claimed %v", async, claimed)

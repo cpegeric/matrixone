@@ -21,6 +21,7 @@ import (
 	"os"
 	pathpkg "path"
 	"path/filepath"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -45,9 +46,14 @@ const (
 )
 
 // publication is a file or entry directory written under a temporary name, published by
-// the publisher of its cache.
+// the publisher of its cache, or, when removal is set, the removal of the cached files of
+// a deleted object.
 type publication struct {
 	diskPath string
+	// object orders it: a removal runs after every publication of its object taken
+	// before it, and a publication after every removal of its object taken before it.
+	object  string
+	removal bool
 	// publish makes it durable, renames it into place and indexes it, and reports whether
 	// it did.
 	publish func(ctx context.Context) (bool, error)
@@ -86,6 +92,9 @@ type publisher struct {
 	startOnce  sync.Once
 	closeOnce  sync.Once
 	submitters sync.WaitGroup
+	// taking, holding one token, orders the taking of publications from jobs with their
+	// entry in taken.
+	taking chan struct{}
 
 	mu struct {
 		sync.Mutex
@@ -93,6 +102,10 @@ type publisher struct {
 		// pending counts the publications begun and not yet released.
 		pending int
 		idle    chan struct{}
+		// taken holds, by object, the publications taken from jobs and not yet done, in
+		// the order they were taken; finished is closed and replaced when one is done.
+		taken    map[string][]*publication
+		finished chan struct{}
 	}
 }
 
@@ -134,6 +147,10 @@ func (p *publisher) init(d *DiskCache) {
 	)
 	p.mu.idle = make(chan struct{})
 	close(p.mu.idle)
+	p.mu.taken = make(map[string][]*publication)
+	p.mu.finished = make(chan struct{})
+	p.taking = make(chan struct{}, 1)
+	p.taking <- struct{}{}
 }
 
 func (d *DiskCache) initWriteFailureState() {
@@ -349,16 +366,113 @@ func (p *publisher) run() {
 		select {
 		case <-p.ctx.Done():
 			return
-		case pub := <-p.jobs:
-			metric.FSDiskCachePublisherQueued.Dec()
-			if p.ctx.Err() == nil {
-				pub.attempted = true
-				pub.published, pub.err = pub.publish(p.ctx)
-				p.d.evictForDiskFull(p.ctx, pub.err)
-			}
-			p.release(pub)
+		case <-p.taking:
+		}
+		var pub *publication
+		select {
+		case <-p.ctx.Done():
+			p.taking <- struct{}{}
+			return
+		case pub = <-p.jobs:
+		}
+		metric.FSDiskCachePublisherQueued.Dec()
+		p.take(pub)
+		p.taking <- struct{}{}
+		p.runTaken(pub)
+	}
+}
+
+// take enters pub, just taken from jobs, in the order of its object.
+func (p *publisher) take(pub *publication) {
+	p.mu.Lock()
+	p.mu.taken[pub.object] = append(p.mu.taken[pub.object], pub)
+	p.mu.Unlock()
+}
+
+// runTaken waits for the turn of pub, taken, and publishes it, or runs it when it is a
+// removal; once the publisher stops, a publication is released unpublished.
+func (p *publisher) runTaken(pub *publication) {
+	for {
+		p.mu.Lock()
+		turn, finished := p.turnLocked(pub), p.mu.finished
+		p.mu.Unlock()
+		if turn {
+			break
+		}
+		var stopped <-chan struct{}
+		if !pub.removal {
+			stopped = p.ctx.Done()
+		}
+		select {
+		case <-finished:
+			continue
+		case <-stopped:
+		}
+		break
+	}
+	if pub.removal || p.ctx.Err() == nil {
+		pub.attempted = true
+		pub.published, pub.err = pub.publish(p.ctx)
+		p.d.evictForDiskFull(p.ctx, pub.err)
+	}
+	p.mu.Lock()
+	taken := p.mu.taken[pub.object]
+	if i := slices.Index(taken, pub); i >= 0 {
+		taken = slices.Delete(taken, i, i+1)
+	}
+	if len(taken) == 0 {
+		delete(p.mu.taken, pub.object)
+	} else {
+		p.mu.taken[pub.object] = taken
+	}
+	close(p.mu.finished)
+	p.mu.finished = make(chan struct{})
+	p.mu.Unlock()
+	p.release(pub)
+}
+
+// turnLocked reports whether pub, taken, may run: a removal once every publication of
+// its object taken before it is done, any other once every removal taken before it is.
+func (p *publisher) turnLocked(pub *publication) bool {
+	for _, q := range p.mu.taken[pub.object] {
+		if q == pub {
+			return true
+		}
+		if pub.removal || q.removal {
+			return false
 		}
 	}
+	return true
+}
+
+// remove has the publisher run remove, which removes the cached files of the object
+// deleted, after every publication of the object queued before it, and returns its error.
+// Once the publisher is closed, it runs remove after the workers exit.
+func (p *publisher) remove(ctx context.Context, object string, remove func() error) error {
+	if p.begin() {
+		job := &publication{
+			diskPath: object,
+			object:   object,
+			removal:  true,
+			publish:  func(context.Context) (bool, error) { return true, remove() },
+			release:  func() error { return nil },
+			done:     make(chan publishResult, 1),
+		}
+		if p.submit(ctx, job) {
+			_, err := p.wait(ctx, job)
+			return err
+		}
+		p.end()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	select {
+	case <-p.done:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return remove()
 }
 
 // release frees what pub holds and reports its result.
@@ -367,7 +481,9 @@ func (p *publisher) release(pub *publication) {
 		pub.releasing.Store(true)
 		cleanupErr := pub.release()
 		var resultErr error
-		if pub.attempted {
+		if pub.removal {
+			resultErr = pub.err
+		} else if pub.attempted {
 			resultErr = pub.err
 			p.d.mergeWriteCleanupError(pub.diskPath, &resultErr, cleanupErr)
 			resultErr = p.d.observeWriteResult(pub.diskPath, resultErr)
@@ -395,7 +511,7 @@ func (p *publisher) flush(ctx context.Context) {
 }
 
 // seal stops the publisher: nothing is published from then, the publications queued are
-// dropped, and submissions end.
+// dropped, the removals queued run, and submissions end.
 func (p *publisher) seal() {
 	p.closeOnce.Do(func() {
 		p.mu.Lock()
@@ -408,11 +524,20 @@ func (p *publisher) seal() {
 		go func() {
 			p.submitters.Wait()
 			for {
+				<-p.taking
 				select {
 				case pub := <-p.jobs:
 					metric.FSDiskCachePublisherQueued.Dec()
-					p.release(pub)
+					if !pub.removal {
+						p.taking <- struct{}{}
+						p.release(pub)
+						continue
+					}
+					p.take(pub)
+					p.taking <- struct{}{}
+					p.runTaken(pub)
 				default:
+					p.taking <- struct{}{}
 					p.startOnce.Do(func() {
 						close(p.done)
 					})

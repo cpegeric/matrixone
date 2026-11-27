@@ -4976,7 +4976,10 @@ func TestAsyncWholeFillDoesNotPublishAfterDeleteMark(t *testing.T) {
 				}, time.Second, time.Millisecond, "the source delete completed and the cache delete was counted")
 				_, err := fs.StatFile(ctx, "object")
 				require.Error(t, err, "object storage no longer holds the object")
-				require.NoError(t, <-deleted, "the delete waits for no fill whose publication it prevents")
+				require.Never(t, func() bool { return len(deleted) > 0 }, 20*time.Millisecond, time.Millisecond,
+					"the delete waits for the publication under way")
+				allowPublish()
+				require.NoError(t, <-deleted)
 			}
 			allowPublish()
 			d.Flush(ctx)

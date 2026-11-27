@@ -888,7 +888,7 @@ func (d *DiskCache) Update(
 		}
 
 		diskPath := d.pathForIOEntry(path.File, entry)
-		if err := d.writeEntry(ctx, vector.FilePath, diskPath, entry, async); err != nil && !async {
+		if err := d.writeEntry(ctx, d.objectKey(path.File), diskPath, entry, async); err != nil && !async {
 			return err
 		}
 	}
@@ -896,16 +896,11 @@ func (d *DiskCache) Update(
 	return nil
 }
 
-// writeEntry writes entry to a file and has the publisher publish it, unless the entry's
-// object was deleted after the entry was read. Unless async is set, it waits for a busy
-// path and for the publication.
-func (d *DiskCache) writeEntry(ctx context.Context, filePath, diskPath string, entry IOEntry, async bool) error {
-	var mark readMark
-	if entry.readDeletes > 0 {
-		if path, err := ParsePath(filePath); err == nil {
-			mark = readMark{object: d.objectKey(path.File), deletes: entry.readDeletes - 1, set: true}
-		}
-	}
+// writeEntry writes entry, of the object with key, to a file and has the publisher publish
+// it, unless the object was deleted after the entry was read. Unless async is set, it
+// waits for a busy path and for the publication.
+func (d *DiskCache) writeEntry(ctx context.Context, key, diskPath string, entry IOEntry, async bool) error {
+	mark := readMark{object: key, deletes: entry.readDeletes - 1, set: entry.readDeletes > 0}
 	_, err := d.writeFileTo(ctx, diskPath, func(context.Context) (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(entry.Data)), nil
 	}, async, notWholeFill, nil, nil, mark)
@@ -1009,8 +1004,8 @@ func prefetchFill(ctx context.Context) bool {
 	return ok
 }
 
-// readMark is the delete count bytes of an object were read at: a file of them is not
-// published once the object was deleted since.
+// readMark is the object of a file and, when set, the delete count its bytes were read
+// at: the file is not published once the object was deleted since.
 type readMark struct {
 	object  string
 	deletes uint64
@@ -1141,11 +1136,18 @@ func (d *DiskCache) writeFileTo(
 	}
 	if whole != nil {
 		mark = readMark{object: diskPath, deletes: *whole.needs.deletes, set: true}
+	} else if t, ok := target.(*wholeFillTarget); ok {
+		mark = readMark{object: t.key, deletes: t.mark, set: true}
+	}
+	object := mark.object
+	if t, ok := target.(indexFillTarget); ok {
+		object = t.dir
 	}
 
 	owner := w.owner
 	job := &publication{
 		diskPath: diskPath,
+		object:   object,
 		publish: func(ctx context.Context) (bool, error) {
 			return d.publishFile(ctx, pub, diskPath, f, target, mark)
 		},
@@ -1219,22 +1221,14 @@ func (d *DiskCache) copyFrom(
 }
 
 // publishFile publishes f, the file of diskPath into target, on the publisher pub, unless
-// mark is set and its object was deleted since.
+// mark is set and its object was deleted since. A delete of the object queued later
+// removes it.
 func (d *DiskCache) publishFile(ctx context.Context, pub *publisher, diskPath string, f *os.File, target fillTarget, mark readMark) (bool, error) {
-	if !mark.set {
-		err := d.finalizeFileTo(ctx, diskPath, f, pub.claim, target)
-		return err == nil, err
-	}
-	var err error
-	published, _ := d.publishUnlessDeletedSince(mark.object, mark.deletes, pub.claim, func(claim func() bool) (bool, error) {
-		err = d.finalizeFileTo(ctx, diskPath, f, claim, target)
-		return err == nil, err
-	})
-	if !published && errors.Is(err, context.Canceled) && ctx.Err() == nil {
-		// The object was deleted.
+	if mark.set && d.deletes.since(mark.object, mark.deletes) {
 		return false, nil
 	}
-	return published, err
+	err := d.finalizeFileTo(ctx, diskPath, f, pub.claim, target)
+	return err == nil, err
 }
 
 // sourceFailure returns err when it is a failed read of object storage by a fill whose
@@ -1504,7 +1498,7 @@ func (d *DiskCache) fillFileTo(
 		defer d.wholeFills.Add(-1)
 	}
 	// The publisher observes the result of a publication.
-	if _, err = d.writeFileTo(ctx, diskPath, openReader, async, fill, objectSize, target, readMark{}); err != nil {
+	if _, err = d.writeFileTo(ctx, diskPath, openReader, async, fill, objectSize, target, readMark{object: diskPath}); err != nil {
 		return d.observeWriteResult(diskPath, err)
 	}
 	return nil
@@ -1539,35 +1533,28 @@ func (d *DiskCache) deletePath(ctx context.Context, path string) error {
 		return err
 	}
 	d.prefetched.forget(key)
-	return d.removeRangeFiles(ctx, path)
+	return d.pub.remove(ctx, key, func() error { return d.removeRanges(key) })
 }
 
-// removeRangeFiles deletes the cached range files of the object at path, each one
-// whatever the others return, and returns their errors joined.
-func (d *DiskCache) removeRangeFiles(ctx context.Context, path string) error {
-	ranges := d.ranges.of(d.objectKey(path))
-	errs := make([]error, 0, len(ranges))
-	for _, r := range ranges {
-		errs = append(errs, d.removeRangeFile(ctx, r.diskPath))
+// removeRanges removes the cached ranges of the object with key, each one whatever the
+// others return, and returns their errors joined. A range whose file is not removed stays
+// indexed.
+func (d *DiskCache) removeRanges(key string) error {
+	ctx := context.Background()
+	var errs []error
+	for _, r := range d.ranges.of(key) {
+		d.paths.endReads(r.diskPath)
+		if err := os.Remove(r.diskPath); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, err)
+			continue
+		}
+		if d.cache.Contains(r.diskPath) {
+			d.preloads.deleted(r.diskPath)
+		}
+		d.ranges.remove(r.diskPath)
+		d.cache.Delete(ctx, r.diskPath)
 	}
 	return errors.Join(errs...)
-}
-
-func (d *DiskCache) removeRangeFile(ctx context.Context, diskPath string) error {
-	owner, err := d.paths.acquire(ctx, diskPath, nil)
-	if err != nil {
-		return err
-	}
-	defer owner.release()
-	if err := os.Remove(diskPath); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	if d.cache.Contains(diskPath) {
-		d.preloads.deleted(diskPath)
-	}
-	d.ranges.remove(diskPath)
-	d.cache.Delete(ctx, diskPath)
-	return nil
 }
 
 func (d *DiskCache) Evict(ctx context.Context, done chan int64) {
@@ -1835,8 +1822,8 @@ func smallestContaining(ranges []cachedRange, offset, size int64, tried []string
 // objectDeletesMax is the most deleted objects remembered; past it they are forgotten.
 const objectDeletesMax = 1 << 16
 
-// objectDeletesStripes is the number of locks the publications and deletes of objects
-// share by their disk paths.
+// objectDeletesStripes is the number of locks the deletes of objects share by their disk
+// paths.
 const objectDeletesStripes = 64
 
 // objectDeletes counts the deletes of objects, so an entry read before its object was
@@ -1851,8 +1838,8 @@ type objectDeletes struct {
 	// loading keeps every delete while the cache loads its files: a file found by the load
 	// is indexed only when its object was not deleted since the cache was created.
 	loading bool
-	// stripes are held shared by the publications of entries and exclusively by the
-	// counting of deletes, by object disk path.
+	// stripes are held shared by the stores of prefetched sizes and the indexing of files
+	// found on disk, and exclusively by the counting of deletes, by object disk path.
 	stripes [objectDeletesStripes]sync.RWMutex
 }
 
@@ -1866,8 +1853,7 @@ func (o *objectDeletes) now() uint64 {
 	return o.count.Load()
 }
 
-// deleted counts a delete of the object at diskPath, after the publications of its
-// entries under way end.
+// deleted counts a delete of the object at diskPath.
 func (o *objectDeletes) deleted(diskPath string) {
 	stripe := o.stripe(diskPath)
 	stripe.Lock()
@@ -1920,35 +1906,6 @@ func (d *DiskCache) storePrefetchedSize(objectPath string, size int64, mark uint
 // readDeletes returns the mark of an entry read now: 1 plus the delete count.
 func (d *DiskCache) readDeletes() uint64 {
 	return d.deletes.now() + 1
-}
-
-// publishUnlessDeletedSince runs write with a claim that also fails when the object at
-// objectPath was deleted after the delete count was mark; it reports false without the
-// error of write when it was.
-func (d *DiskCache) publishUnlessDeletedSince(
-	objectPath string,
-	mark uint64,
-	claim func() bool,
-	write func(claim func() bool) (bool, error),
-) (bool, error) {
-	stripe := d.deletes.stripe(objectPath)
-	locked, deleted := false, false
-	written, err := write(func() bool {
-		if claim != nil && !claim() {
-			return false
-		}
-		stripe.RLock()
-		locked = true
-		deleted = d.deletes.since(objectPath, mark)
-		return !deleted
-	})
-	if locked {
-		stripe.RUnlock()
-	}
-	if deleted {
-		return false, nil
-	}
-	return written, err
 }
 
 // diskCacheMissingPathsMax is the most paths noted missing; past it they are forgotten.
@@ -2315,6 +2272,13 @@ func (p *pathOwners) endRead(path string, gen uint64) {
 			p.reads[path] = r
 		}
 	}
+}
+
+// endReads ends the generation of path and drops its kept file, whatever owner it has.
+func (p *pathOwners) endReads(path string) {
+	p.L.Lock()
+	defer p.L.Unlock()
+	p.endReadsLocked(path)
 }
 
 // endReadsLocked ends the generation of path and drops its kept file.

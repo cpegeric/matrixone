@@ -1285,8 +1285,10 @@ func TestS3FSRangeFillWaitsForPublisherRoom(t *testing.T) {
 			require.Equal(t, data[20000:20010], read(SkipDiskCacheWrites, 20000), "a read goes on")
 
 			reads := storage.reads.Load()
+			// The delete ends the wait of the fill, and waits for the publisher.
+			deleted := make(chan error, 1)
 			if ev == "delete" {
-				require.NoError(t, fs.Delete(ctx, "object"))
+				go func() { deleted <- fs.Delete(ctx, "object") }()
 				select {
 				case <-ended:
 				case <-time.After(diskCacheLifecycleTestTimeout):
@@ -1294,6 +1296,9 @@ func TestS3FSRangeFillWaitsForPublisherRoom(t *testing.T) {
 				}
 			}
 			unblock()
+			if ev == "delete" {
+				require.NoError(t, <-deleted)
+			}
 			waitObjectsEnd(d, "object")
 			flushCtx, cancel := context.WithTimeout(ctx, diskCacheLifecycleTestTimeout)
 			defer cancel()
@@ -3364,8 +3369,8 @@ func TestDiskCacheTransitionAbandonedStalledDownloadFreesResources(t *testing.T)
 	require.Empty(t, d.objectFiles("object"))
 }
 
-// An entry read before a delete, whose async publication waits while the object is
-// Deleted and rewritten with new content, is not published; a later read gets the new bytes.
+// An entry read before a delete, whose async publication is queued when the object is
+// deleted, is removed by the delete; a later read after a rewrite gets the new bytes.
 func TestDiskCacheTransitionAsyncEntryPublicationAfterDeleteRewrite(t *testing.T) {
 	fs, _, data := newPrefetchRangeFS(t, 0, 64<<10)
 	d := fs.diskCache
@@ -3384,14 +3389,18 @@ func TestDiskCacheTransitionAsyncEntryPublicationAfterDeleteRewrite(t *testing.T
 	require.Equal(t, data[100:110], vec.Entries[0].Data)
 	vec.Release()
 	<-held
-	require.NoError(t, fs.Delete(ctx, "object"))
+	// The delete waits for the publication queued before it.
+	deleted := make(chan error, 1)
+	go func() { deleted <- fs.Delete(ctx, "object") }()
+	require.Never(t, func() bool { return len(deleted) > 0 }, 20*time.Millisecond, time.Millisecond)
+	close(hold)
+	require.NoError(t, <-deleted)
 	v2 := make([]byte, len(data))
 	for i := range v2 {
 		v2[i] = ^data[i]
 	}
 	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(v2)), Data: v2}},
 		Policy: SkipDiskCache | SkipMemoryCache}))
-	close(hold)
 	d.Flush(ctx)
 	vec = &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache | ExactRead,
 		Entries: []IOEntry{{Offset: 100, Size: 10}}}

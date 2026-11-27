@@ -1662,7 +1662,12 @@ func (s *S3FS) read(ctx context.Context, vector *IOVector, forceMinimalRangeRead
 		s.tierOf(vector.Policy) == diskTier {
 		t0 := time.Now()
 		LogEvent(ctx, str_disk_cache_setfile_begin)
-		err := s.diskCache.setFileContent(ctx, vector.FilePath, contentBytes, true)
+		// The content is not cached after a delete of the object since the read began.
+		fillCtx := ctx
+		if vector.Entries[0].readDeletes > 0 {
+			fillCtx = withDeletesMark(ctx, vector.Entries[0].readDeletes-1)
+		}
+		err := s.diskCache.setFileContent(fillCtx, vector.FilePath, contentBytes, true)
 		LogEvent(ctx, str_disk_cache_setfile_end)
 		metric.FSReadDurationSetCachedData.Observe(time.Since(t0).Seconds())
 		if err != nil {

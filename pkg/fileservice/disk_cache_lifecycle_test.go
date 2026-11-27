@@ -1627,3 +1627,271 @@ func TestDiskCacheReadSkipsUnloadedRangeFileOfDeletedObject(t *testing.T) {
 	_, err := os.Stat(rangePath)
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
+
+// holdPublisher gives the publisher of d one worker, which stops at the first file or
+// entry directory it publishes until release is called; held is closed once it stops.
+func holdPublisher(t *testing.T, d *DiskCache) (held <-chan struct{}, release func()) {
+	t.Helper()
+	d.pub.workers = 1
+	h, r := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	d.hooks.beforeFilePublication = func() {
+		once.Do(func() {
+			close(h)
+			<-r
+		})
+	}
+	release = sync.OnceFunc(func() { close(r) })
+	t.Cleanup(release)
+	return h, release
+}
+
+// waitQueued waits until n publications wait in the queue of the publisher of d.
+func waitQueued(t *testing.T, d *DiskCache, n int) {
+	t.Helper()
+	require.Eventually(t, func() bool { return len(d.pub.jobs) == n }, diskCacheLifecycleTestTimeout, time.Millisecond)
+}
+
+// deleteReleasing runs del while a publisher is held, releases the publisher once del
+// returns or a moment passed, and returns the error of del.
+func deleteReleasing(release func(), del func() error) error {
+	deleted := make(chan error, 1)
+	go func() { deleted <- del() }()
+	select {
+	case err := <-deleted:
+		release()
+		return err
+	case <-time.After(50 * time.Millisecond):
+	}
+	release()
+	return <-deleted
+}
+
+// A publication of an object queued before a delete of the object is never published
+// after the delete returns: the delete removes it once it is published, or it is not.
+func TestPublicationQueuedBeforeDeleteIsNotPublishedAfterIt(t *testing.T) {
+	ctx := context.Background()
+	cachingWrite := func(fs *S3FS, name string) {
+		require.NoError(t, fs.Write(ctx, IOVector{FilePath: name, Policy: SkipMemoryCache,
+			Entries: []IOEntry{{Size: 4096, Data: make([]byte, 4096)}}}))
+	}
+	t.Run("whole object", func(t *testing.T) {
+		fs, _, _ := newIndexObjectFS(t, true)
+		d := fs.diskCache
+		held, release := holdPublisher(t, d)
+		cachingWrite(fs, "other")
+		<-held
+		cachingWrite(fs, "target")
+		waitQueued(t, d, 1)
+		require.NoError(t, deleteReleasing(release, func() error { return fs.Delete(ctx, "target") }))
+		d.Flush(ctx)
+		require.Empty(t, d.ranges.of(d.objectKey("target")))
+	})
+	t.Run("range", func(t *testing.T) {
+		fs, _, _ := newIndexObjectFS(t, true)
+		d := fs.diskCache
+		held, release := holdPublisher(t, d)
+		cachingWrite(fs, "other")
+		<-held
+		vec := &IOVector{FilePath: "object", Policy: SkipMemoryCache, Entries: []IOEntry{{Offset: 100, Size: 10}}}
+		require.NoError(t, fs.Read(ctx, vec))
+		vec.Release()
+		waitQueued(t, d, 1)
+		require.NoError(t, deleteReleasing(release, func() error { return fs.Delete(ctx, "object") }))
+		d.Flush(ctx)
+		require.Empty(t, d.ranges.of(d.objectKey("object")))
+	})
+	putOther := func(c *IndexFileCache) chan error {
+		put := make(chan error, 1)
+		go func() {
+			_, err := c.Put(ctx, "other", []IndexCacheFile{{Name: "f", Open: func(context.Context) (io.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader("other")), nil
+			}}})
+			put <- err
+		}()
+		return put
+	}
+	t.Run("index object", func(t *testing.T) {
+		fs, _, _ := newIndexObjectFS(t, true)
+		c := fs.indexFileCache
+		held, release := holdPublisher(t, c.disk)
+		other := putOther(c)
+		<-held
+		require.NoError(t, fs.PrefetchFile(WithFileServicePolicy(ctx, IndexFileObject), "object"))
+		waitQueued(t, c.disk, 1)
+		require.NoError(t, deleteReleasing(release, func() error { return fs.Delete(ctx, "object") }))
+		require.NoError(t, <-other)
+		flushPublishers(fs)
+		_, cached := fs.indexObjectCached("object")
+		require.False(t, cached)
+	})
+	t.Run("index entry", func(t *testing.T) {
+		fs, _, _ := newIndexObjectFS(t, true)
+		c := fs.indexFileCache
+		held, release := holdPublisher(t, c.disk)
+		other := putOther(c)
+		<-held
+		put := make(chan error, 1)
+		go func() {
+			_, err := c.Put(ctx, "entry", []IndexCacheFile{{Name: "f", Open: func(context.Context) (io.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader("entry")), nil
+			}}})
+			put <- err
+		}()
+		waitQueued(t, c.disk, 1)
+		require.NoError(t, deleteReleasing(release, func() error { return c.Delete(ctx, "entry") }))
+		require.NoError(t, <-other)
+		require.NoError(t, <-put)
+		c.disk.Flush(ctx)
+		dir, err := c.disk.pathForDir("entry")
+		require.NoError(t, err)
+		require.False(t, c.disk.cache.Contains(dir))
+		_, err = os.Stat(dir)
+		require.True(t, os.IsNotExist(err), "%v", err)
+	})
+}
+
+// firstReadGateStorage blocks the first read until open is closed, or its context ends;
+// started is closed once it blocks.
+type firstReadGateStorage struct {
+	ObjectStorage
+	once    sync.Once
+	started chan struct{}
+	open    chan struct{}
+}
+
+func (s *firstReadGateStorage) Read(ctx context.Context, key string, min, max *int64) (io.ReadCloser, error) {
+	first := false
+	s.once.Do(func() { first = true })
+	if first {
+		close(s.started)
+		select {
+		case <-s.open:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return s.ObjectStorage.Read(ctx, key, min, max)
+}
+
+// A delete of an object while a fill of it runs, waits for its publication or publishes
+// leaves no range of the old version: the next reads after the object is rewritten get
+// the new version.
+func TestDeleteDuringFillReadsNewVersion(t *testing.T) {
+	const size = 64 << 10
+	ctx := context.Background()
+	for _, state := range []string{"running", "queued", "publishing"} {
+		t.Run(state, func(t *testing.T) {
+			fs, _, v1 := newPrefetchRangeFS(t, 0, size)
+			d := fs.diskCache
+			d.memoryPrefetchMax = 1 << 10
+			read := func(offset, n int64) ([]byte, error) {
+				vec := &IOVector{FilePath: "object", Policy: ColumnPrefetch | SkipFullFilePreloads | SkipMemoryCache,
+					Entries: []IOEntry{{Offset: offset, Size: n}}}
+				defer vec.Release()
+				err := fs.Read(ctx, vec)
+				return append([]byte(nil), vec.Entries[0].Data...), err
+			}
+			release := func() {}
+			switch state {
+			case "running":
+				gate := &firstReadGateStorage{ObjectStorage: fs.server.raw, started: make(chan struct{}), open: make(chan struct{})}
+				fs.server.raw = gate
+				release = sync.OnceFunc(func() { close(gate.open) })
+				t.Cleanup(release)
+				go func() { _, _ = read(0, size/4) }()
+				<-gate.started
+			case "queued":
+				var held <-chan struct{}
+				held, release = holdPublisher(t, d)
+				require.NoError(t, fs.Write(ctx, IOVector{FilePath: "other", Policy: SkipMemoryCache,
+					Entries: []IOEntry{{Size: 4096, Data: make([]byte, 4096)}}}))
+				<-held
+				go func() { _, _ = read(0, size/4) }()
+				waitQueued(t, d, 1)
+			case "publishing":
+				var held <-chan struct{}
+				held, release = holdPublisher(t, d)
+				go func() { _, _ = read(0, size/4) }()
+				<-held
+			}
+			require.NoError(t, deleteReleasing(release, func() error { return fs.Delete(ctx, "object") }))
+			v2 := make([]byte, size)
+			for i := range v2 {
+				v2[i] = v1[i] + 1
+			}
+			require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: size, Data: v2}},
+				Policy: SkipDiskCache | SkipMemoryCache}))
+			waitObjectsEnd(d, "object")
+			d.Flush(ctx)
+			for _, r := range [][2]int64{{0, size / 4}, {0, size}, {size / 8, size / 4}} {
+				data, err := read(r[0], r[1])
+				require.NoError(t, err)
+				require.Equal(t, v2[r[0]:r[0]+r[1]], data, "%s: [%d, +%d)", state, r[0], r[1])
+			}
+		})
+	}
+}
+
+// A range whose file a delete cannot remove stays indexed, and a later delete removes it.
+func TestDeleteKeepsUnremovableRangeIndexed(t *testing.T) {
+	ctx := context.Background()
+	fs, _, _ := newPrefetchRangeFS(t, 0, 64<<10)
+	d := fs.diskCache
+	vec := &IOVector{FilePath: "object", Policy: SkipMemoryCache, Entries: []IOEntry{{Offset: 100, Size: 10}}}
+	require.NoError(t, fs.Read(ctx, vec))
+	vec.Release()
+	d.Flush(ctx)
+	key := d.objectKey("object")
+	ranges := d.ranges.of(key)
+	require.Len(t, ranges, 1)
+	path := ranges[0].diskPath
+	// A non-empty directory in place of the file cannot be removed as a file.
+	require.NoError(t, os.Remove(path))
+	require.NoError(t, os.Mkdir(path, 0755))
+	child := filepath.Join(path, "child")
+	require.NoError(t, os.WriteFile(child, []byte("x"), 0644))
+	require.Error(t, fs.Delete(ctx, "object"))
+	require.Equal(t, ranges, d.ranges.of(key))
+	require.True(t, d.cache.Contains(path))
+	require.NoError(t, os.Remove(child))
+	require.NoError(t, fs.Delete(ctx, "object"))
+	require.Empty(t, d.ranges.of(key))
+	require.False(t, d.cache.Contains(path))
+	_, err := os.Stat(path)
+	require.True(t, os.IsNotExist(err), "%v", err)
+}
+
+// A delete waits for room in a full publisher queue, and ends once the publisher drains
+// it, as do the submitters waiting for room.
+func TestDeleteWithFullPublisherQueue(t *testing.T) {
+	ctx := context.Background()
+	fs, _, _ := newIndexObjectFS(t, true)
+	d := fs.diskCache
+	d.pub.jobs = make(chan *publication, 1)
+	held, release := holdPublisher(t, d)
+	write := func(name string) error {
+		return fs.Write(ctx, IOVector{FilePath: name, Policy: SkipMemoryCache,
+			Entries: []IOEntry{{Size: 4096, Data: make([]byte, 4096)}}})
+	}
+	require.NoError(t, write("a"))
+	<-held
+	require.NoError(t, write("b"))
+	waitQueued(t, d, 1)
+	written := make(chan error, 1)
+	go func() { written <- write("c") }()
+	deleted := make(chan error, 1)
+	go func() { deleted <- fs.Delete(ctx, "b") }()
+	require.Never(t, func() bool { return len(deleted) > 0 }, 50*time.Millisecond, time.Millisecond,
+		"the delete waits for the publication of b queued before it")
+	release()
+	select {
+	case err := <-deleted:
+		require.NoError(t, err)
+	case <-time.After(diskCacheLifecycleTestTimeout):
+		t.Fatal("the delete did not return")
+	}
+	require.NoError(t, <-written)
+	d.Flush(ctx)
+	require.Empty(t, d.ranges.of(d.objectKey("b")))
+}
