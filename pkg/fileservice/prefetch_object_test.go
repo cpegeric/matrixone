@@ -113,7 +113,8 @@ type blackBoxStorage struct {
 	cur   map[string]int
 	most  map[string]int
 	total map[string]int
-	// marked counts the reads under a context of withReadMark.
+	// marked counts the reads under a context of withReadMark or one that already ended,
+	// which read nothing.
 	marked map[string]int
 	// ranges are the ranges read, the end -1 for none.
 	ranges [][2]int64
@@ -153,7 +154,8 @@ func (g *blackBoxStorage) Read(ctx context.Context, key string, from, to *int64)
 		end = *to
 	}
 	g.ranges = append(g.ranges, [2]int64{offset, end})
-	if ctx.Value(readMarkKey{}) != nil {
+	ended := ctx.Err()
+	if ctx.Value(readMarkKey{}) != nil || ended != nil {
 		g.marked[key]++
 	}
 	g.most[key] = max(g.most[key], g.cur[key])
@@ -163,6 +165,9 @@ func (g *blackBoxStorage) Read(ctx context.Context, key string, from, to *int64)
 		g.cur[key]--
 		g.mu.Unlock()
 	}()
+	if ended != nil {
+		return nil, ended
+	}
 	if gate := g.gated(key, offset); gate != nil {
 		select {
 		case <-gate:
@@ -179,7 +184,7 @@ func (g *blackBoxStorage) counts(key string) (cur, most, total int) {
 	return g.cur[key], g.most[key], g.total[key]
 }
 
-// unmarked returns the reads of key not under a context of withReadMark.
+// unmarked returns the reads of key not counted as marked.
 func (g *blackBoxStorage) unmarked(key string) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
