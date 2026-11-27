@@ -4971,22 +4971,16 @@ func TestSyncWholeFillDoesNotPublishAfterDeleteMark(t *testing.T) {
 				deleteCtx, cancelDelete := context.WithCancel(ctx)
 				defer cancelDelete()
 				go func() { deleted <- fs.Delete(deleteCtx, "object") }()
-				counted := false
-				for i := 0; i < 100 && !counted; i++ {
-					time.Sleep(time.Millisecond)
-					counted = d.deletes.since(diskPath, mark)
-				}
-				if counted {
-					cancelDelete()
-					require.ErrorIs(t, <-deleted, context.Canceled)
-					deleted <- nil
-				}
+				// The delete is counted and waits behind the held publication; its caller
+				// gives up, and the publisher still runs its removal.
+				require.Eventually(t, func() bool { return d.deletes.since(diskPath, mark) },
+					diskCacheLifecycleTestTimeout, time.Millisecond)
+				cancelDelete()
+				require.ErrorIs(t, <-deleted, context.Canceled)
 			}
 			allowPublish()
-			if tc.delete {
-				require.NoError(t, <-deleted)
-			}
 			require.Eventually(t, func() bool { return !fs.diskCache.fillsUnderWay("object") }, time.Second, time.Millisecond)
+			d.Flush(ctx)
 			if !tc.delete {
 				require.FileExists(t, d.wholePath("object", 64<<10))
 				return
