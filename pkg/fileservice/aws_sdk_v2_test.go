@@ -267,41 +267,6 @@ func TestAwsSDKv2BasicObjectOperations(t *testing.T) {
 	require.NoError(t, sdk.Write(context.Background(), "empty", bytes.NewReader(nil), nil, nil))
 }
 
-func TestAwsSDKv2WriteUnknownSizeMultipartCompletes(t *testing.T) {
-	var uploadedParts int
-	var completed bool
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := strings.TrimPrefix(r.URL.Path, "/bucket/")
-		switch {
-		case r.Method == http.MethodPost && key == "large" && strings.Contains(r.URL.RawQuery, "uploads"):
-			w.Header().Set("Content-Type", "application/xml")
-			_, _ = io.WriteString(w, `<CreateMultipartUploadResult><Bucket>bucket</Bucket><Key>large</Key><UploadId>upload-1</UploadId></CreateMultipartUploadResult>`)
-		case r.Method == http.MethodPut && key == "large" && strings.Contains(r.URL.RawQuery, "partNumber="):
-			uploadedParts++
-			_, _ = io.Copy(io.Discard, r.Body)
-			w.Header().Set("ETag", `"etag-1"`)
-			w.WriteHeader(http.StatusOK)
-		case r.Method == http.MethodPost && key == "large" && strings.Contains(r.URL.RawQuery, "uploadId=upload-1"):
-			completed = true
-			_, _ = io.Copy(io.Discard, r.Body)
-			w.Header().Set("Content-Type", "application/xml")
-			_, _ = io.WriteString(w, `<CompleteMultipartUploadResult><Bucket>bucket</Bucket><Key>large</Key><ETag>"final"</ETag></CompleteMultipartUploadResult>`)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-
-	sdk := newTestAWSClient(t, server)
-	data := bytes.Repeat([]byte("non-empty"), int(minMultipartPartSize/9)+1)
-	err := writeInParts(context.Background(), sdk, "large", bytes.NewReader(data), nil, &ParallelMultipartOption{
-		PartSize: minMultipartPartSize, Concurrency: 1,
-	})
-	require.NoError(t, err)
-	require.Equal(t, 2, uploadedParts)
-	require.True(t, completed)
-}
-
 func TestAwsSDKv2WriteUnknownSizeEmptyCreatesObject(t *testing.T) {
 	var activeUploads, putCount int
 	var putBytes int
@@ -373,43 +338,6 @@ func TestAwsSDKv2WriteUnknownSizeEmptyCreatesObject(t *testing.T) {
 	require.Equal(t, 2, putCount)
 	require.Zero(t, putBytes)
 	require.Zero(t, activeUploads, "empty writes must not leak multipart uploads")
-}
-
-func TestAwsSDKv2WriteUnknownSizePartFailureAborts(t *testing.T) {
-	var mu sync.Mutex
-	var created, aborted, completed int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		mu.Lock()
-		defer mu.Unlock()
-		switch {
-		case r.Method == http.MethodPost && strings.Contains(r.URL.RawQuery, "uploads"):
-			created++
-			w.Header().Set("Content-Type", "application/xml")
-			_, _ = io.WriteString(w, `<CreateMultipartUploadResult><UploadId>failed-upload</UploadId></CreateMultipartUploadResult>`)
-		case r.Method == http.MethodPut && strings.Contains(r.URL.RawQuery, "partNumber="):
-			w.WriteHeader(http.StatusForbidden)
-		case r.Method == http.MethodDelete && strings.Contains(r.URL.RawQuery, "uploadId=failed-upload"):
-			aborted++
-			w.WriteHeader(http.StatusNoContent)
-		case r.Method == http.MethodPost && strings.Contains(r.URL.RawQuery, "uploadId=failed-upload"):
-			completed++
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer server.Close()
-
-	sdk := newTestAWSClient(t, server)
-	data := bytes.Repeat([]byte("non-empty"), int(minMultipartPartSize/9)+1)
-	err := writeInParts(context.Background(), sdk, "failed", bytes.NewReader(data), nil, &ParallelMultipartOption{
-		PartSize: minMultipartPartSize, Concurrency: 1,
-	})
-	require.Error(t, err)
-	mu.Lock()
-	defer mu.Unlock()
-	require.Equal(t, 1, created)
-	require.Equal(t, 1, aborted)
-	require.Zero(t, completed)
 }
 
 func TestAwsSDKv2ConstructorCredentialsAndRetryer(t *testing.T) {

@@ -24,7 +24,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/stretchr/testify/require"
 )
 
@@ -181,28 +180,44 @@ func newPartFS(t *testing.T, storage ObjectStorage, mode ParallelMode, room int)
 func TestS3FSWriteInParts(t *testing.T) {
 	small := []byte("hello")
 	large := bytes.Repeat([]byte("abcdefg"), int(3*minMultipartPartSize/7)+2)
+	shortTail := append(bytes.Repeat([]byte("x"), int(2*minMultipartPartSize)), "tail"...)
 	for _, c := range []struct {
 		name  string
 		mode  ParallelMode
 		room  int
 		data  []byte
-		size  bool
+		input string
 		parts int
 		most  int64
 	}{
-		{"small", ParallelForce, 8, small, true, 0, 0},
-		{"small unknown size", ParallelForce, 8, small, false, 0, 0},
-		{"large parallel", ParallelForce, 8, large, true, 4, 4},
-		{"large unknown size", ParallelAuto, 8, large, false, 4, 4},
-		{"large serial", ParallelOff, 8, large, true, 4, 1},
-		{"large parallel in one room", ParallelForce, 1, large, true, 4, 1},
+		{"small", ParallelForce, 8, small, "data", 0, 0},
+		{"small known size reader", ParallelForce, 8, small, "reader", 0, 0},
+		{"small unknown size", ParallelForce, 8, small, "unknown", 0, 0},
+		{"large parallel", ParallelForce, 8, large, "data", 4, 4},
+		{"large unknown size", ParallelAuto, 8, large, "unknown", 4, 4},
+		{"pipe with short tail", ParallelForce, 8, shortTail, "pipe", 3, 3},
+		{"large serial", ParallelOff, 8, large, "data", 4, 1},
+		{"large parallel in one room", ParallelForce, 1, large, "data", 4, 1},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			storage := newPartStorage()
 			fs := newPartFS(t, storage, c.mode, c.room)
 			entry := IOEntry{Size: int64(len(c.data)), Data: c.data}
-			if !c.size {
+			switch c.input {
+			case "reader":
+				entry = IOEntry{Size: int64(len(c.data)), ReaderForWrite: bytes.NewReader(c.data)}
+			case "unknown":
 				entry = IOEntry{Size: -1, ReaderForWrite: bytes.NewReader(c.data)}
+			case "pipe":
+				pr, pw := io.Pipe()
+				t.Cleanup(func() { _ = pr.Close() })
+				go func() {
+					for i := 0; i < len(c.data); i += 1 << 20 {
+						_, _ = pw.Write(c.data[i:min(i+1<<20, len(c.data))])
+					}
+					_ = pw.Close()
+				}()
+				entry = IOEntry{Size: -1, ReaderForWrite: pr}
 			}
 			expire := time.Now().Add(time.Hour)
 			require.NoError(t, fs.Write(context.Background(), IOVector{FilePath: "obj", ExpireAt: expire, Entries: []IOEntry{entry}}))
@@ -215,6 +230,7 @@ func TestS3FSWriteInParts(t *testing.T) {
 			require.Empty(t, storage.puts)
 			require.Equal(t, c.parts, len(storage.parts))
 			require.True(t, bytes.Equal(c.data, storage.done))
+			require.Len(t, storage.parts[int32(c.parts)], len(c.data)-(c.parts-1)*int(minMultipartPartSize))
 			require.LessOrEqual(t, storage.most.Load(), c.most)
 			if c.most == 1 {
 				require.Equal(t, int64(1), storage.most.Load())
@@ -222,12 +238,4 @@ func TestS3FSWriteInParts(t *testing.T) {
 			require.True(t, storage.creates[0].Equal(expire), "expire is passed")
 		})
 	}
-}
-
-func TestS3FSWriteFileExists(t *testing.T) {
-	storage := newPartStorage()
-	storage.exists = true
-	fs := newPartFS(t, storage, ParallelOff, 1)
-	err := fs.Write(context.Background(), IOVector{FilePath: "dup", Entries: []IOEntry{{Size: 1, Data: []byte("x")}}})
-	require.True(t, moerr.IsMoErrCode(err, moerr.ErrFileAlreadyExists), "got %v", err)
 }

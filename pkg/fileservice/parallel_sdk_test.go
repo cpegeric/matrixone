@@ -110,6 +110,7 @@ func newMockAWSServer(t *testing.T, failPart int32) (*httptest.Server, *awsServe
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodPost && strings.Contains(r.URL.RawQuery, "uploads"):
+			state.creates.Add(1)
 			if state.failCreate {
 				w.WriteHeader(http.StatusInternalServerError)
 				return
@@ -222,6 +223,7 @@ type awsServerState struct {
 	failComplete             bool
 	failCreate               bool
 	uploadID                 string
+	creates                  atomic.Int32
 	aborted                  atomic.Bool
 	putCount                 int
 	putBody                  []byte
@@ -246,6 +248,62 @@ func awsObjectKeyFromPath(path string) string {
 
 func awsS3ErrorXML(code, message string) string {
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><Error><Code>%s</Code><Message>%s</Message></Error>`, code, message)
+}
+
+// multipartFixture is a mock AWS or COS multipart server and the fields of its state.
+type multipartFixture struct {
+	provider     string
+	server       *httptest.Server
+	mu           *sync.Mutex
+	failComplete *bool
+	failCreate   *bool
+	failPartSeen *chan struct{}
+	creates      *atomic.Int32
+	aborted      *atomic.Bool
+	completeBody *[]byte
+	parts        func() int
+}
+
+var multipartProviders = []string{"aws", "cos"}
+
+func newMultipartFixture(t *testing.T, provider string, failPart int) *multipartFixture {
+	f := &multipartFixture{provider: provider}
+	if provider == "aws" {
+		server, s := newMockAWSServer(t, int32(failPart))
+		s.uploadID = "aws-upload"
+		f.server, f.mu, f.failComplete, f.failCreate, f.failPartSeen = server, &s.mu, &s.failComplete, &s.failCreate, &s.failPartSeen
+		f.creates, f.aborted, f.completeBody, f.parts = &s.creates, &s.aborted, &s.completeBody, func() int { return len(s.parts) }
+	} else {
+		server, s := newMockCOSServer(t, failPart)
+		f.server, f.mu, f.failComplete, f.failCreate, f.failPartSeen = server, &s.mu, &s.failComplete, &s.failCreate, &s.failPartSeen
+		f.creates, f.aborted, f.completeBody, f.parts = &s.initCalls, &s.aborted, &s.completeBody, func() int { return len(s.parts) }
+	}
+	t.Cleanup(f.server.Close)
+	return f
+}
+
+// client returns a client of the server that sends requests through transport, or the
+// transport of the server when it is nil.
+func (f *multipartFixture) client(t *testing.T, transport http.RoundTripper) ObjectStorage {
+	if transport == nil {
+		transport = f.server.Client().Transport
+	}
+	if f.provider == "aws" {
+		return newTestAWSClientWithTransport(t, f.server, transport)
+	}
+	return newTestCOSClientWithTransport(t, f.server, transport)
+}
+
+// requireAbortedNotCompleted requires that the upload was aborted with no part kept
+// when noParts is set, and was never completed.
+func (f *multipartFixture) requireAbortedNotCompleted(t *testing.T, noParts bool) {
+	require.True(t, f.aborted.Load(), "abort")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	require.Empty(t, *f.completeBody, "complete")
+	if noParts {
+		require.Zero(t, f.parts())
+	}
 }
 
 func newTestAWSClient(t *testing.T, srv *httptest.Server) *AwsSDKv2 {
@@ -277,117 +335,65 @@ func newTestAWSClientWithTransport(t *testing.T, srv *httptest.Server, transport
 }
 
 func TestAwsParallelMultipartSuccess(t *testing.T) {
-	server, state := newMockAWSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "uid-success"
+	for _, known := range []bool{true, false} {
+		t.Run(fmt.Sprintf("known size %v", known), func(t *testing.T) {
+			server, state := newMockAWSServer(t, 0)
+			defer server.Close()
+			state.uploadID = "uid-success"
 
-	upstream := server.Client().Transport
-	var traceMu sync.Mutex
-	traces := make(map[*httptrace.ClientTrace]struct{})
-	transport := wrapRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
-		tr := httptrace.ContextClientTrace(req.Context())
-		if tr == nil {
-			return nil, errors.New("multipart request has no HTTP trace")
-		}
-		traceMu.Lock()
-		traces[tr] = struct{}{}
-		traceMu.Unlock()
-		return upstream.RoundTrip(req)
-	}))
-	g := newObjectStorageServer(newTestAWSClientWithTransport(t, server, transport), minRequestRoom)
-	counter := new(perfcounter.CounterSet)
-	ctx := perfcounter.WithCounterSet(context.Background(), counter)
-	var callerHooks atomic.Int64
-	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(httptrace.GotConnInfo) { callerHooks.Add(1) }})
+			upstream := server.Client().Transport
+			var traceMu sync.Mutex
+			traces := make(map[*httptrace.ClientTrace]struct{})
+			transport := wrapRoundTripper(roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+				tr := httptrace.ContextClientTrace(req.Context())
+				if tr == nil {
+					return nil, errors.New("multipart request has no HTTP trace")
+				}
+				traceMu.Lock()
+				traces[tr] = struct{}{}
+				traceMu.Unlock()
+				return upstream.RoundTrip(req)
+			}))
+			g := newObjectStorageServer(newTestAWSClientWithTransport(t, server, transport), minRequestRoom)
+			counter := new(perfcounter.CounterSet)
+			ctx := perfcounter.WithCounterSet(context.Background(), counter)
+			var callerHooks atomic.Int64
+			ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: func(httptrace.GotConnInfo) { callerHooks.Add(1) }})
 
-	data := bytes.Repeat([]byte("a"), int(minMultipartPartSize+1))
-	size := int64(len(data))
-	err := writeParts(ctx, g, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 2,
-	})
-	if err != nil {
-		t.Fatalf("write failed: %v, parts=%d, complete=%s", err, len(state.parts), string(state.completeBody))
-	}
-	if len(state.parts) != 2 {
-		t.Fatalf("expected 2 multipart parts, got %d", len(state.parts))
-	}
-	if len(state.parts[1])+len(state.parts[2]) != len(data) {
-		t.Fatalf("expected total part size %d, got %d", len(data), len(state.parts[1])+len(state.parts[2]))
-	}
-	if len(state.completeBody) == 0 {
-		t.Fatalf("complete body not recorded")
-	}
-	traceMu.Lock()
-	traceCount := len(traces)
-	traceMu.Unlock()
-	require.GreaterOrEqual(t, traceCount, 4, "create, two parts and completion need independent traces")
-	require.Equal(t, int64(traceCount), callerHooks.Load(), "caller hooks must be composed exactly once per request")
-	if got := counter.FileService.S3.Put.Load(); got != 2 {
-		t.Fatalf("expected 2 physical PUT requests, got %d", got)
-	}
-	if got := counter.FileService.S3WriteSize.Load(); got != size {
-		t.Fatalf("expected %d accepted bytes, got %d", size, got)
-	}
-}
-
-func TestAwsParallelMultipartAbortOnError(t *testing.T) {
-	server, state := newMockAWSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "uid-fail"
-	state.failComplete = true
-
-	sdk := newTestAWSClient(t, server)
-
-	data := bytes.Repeat([]byte("b"), int(minMultipartPartSize*2))
-	size := int64(len(data))
-	err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 2,
-	})
-	if err == nil {
-		t.Fatalf("expected error")
-	}
-	if !state.aborted.Load() {
-		t.Fatalf("expected abort request to be sent")
-	}
-}
-
-func TestAwsMultipartFallbackSmallSize(t *testing.T) {
-	server, state := newMockAWSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "uid-small"
-
-	sdk := newTestAWSClient(t, server)
-	data := bytes.Repeat([]byte("x"), int(minMultipartPartSize-1))
-	size := int64(len(data))
-	if err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{PartSize: minMultipartPartSize}); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-	if state.putCount != 1 {
-		t.Fatalf("expected single PUT fallback, got %d", state.putCount)
-	}
-	if string(state.putBody) != string(data) {
-		t.Fatalf("unexpected put body")
-	}
-}
-
-func TestAwsMultipartFallbackUnknownSmall(t *testing.T) {
-	server, state := newMockAWSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "uid-unknown"
-
-	sdk := newTestAWSClient(t, server)
-	data := bytes.Repeat([]byte("y"), int(minMultipartPartSize-1))
-	reader := bytes.NewReader(data)
-	if err := writeInParts(context.Background(), sdk, "object", reader, nil, &ParallelMultipartOption{PartSize: minMultipartPartSize}); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-	if state.putCount != 1 {
-		t.Fatalf("expected fallback PUT for unknown small")
-	}
-	if string(state.putBody) != string(data) {
-		t.Fatalf("unexpected put body")
+			data := bytes.Repeat([]byte("a"), int(minMultipartPartSize+1))
+			size := int64(len(data))
+			sizeHint := &size
+			if !known {
+				sizeHint = nil
+			}
+			err := writeParts(ctx, g, "object", bytes.NewReader(data), sizeHint, &ParallelMultipartOption{
+				PartSize:    minMultipartPartSize,
+				Concurrency: 2,
+			})
+			if err != nil {
+				t.Fatalf("write failed: %v, parts=%d, complete=%s", err, len(state.parts), string(state.completeBody))
+			}
+			if len(state.parts) != 2 {
+				t.Fatalf("expected 2 multipart parts, got %d", len(state.parts))
+			}
+			if len(state.parts[1])+len(state.parts[2]) != len(data) {
+				t.Fatalf("expected total part size %d, got %d", len(data), len(state.parts[1])+len(state.parts[2]))
+			}
+			if len(state.completeBody) == 0 {
+				t.Fatalf("complete body not recorded")
+			}
+			traceMu.Lock()
+			traceCount := len(traces)
+			traceMu.Unlock()
+			require.GreaterOrEqual(t, traceCount, 4, "create, two parts and completion need independent traces")
+			require.Equal(t, int64(traceCount), callerHooks.Load(), "caller hooks must be composed exactly once per request")
+			if got := counter.FileService.S3.Put.Load(); got != 2 {
+				t.Fatalf("expected 2 physical PUT requests, got %d", got)
+			}
+			if got := counter.FileService.S3WriteSize.Load(); got != size {
+				t.Fatalf("expected %d accepted bytes, got %d", size, got)
+			}
+		})
 	}
 }
 
@@ -406,144 +412,72 @@ func TestAwsMultipartTooManyParts(t *testing.T) {
 }
 
 func TestAwsMultipartUploadPartError(t *testing.T) {
-	server, _ := newMockAWSServer(t, 2)
-	defer server.Close()
-
-	sdk := newTestAWSClient(t, server)
-	counter := new(perfcounter.CounterSet)
-	ctx := perfcounter.WithCounterSet(context.Background(), counter)
-	data := bytes.Repeat([]byte("p"), int(minMultipartPartSize*2))
-	size := int64(len(data))
-	if err := writeInParts(ctx, sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 1,
-	}); err == nil {
-		t.Fatalf("expected upload part error")
-	}
-	if got := counter.FileService.S3.Put.Load(); got < 2 {
-		t.Fatalf("expected successful and failed PUT attempts, got %d", got)
-	}
-	if got := counter.FileService.S3WriteSize.Load(); got != minMultipartPartSize {
-		t.Fatalf("expected first accepted part bytes %d, got %d", minMultipartPartSize, got)
+	for _, provider := range multipartProviders {
+		t.Run(provider, func(t *testing.T) {
+			f := newMultipartFixture(t, provider, 2)
+			counter := new(perfcounter.CounterSet)
+			ctx := perfcounter.WithCounterSet(context.Background(), counter)
+			data := bytes.Repeat([]byte("p"), int(minMultipartPartSize*2))
+			size := int64(len(data))
+			require.Error(t, writeInParts(ctx, f.client(t, nil), "object", bytes.NewReader(data), &size, &ParallelMultipartOption{
+				PartSize:    minMultipartPartSize,
+				Concurrency: 1,
+			}))
+			require.GreaterOrEqual(t, counter.FileService.S3.Put.Load(), int64(2), "successful and failed PUT attempts")
+			require.Equal(t, int64(minMultipartPartSize), counter.FileService.S3WriteSize.Load(), "first accepted part bytes")
+		})
 	}
 }
 
+// A part or completion the server rejects aborts the upload it created and never
+// completes it, also when the reader is still waiting on the rejected part.
 func TestAwsMultipartSendJobFailureAfterPendingChunk(t *testing.T) {
-	server, state := newMockAWSServer(t, 1)
-	defer server.Close()
-	state.uploadID = "uid-pending-fail"
-	state.failPartSeen = make(chan struct{})
-
-	sdk := newTestAWSClient(t, server)
-	data := bytes.Repeat([]byte("q"), int(minMultipartPartSize*3))
-	reader := &waitAfterBytesReader{
-		r:         bytes.NewReader(data),
-		waitAfter: minMultipartPartSize * 2,
-		waitCh:    state.failPartSeen,
-		timeout:   3 * time.Second,
-	}
-	size := int64(len(data))
-	err := writeInParts(context.Background(), sdk, "object", reader, &size, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 1,
-	})
-	if err == nil {
-		t.Fatalf("expected upload part error")
-	}
-	if !state.aborted.Load() {
-		t.Fatalf("expected abort request")
-	}
-	if len(state.completeBody) > 0 {
-		t.Fatalf("expected no complete body")
-	}
-}
-
-func TestAwsParallelMultipartUnknownSize(t *testing.T) {
-	server, state := newMockAWSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "uid-unknown-size"
-
-	sdk := newTestAWSClient(t, server)
-	data := bytes.Repeat([]byte("z"), int(minMultipartPartSize+1))
-	if err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(data), nil, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 2,
-	}); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-	if len(state.parts) != 2 {
-		t.Fatalf("expected 2 multipart parts, got %d parts", len(state.parts))
-	}
-	if len(state.parts[1])+len(state.parts[2]) != len(data) {
-		t.Fatalf("expected total part size %d, got %d", len(data), len(state.parts[1])+len(state.parts[2]))
-	}
-}
-
-func TestAwsMultipartEmptyReader(t *testing.T) {
-	server, state := newMockAWSServer(t, 0)
-	defer server.Close()
-
-	sdk := newTestAWSClient(t, server)
-	if err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(nil), nil, &ParallelMultipartOption{PartSize: minMultipartPartSize}); err != nil {
-		t.Fatalf("expected nil error for empty reader, got %v", err)
-	}
-	if state.putCount != 1 || len(state.putBody) != 0 {
-		t.Fatalf("expected one empty PUT, got count=%d body=%q", state.putCount, state.putBody)
-	}
-	if len(state.parts) != 0 {
-		t.Fatalf("multipart upload should not happen for empty reader")
-	}
-}
-
-func TestAwsMultipartContextCanceled(t *testing.T) {
-	server, _ := newMockAWSServer(t, 0)
-	defer server.Close()
-
-	sdk := newTestAWSClient(t, server)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := writeInParts(ctx, sdk, "object", bytes.NewReader([]byte("data")), nil, &ParallelMultipartOption{PartSize: minMultipartPartSize}); err == nil {
-		t.Fatalf("expected context canceled error")
+	for _, provider := range multipartProviders {
+		for _, c := range []struct {
+			name         string
+			failPart     int
+			knownSize    bool
+			failComplete bool
+		}{
+			{"pending part", 1, true, false},
+			{"pending part unknown size", 1, false, false},
+			{"complete rejected", 0, true, true},
+		} {
+			t.Run(provider+" "+c.name, func(t *testing.T) {
+				f := newMultipartFixture(t, provider, c.failPart)
+				*f.failComplete = c.failComplete
+				data := bytes.Repeat([]byte("q"), int(minMultipartPartSize*3))
+				var reader io.Reader = bytes.NewReader(data)
+				if c.failPart > 0 {
+					seen := make(chan struct{})
+					*f.failPartSeen = seen
+					reader = &waitAfterBytesReader{r: reader, waitAfter: minMultipartPartSize * 2, waitCh: seen, timeout: 3 * time.Second}
+				}
+				size := int64(len(data))
+				sizeHint := &size
+				if !c.knownSize {
+					sizeHint = nil
+				}
+				require.Error(t, writeInParts(context.Background(), f.client(t, nil), "object", reader, sizeHint, &ParallelMultipartOption{
+					PartSize:    minMultipartPartSize,
+					Concurrency: 1,
+				}))
+				require.Equal(t, int32(1), f.creates.Load())
+				f.requireAbortedNotCompleted(t, false)
+			})
+		}
 	}
 }
 
 func TestAwsMultipartCreateFail(t *testing.T) {
-	server, state := newMockAWSServer(t, 0)
-	defer server.Close()
-	state.failCreate = true
-
-	sdk := newTestAWSClient(t, server)
-	data := bytes.Repeat([]byte("i"), int(minMultipartPartSize+1))
-	size := int64(len(data))
-	if err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{PartSize: minMultipartPartSize}); err == nil {
-		t.Fatalf("expected create multipart error")
-	}
-}
-
-func TestAwsParallelMultipartCompletes(t *testing.T) {
-	server, state := newMockAWSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "uid-no-deadlock"
-
-	sdk := newTestAWSClient(t, server)
-	data := bytes.Repeat([]byte("m"), int(minMultipartPartSize*2))
-	size := int64(len(data))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := writeInParts(ctx, sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 2,
-	}); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-
-	if len(state.parts) != 2 {
-		t.Fatalf("expected 2 parts, got %d", len(state.parts))
-	}
-	if len(state.completeBody) == 0 {
-		t.Fatalf("expected multipart complete request")
+	for _, provider := range multipartProviders {
+		t.Run(provider, func(t *testing.T) {
+			f := newMultipartFixture(t, provider, 0)
+			*f.failCreate = true
+			data := bytes.Repeat([]byte("i"), int(minMultipartPartSize+1))
+			size := int64(len(data))
+			require.Error(t, writeInParts(context.Background(), f.client(t, nil), "object", bytes.NewReader(data), &size, &ParallelMultipartOption{PartSize: minMultipartPartSize}))
+		})
 	}
 }
 
@@ -837,131 +771,6 @@ func TestCOSParallelMultipartSuccess(t *testing.T) {
 	}
 }
 
-func TestCOSParallelMultipartAbortOnError(t *testing.T) {
-	server, state := newMockCOSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "cos-uid-fail"
-	state.failComplete = true
-
-	sdk := newTestCOSClient(t, server)
-	data := bytes.Repeat([]byte("d"), int(minMultipartPartSize*2))
-	size := int64(len(data))
-	err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 2,
-	})
-	if err == nil {
-		t.Fatalf("expected error")
-	}
-	if !state.aborted.Load() {
-		t.Fatalf("expected abort request")
-	}
-}
-
-func TestCOSMultipartFallbackSmallSize(t *testing.T) {
-	server, state := newMockCOSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "cos-small"
-
-	sdk := newTestCOSClient(t, server)
-	data := bytes.Repeat([]byte("e"), int(minMultipartPartSize-1))
-	size := int64(len(data))
-	if err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{PartSize: minMultipartPartSize}); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-	if state.putCount != 1 {
-		t.Fatalf("expected single PUT fallback, got %d", state.putCount)
-	}
-	if string(state.putBody) != string(data) {
-		t.Fatalf("unexpected put body")
-	}
-}
-
-func TestCOSMultipartFallbackUnknownSmall(t *testing.T) {
-	server, state := newMockCOSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "cos-unknown"
-
-	sdk := newTestCOSClient(t, server)
-	data := bytes.Repeat([]byte("f"), int(minMultipartPartSize-1))
-	if err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(data), nil, &ParallelMultipartOption{PartSize: minMultipartPartSize}); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-	if state.putCount != 1 {
-		t.Fatalf("expected fallback PUT for unknown small")
-	}
-	if string(state.putBody) != string(data) {
-		t.Fatalf("unexpected put body")
-	}
-}
-
-func TestCOSMultipartTooManyParts(t *testing.T) {
-	server, _ := newMockCOSServer(t, 0)
-	defer server.Close()
-
-	sdk := newTestCOSClient(t, server)
-	huge := int64(maxMultipartParts+1) * defaultParallelMultipartPartSize
-	err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(nil), &huge, &ParallelMultipartOption{
-		PartSize: defaultParallelMultipartPartSize,
-	})
-	if err == nil {
-		t.Fatalf("expected error for too many parts")
-	}
-}
-
-func TestCOSMultipartUploadPartError(t *testing.T) {
-	server, _ := newMockCOSServer(t, 2)
-	defer server.Close()
-
-	sdk := newTestCOSClient(t, server)
-	counter := new(perfcounter.CounterSet)
-	ctx := perfcounter.WithCounterSet(context.Background(), counter)
-	data := bytes.Repeat([]byte("h"), int(minMultipartPartSize*2))
-	size := int64(len(data))
-	if err := writeInParts(ctx, sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 1,
-	}); err == nil {
-		t.Fatalf("expected upload part error")
-	}
-	if got := counter.FileService.S3.Put.Load(); got < 2 {
-		t.Fatalf("expected successful and failed PUT attempts, got %d", got)
-	}
-	if got := counter.FileService.S3WriteSize.Load(); got != minMultipartPartSize {
-		t.Fatalf("expected first accepted part bytes %d, got %d", minMultipartPartSize, got)
-	}
-}
-
-func TestCOSMultipartSendJobFailureAfterPendingChunk(t *testing.T) {
-	server, state := newMockCOSServer(t, 1)
-	defer server.Close()
-	state.uploadID = "cos-uid-pending-fail"
-	state.failPartSeen = make(chan struct{})
-
-	sdk := newTestCOSClient(t, server)
-	data := bytes.Repeat([]byte("s"), int(minMultipartPartSize*3))
-	reader := &waitAfterBytesReader{
-		r:         bytes.NewReader(data),
-		waitAfter: minMultipartPartSize * 2,
-		waitCh:    state.failPartSeen,
-		timeout:   3 * time.Second,
-	}
-	size := int64(len(data))
-	err := writeInParts(context.Background(), sdk, "object", reader, &size, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 1,
-	})
-	if err == nil {
-		t.Fatalf("expected upload part error")
-	}
-	if !state.aborted.Load() {
-		t.Fatalf("expected abort request")
-	}
-	if state.completed.Load() || len(state.completeBody) > 0 {
-		t.Fatalf("expected no complete multipart upload")
-	}
-}
-
 func TestCOSMultipartUploadPartRetriesServerClosedIdleConnection(t *testing.T) {
 	server, state := newMockCOSServer(t, 0)
 	defer server.Close()
@@ -1078,96 +887,45 @@ func TestCOSMultipartInitDoesNotRequireListPermission(t *testing.T) {
 }
 
 func TestAwsMultipartWorkerCancellationAborts(t *testing.T) {
-	server, state := newMockAWSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "aws-worker-canceled"
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sdk := newTestAWSClient(t, server)
-
-	data := bytes.Repeat([]byte("r"), int(minMultipartPartSize)+1)
-	reader := &eofSignalReader{r: bytes.NewReader(data), eof: make(chan struct{})}
-	size := int64(len(data))
-	err := writeInParts(ctx, sdk, "object", reader, &size, &ParallelMultipartOption{
-		PartSize: minMultipartPartSize,
-		beforePartUpload: func() {
-			<-reader.eof
-			cancel()
-		},
-	})
-	require.ErrorIs(t, err, context.Canceled)
-	require.True(t, state.aborted.Load())
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	require.Empty(t, state.completeBody)
-	require.Empty(t, state.parts)
-}
-
-func TestCOSMultipartWorkerCancellationAborts(t *testing.T) {
-	server, state := newMockCOSServer(t, 0)
-	defer server.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sdk := newTestCOSClient(t, server)
-
-	data := bytes.Repeat([]byte("r"), int(minMultipartPartSize)+1)
-	reader := &eofSignalReader{r: bytes.NewReader(data), eof: make(chan struct{})}
-	size := int64(len(data))
-	err := writeInParts(ctx, sdk, "object", reader, &size, &ParallelMultipartOption{
-		PartSize: minMultipartPartSize,
-		beforePartUpload: func() {
-			<-reader.eof
-			cancel()
-		},
-	})
-	require.ErrorIs(t, err, context.Canceled)
-	require.True(t, state.aborted.Load())
-	require.False(t, state.completed.Load())
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	require.Empty(t, state.parts)
+	for _, provider := range multipartProviders {
+		t.Run(provider, func(t *testing.T) {
+			f := newMultipartFixture(t, provider, 0)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			data := bytes.Repeat([]byte("r"), int(minMultipartPartSize)+1)
+			reader := &eofSignalReader{r: bytes.NewReader(data), eof: make(chan struct{})}
+			size := int64(len(data))
+			err := writeInParts(ctx, f.client(t, nil), "object", reader, &size, &ParallelMultipartOption{
+				PartSize: minMultipartPartSize,
+				beforePartUpload: func() {
+					<-reader.eof
+					cancel()
+				},
+			})
+			require.ErrorIs(t, err, context.Canceled)
+			f.requireAbortedNotCompleted(t, true)
+		})
+	}
 }
 
 func TestAwsMultipartInitCancellationCleansOwnedUpload(t *testing.T) {
-	server, state := newMockAWSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "aws-uid-canceled"
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	sdk := newTestAWSClientWithTransport(t, server, &multipartInitCancelAfterResponseTransport{
-		base:   server.Client().Transport,
-		cancel: cancel,
-	})
-
-	data := bytes.Repeat([]byte("r"), int(minMultipartPartSize+1))
-	size := int64(len(data))
-	err := writeInParts(ctx, sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{PartSize: minMultipartPartSize})
-	require.ErrorIs(t, err, context.Canceled)
-	require.True(t, state.aborted.Load())
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	require.Empty(t, state.completeBody)
-}
-
-func TestCOSMultipartInitCancellationCleansOwnedUpload(t *testing.T) {
-	server, state := newMockCOSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "cos-uid-canceled"
-	ctx, cancel := context.WithCancel(context.Background())
-	transport := &multipartInitCancelAfterResponseTransport{
-		base:   server.Client().Transport,
-		cancel: cancel,
+	for _, provider := range multipartProviders {
+		t.Run(provider, func(t *testing.T) {
+			f := newMultipartFixture(t, provider, 0)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			sdk := f.client(t, &multipartInitCancelAfterResponseTransport{base: f.server.Client().Transport, cancel: cancel})
+			cleanupBefore := testutil.ToFloat64(metric.FSMultipartInitCleanupCounter)
+			data := bytes.Repeat([]byte("r"), int(minMultipartPartSize+1))
+			size := int64(len(data))
+			err := writeInParts(ctx, sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{PartSize: minMultipartPartSize})
+			require.ErrorIs(t, err, context.Canceled)
+			f.requireAbortedNotCompleted(t, false)
+			if provider == "cos" {
+				require.Equal(t, cleanupBefore+1, testutil.ToFloat64(metric.FSMultipartInitCleanupCounter))
+			}
+		})
 	}
-	sdk := newTestCOSClientWithTransport(t, server, transport)
-
-	cleanupBefore := testutil.ToFloat64(metric.FSMultipartInitCleanupCounter)
-	data := bytes.Repeat([]byte("r"), int(minMultipartPartSize+1))
-	size := int64(len(data))
-	err := writeInParts(ctx, sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{PartSize: minMultipartPartSize})
-	require.ErrorIs(t, err, context.Canceled)
-	require.True(t, state.aborted.Load())
-	require.False(t, state.completed.Load())
-	require.Equal(t, cleanupBefore+1, testutil.ToFloat64(metric.FSMultipartInitCleanupCounter))
 }
 
 func TestCOSMultipartInitCancellationOverridesRetryableError(t *testing.T) {
@@ -1214,9 +972,13 @@ func TestCOSMultipartInitDefinitiveErrorOverridesEarlierRetryableError(t *testin
 }
 
 func TestCOSMultipartInitDoesNotRetryAfterRequestCommitted(t *testing.T) {
+	invalidBody := func(r io.Reader) func() io.ReadCloser {
+		return func() io.ReadCloser { return io.NopCloser(r) }
+	}
 	tests := []struct {
 		name string
 		err  error
+		body func() io.ReadCloser
 	}{
 		{name: "EOF", err: io.EOF},
 		{name: "unexpected EOF", err: io.ErrUnexpectedEOF},
@@ -1224,58 +986,11 @@ func TestCOSMultipartInitDoesNotRetryAfterRequestCommitted(t *testing.T) {
 		{name: "connection reset", err: errors.New("read: connection reset by peer")},
 		{name: "broken pipe", err: errors.New("write: broken pipe")},
 		{name: "server closed connection", err: errors.New("http: server closed idle connection")},
-	}
-
-	ambiguousBefore := testutil.ToFloat64(metric.FSMultipartInitAmbiguousCounter)
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			var initCalls atomic.Int32
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if r.Method != http.MethodPost || !r.URL.Query().Has("uploads") {
-					w.WriteHeader(http.StatusNotFound)
-					return
-				}
-				uploadID := fmt.Sprintf("upload-%d", initCalls.Add(1))
-				w.Header().Set("Content-Type", "application/xml")
-				_, _ = fmt.Fprintf(w, `<InitiateMultipartUploadResult><UploadId>%s</UploadId></InitiateMultipartUploadResult>`, uploadID)
-			}))
-			defer server.Close()
-
-			sdk := newTestCOSClientWithTransport(t, server, &cosMultipartInitResponseLostTransport{
-				base: server.Client().Transport,
-				err:  test.err,
-			})
-			data := bytes.Repeat([]byte("r"), int(minMultipartPartSize+1))
-			size := int64(len(data))
-			err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{PartSize: minMultipartPartSize})
-			require.ErrorContains(t, err, test.err.Error())
-			require.Equal(t, int32(1), initCalls.Load())
-		})
-	}
-	require.Equal(t, ambiguousBefore+float64(len(tests)), testutil.ToFloat64(metric.FSMultipartInitAmbiguousCounter))
-}
-
-func TestCOSMultipartInitDoesNotRetryInvalidSuccessBody(t *testing.T) {
-	tests := []struct {
-		name string
-		body func() io.ReadCloser
-		err  error
-	}{
-		{
-			name: "empty",
-			body: func() io.ReadCloser { return io.NopCloser(strings.NewReader("")) },
-			err:  io.EOF,
-		},
-		{
-			name: "truncated",
-			body: func() io.ReadCloser {
-				return io.NopCloser(io.MultiReader(
-					strings.NewReader(`<InitiateMultipartUploadResult><UploadId>`),
-					multipartInitErrorReader{err: io.ErrUnexpectedEOF},
-				))
-			},
-			err: io.ErrUnexpectedEOF,
-		},
+		{name: "empty success body", err: io.EOF, body: invalidBody(strings.NewReader(""))},
+		{name: "truncated success body", err: io.ErrUnexpectedEOF, body: invalidBody(io.MultiReader(
+			strings.NewReader(`<InitiateMultipartUploadResult><UploadId>`),
+			multipartInitErrorReader{err: io.ErrUnexpectedEOF},
+		))},
 	}
 
 	ambiguousBefore := testutil.ToFloat64(metric.FSMultipartInitAmbiguousCounter)
@@ -1283,12 +998,12 @@ func TestCOSMultipartInitDoesNotRetryInvalidSuccessBody(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			server, state := newMockCOSServer(t, 0)
 			defer server.Close()
-			state.uploadID = "committed-upload"
-			sdk := newTestCOSClientWithTransport(t, server, &cosMultipartInitInvalidSuccessBodyTransport{
-				base: server.Client().Transport,
-				body: test.body,
-			})
-
+			state.generateUploadIDs = true
+			var transport http.RoundTripper = &cosMultipartInitResponseLostTransport{base: server.Client().Transport, err: test.err}
+			if test.body != nil {
+				transport = &cosMultipartInitInvalidSuccessBodyTransport{base: server.Client().Transport, body: test.body}
+			}
+			sdk := newTestCOSClientWithTransport(t, server, transport)
 			data := bytes.Repeat([]byte("r"), int(minMultipartPartSize+1))
 			size := int64(len(data))
 			err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{PartSize: minMultipartPartSize})
@@ -1456,209 +1171,24 @@ func (t *cosUploadPartIdleConnTransport) RoundTrip(req *http.Request) (*http.Res
 	return t.base.RoundTrip(req)
 }
 
-func TestCOSParallelMultipartUnknownSize(t *testing.T) {
-	server, state := newMockCOSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "cos-unknown-size"
-
-	sdk := newTestCOSClient(t, server)
-	data := bytes.Repeat([]byte("g"), int(minMultipartPartSize+1))
-	if err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(data), nil, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 2,
-	}); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-	if len(state.parts) != 2 {
-		t.Fatalf("expected 2 multipart parts, got %d parts", len(state.parts))
-	}
-	if len(state.parts[1])+len(state.parts[2]) != len(data) {
-		t.Fatalf("expected total part size %d, got %d", len(data), len(state.parts[1])+len(state.parts[2]))
-	}
-}
-
-func TestCOSParallelMultipartPipeSmallTail(t *testing.T) {
-	server, state := newMockCOSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "cos-pipe-small-tail"
-
-	sdk := newTestCOSClient(t, server)
-	pr, pw := io.Pipe()
-	writeErrCh := make(chan error, 1)
-	go func() {
-		chunk := bytes.Repeat([]byte("x"), 1<<20)
-		for i := 0; i < 10; i++ {
-			if _, err := pw.Write(chunk); err != nil {
-				writeErrCh <- err
-				return
-			}
-		}
-		if _, err := pw.Write([]byte("tail")); err != nil {
-			writeErrCh <- err
-			return
-		}
-		writeErrCh <- pw.Close()
-	}()
-
-	err := writeInParts(context.Background(), sdk, "object", pr, nil, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 2,
-	})
-	if writeErr := <-writeErrCh; writeErr != nil {
-		t.Fatalf("pipe writer failed: %v", writeErr)
-	}
-	if err != nil {
-		t.Fatalf("write failed: %v, parts=%d, complete=%s", err, len(state.parts), string(state.completeBody))
-	}
-	if len(state.parts) != 3 {
-		t.Fatalf("expected 3 parts, got %d", len(state.parts))
-	}
-	if len(state.parts[1]) != int(minMultipartPartSize) {
-		t.Fatalf("expected first part size %d, got %d", minMultipartPartSize, len(state.parts[1]))
-	}
-	if len(state.parts[2]) != int(minMultipartPartSize) {
-		t.Fatalf("expected second part size %d, got %d", minMultipartPartSize, len(state.parts[2]))
-	}
-	if len(state.parts[3]) != len("tail") {
-		t.Fatalf("expected final tail part size %d, got %d", len("tail"), len(state.parts[3]))
-	}
-}
-
-func TestCOSMultipartEmptyReader(t *testing.T) {
-	server, state := newMockCOSServer(t, 0)
-	defer server.Close()
-
-	sdk := newTestCOSClient(t, server)
-	if err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(nil), nil, &ParallelMultipartOption{PartSize: minMultipartPartSize}); err != nil {
-		t.Fatalf("expected nil error for empty reader, got %v", err)
-	}
-	if state.putCount != 1 || len(state.putBody) != 0 {
-		t.Fatalf("expected one empty PUT, got count=%d body=%q", state.putCount, state.putBody)
-	}
-	if len(state.parts) != 0 {
-		t.Fatalf("multipart upload should not happen for empty reader")
-	}
-}
-
-func TestCOSMultipartContextCanceled(t *testing.T) {
-	server, _ := newMockCOSServer(t, 0)
-	defer server.Close()
-
-	sdk := newTestCOSClient(t, server)
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := writeInParts(ctx, sdk, "object", bytes.NewReader([]byte("data")), nil, &ParallelMultipartOption{PartSize: minMultipartPartSize}); err == nil {
-		t.Fatalf("expected context canceled error")
-	}
-}
-
-func TestCOSMultipartCreateFail(t *testing.T) {
-	server, state := newMockCOSServer(t, 0)
-	defer server.Close()
-	state.failCreate = true
-
-	sdk := newTestCOSClient(t, server)
-	data := bytes.Repeat([]byte("j"), int(minMultipartPartSize+1))
-	size := int64(len(data))
-	if err := writeInParts(context.Background(), sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{PartSize: minMultipartPartSize}); err == nil {
-		t.Fatalf("expected create multipart error")
-	}
-}
-
-func TestCOSParallelMultipartCompletes(t *testing.T) {
-	server, state := newMockCOSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "cos-no-deadlock"
-
-	sdk := newTestCOSClient(t, server)
-	data := bytes.Repeat([]byte("n"), int(minMultipartPartSize*2))
-	size := int64(len(data))
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	if err := writeInParts(ctx, sdk, "object", bytes.NewReader(data), &size, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 2,
-	}); err != nil {
-		t.Fatalf("write failed: %v", err)
-	}
-
-	if len(state.parts) != 2 {
-		t.Fatalf("expected 2 parts, got %d", len(state.parts))
-	}
-	if len(state.completeBody) == 0 {
-		t.Fatalf("expected multipart complete request")
-	}
-}
-
-// TestAwsParallelMultipartAbortOnReadError verifies that AbortMultipartUpload
-// is sent when a read error occurs after multipart upload has been initiated.
-// This covers the case where setErr cancels the derived context and the abort
-// defer must use a non-canceled context.
+// A read error after the upload is created aborts it with a context that is not canceled.
 func TestAwsParallelMultipartAbortOnReadError(t *testing.T) {
-	server, state := newMockAWSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "uid-read-err"
-
-	sdk := newTestAWSClient(t, server)
-
-	// Provide enough data for the first readChunk to succeed (triggering
-	// multipart initiation), then fail on the next read.
-	data := bytes.Repeat([]byte("x"), int(minMultipartPartSize*2))
-	r := &failAfterBytesReader{
-		r:         bytes.NewReader(data),
-		failAfter: minMultipartPartSize,
-		errAfter:  errors.New("size does not match"),
-	}
-	size := int64(len(data))
-	err := writeInParts(context.Background(), sdk, "object", r, &size, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 2,
-	})
-	if err == nil {
-		t.Fatal("expected read error")
-	}
-	if len(state.completeBody) > 0 {
-		t.Fatal("expected no complete body")
-	}
-	if !state.aborted.Load() {
-		t.Fatal("expected abort request to be sent for size mismatch read error")
-	}
-}
-
-// TestCOSParallelMultipartAbortOnReadError verifies that AbortMultipartUpload
-// is sent when a read error occurs after multipart upload has been initiated
-// for the COS SDK.
-func TestCOSParallelMultipartAbortOnReadError(t *testing.T) {
-	server, state := newMockCOSServer(t, 0)
-	defer server.Close()
-	state.uploadID = "cos-uid-read-err"
-
-	sdk := newTestCOSClient(t, server)
-
-	data := bytes.Repeat([]byte("y"), int(minMultipartPartSize*2))
-	r := &failAfterBytesReader{
-		r:         bytes.NewReader(data),
-		failAfter: minMultipartPartSize,
-		errAfter:  errors.New("size does not match"),
-	}
-	size := int64(len(data))
-	err := writeInParts(context.Background(), sdk, "object", r, &size, &ParallelMultipartOption{
-		PartSize:    minMultipartPartSize,
-		Concurrency: 2,
-	})
-	if err == nil {
-		t.Fatal("expected read error")
-	}
-	if state.completed.Load() {
-		t.Fatal("expected no complete multipart upload")
-	}
-	if len(state.completeBody) > 0 {
-		t.Fatal("expected no complete body")
-	}
-	if !state.aborted.Load() {
-		t.Fatal("expected abort request to be sent for size mismatch read error")
+	for _, provider := range multipartProviders {
+		t.Run(provider, func(t *testing.T) {
+			f := newMultipartFixture(t, provider, 0)
+			data := bytes.Repeat([]byte("x"), int(minMultipartPartSize*2))
+			r := &failAfterBytesReader{
+				r:         bytes.NewReader(data),
+				failAfter: minMultipartPartSize,
+				errAfter:  errors.New("size does not match"),
+			}
+			size := int64(len(data))
+			require.Error(t, writeInParts(context.Background(), f.client(t, nil), "object", r, &size, &ParallelMultipartOption{
+				PartSize:    minMultipartPartSize,
+				Concurrency: 2,
+			}))
+			f.requireAbortedNotCompleted(t, false)
+		})
 	}
 }
 

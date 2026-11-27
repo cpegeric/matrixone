@@ -249,6 +249,8 @@ func TestReplayWriteSkipCacheAndCanceledContext(t *testing.T) {
 	vector.Policy = 0
 	require.ErrorIs(t, writeReplayableData(canceled, fs, vector), context.Canceled)
 	require.Empty(t, fs.diskCache.objectFiles("canceled"))
+	reader := IOVector{FilePath: "canceled-reader", Entries: []IOEntry{{Size: -1, ReaderForWrite: bytes.NewReader([]byte("data"))}}}
+	require.ErrorIs(t, fs.Write(canceled, reader), context.Canceled)
 }
 
 func TestReplayWritePreservesExistingCacheBehavior(t *testing.T) {

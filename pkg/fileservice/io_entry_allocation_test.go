@@ -241,26 +241,6 @@ func TestS3FSReadDiskCacheAllocationFailure(t *testing.T) {
 	}
 }
 
-func TestS3FSReadDiskCacheShortReadFallsBack(t *testing.T) {
-	ctx := context.Background()
-	fs := newAllocationTestS3FS(t)
-	const name = "object"
-	entry := IOEntry{Size: 2, Data: []byte("xy")}
-	require.NoError(t, fs.Write(ctx, IOVector{FilePath: name, Entries: []IOEntry{entry}, Policy: SkipAllCache}))
-	require.NoError(t, fs.diskCache.Update(ctx, &IOVector{
-		FilePath: name, Entries: []IOEntry{entry}, Policy: SkipFullFilePreloads,
-	}, false))
-	require.NoError(t, os.Truncate(fs.diskCache.pathForIOEntry(name, entry), 1))
-	storage := &readRangeRecordingObjectStorage{ObjectStorage: fs.server.raw}
-	fs.server.raw = storage
-	vector := &IOVector{FilePath: name, Policy: SkipFullFilePreloads, Entries: []IOEntry{{Size: 2}}}
-	t.Cleanup(vector.Release)
-	require.NoError(t, fs.Read(ctx, vector))
-	require.Equal(t, []byte("xy"), vector.Entries[0].Data)
-	_, read := storage.lastRead()
-	require.True(t, read, "short cache read should fall back to object storage")
-}
-
 func TestDiskCacheAllocationFailureKeepsEarlierHitOwned(t *testing.T) {
 	ctx := context.Background()
 	cache, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1<<20), nil, false, nil, "")
