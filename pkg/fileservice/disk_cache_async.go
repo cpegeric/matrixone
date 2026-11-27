@@ -118,7 +118,7 @@ type publisher struct {
 }
 
 // queuedJob names a removal queued without waiting: its kind ("evict", "reindex",
-// "repair" or "unload") and the path it changes.
+// "repair", "unload" or "delete") and the path it changes.
 type queuedJob struct{ kind, path string }
 
 type diskCacheWriteFailureState struct {
@@ -518,7 +518,8 @@ func (p *publisher) turnLocked(pub *publication) bool {
 
 // remove has the publisher run remove, which removes the cached files of the object
 // deleted, after every publication of the object queued before it, and returns its error.
-// Once the publisher is closed, it runs remove after the workers exit.
+// When ctx ends before it is queued, it is queued without waiting and ctx's error is
+// returned. Once the publisher is closed, it runs remove after the workers exit.
 func (p *publisher) remove(ctx context.Context, object string, remove func() error) error {
 	if p.begin() {
 		job := &publication{
@@ -535,6 +536,7 @@ func (p *publisher) remove(ctx context.Context, object string, remove func() err
 		}
 		p.end()
 		if err := ctx.Err(); err != nil {
+			p.queue(object, queuedJob{"delete", object}, remove)
 			return err
 		}
 	}

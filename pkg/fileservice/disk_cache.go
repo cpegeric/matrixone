@@ -1446,12 +1446,15 @@ func (d *DiskCache) deletePath(ctx context.Context, path string) error {
 	d.deletes.deleted(key)
 	defer d.deletes.deleted(key)
 	// No prefetch object of the object caches its bytes after the delete; one under
-	// way is canceled rather than waited for.
-	if err := d.dropPrefetches(ctx, key); err != nil {
-		return err
-	}
+	// way is canceled rather than waited for. The ranges are removed whether or not
+	// ctx ends first.
+	dropped := d.dropPrefetches(ctx, key)
 	d.prefetched.forget(key)
-	return d.pub.remove(ctx, key, func() error { return d.removeRanges(key) })
+	removed := d.pub.remove(ctx, key, func() error { return d.removeRanges(key) })
+	if dropped != nil {
+		return dropped
+	}
+	return removed
 }
 
 // removeRanges removes the cached ranges of the object with key, stale or not, each one

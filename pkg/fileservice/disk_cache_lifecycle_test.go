@@ -1548,6 +1548,94 @@ func TestDeleteDuringFillReadsNewVersion(t *testing.T) {
 	}
 }
 
+// heldReadStorage blocks the first read until open is closed, whatever its context;
+// started is closed once it blocks.
+type heldReadStorage struct {
+	ObjectStorage
+	once    sync.Once
+	started chan struct{}
+	open    chan struct{}
+}
+
+func (s *heldReadStorage) Read(ctx context.Context, key string, min, max *int64) (io.ReadCloser, error) {
+	first := false
+	s.once.Do(func() { first = true })
+	if first {
+		close(s.started)
+		<-s.open
+	}
+	return s.ObjectStorage.Read(ctx, key, min, max)
+}
+
+// A delete whose context ends while it waits for a fill of the object to end, or for
+// room in the publisher's queue, returns the error and still removes the cached ranges
+// of the object: once the object is rewritten, a read of a cached range returns the new
+// version. The control's delete returns.
+func TestCanceledDeleteRemovesCachedRanges(t *testing.T) {
+	for _, c := range []string{"fill", "queue", "control"} {
+		t.Run(c, func(t *testing.T) {
+			ctx := context.Background()
+			fs, _, v1 := newIndexObjectFS(t, false)
+			d := fs.diskCache
+			if c == "queue" {
+				d.pub.workers, d.pub.jobs = 1, make(chan *publication, 1)
+			}
+			path := cacheRange(t, fs, 100, 10)
+			release := func() {}
+			switch c {
+			case "fill":
+				gate := &heldReadStorage{ObjectStorage: fs.server.raw, started: make(chan struct{}), open: make(chan struct{})}
+				fs.server.raw = gate
+				release = sync.OnceFunc(func() { close(gate.open) })
+				t.Cleanup(release)
+				go func() {
+					vec := &IOVector{FilePath: "object", Policy: ColumnPrefetch | SkipFullFilePreloads | SkipMemoryCache,
+						Entries: []IOEntry{{Offset: 4096, Size: 4096}}}
+					_ = fs.Read(ctx, vec)
+					vec.Release()
+				}()
+				<-gate.started
+			case "queue":
+				var held <-chan struct{}
+				held, release = holdPublisher(t, d)
+				for _, name := range []string{"a", "b"} {
+					require.NoError(t, fs.Write(ctx, IOVector{FilePath: name, Policy: SkipMemoryCache,
+						Entries: []IOEntry{{Size: 4096, Data: make([]byte, 4096)}}}))
+					if name == "a" {
+						<-held
+					}
+				}
+				waitQueued(t, d, 1)
+			}
+			key := d.objectKey("object")
+			mark := d.deletes.now()
+			delCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			deleted := make(chan error, 1)
+			go func() { deleted <- fs.Delete(delCtx, "object") }()
+			require.Eventually(t, func() bool { return d.deletes.since(key, mark) }, diskCacheLifecycleTestTimeout, time.Millisecond)
+			if c == "control" {
+				require.NoError(t, <-deleted)
+			} else {
+				require.Never(t, func() bool { return len(deleted) > 0 }, 20*time.Millisecond, time.Millisecond)
+				cancel()
+				require.ErrorIs(t, <-deleted, context.Canceled)
+				release()
+			}
+			v2 := slices.Clone(v1)
+			for i := range v2 {
+				v2[i]++
+			}
+			require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(v2)), Data: v2}},
+				Policy: SkipDiskCache | SkipMemoryCache}))
+			waitObjectsEnd(d, "object")
+			flushPublishers(fs)
+			require.Equal(t, v2[102:108], readRangeOf(t, fs, 0, 102, 6))
+			require.False(t, d.cache.Contains(path))
+		})
+	}
+}
+
 // A range whose file cannot be removed, by a delete or by an eviction, stays in the cache
 // and no read uses it: once the object is rewritten, a read of the range and one of bytes
 // within it return the new version, and a later delete removes the file. The control
