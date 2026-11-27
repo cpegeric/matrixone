@@ -16,6 +16,7 @@ package fileservice
 
 import (
 	"cmp"
+	"hash/maphash"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // cachedRange is a range of an object cached in a file of its own.
@@ -258,4 +260,267 @@ func smallestContaining(ranges []cachedRange, offset, size int64, tried []string
 		}
 	}
 	return found, ok
+}
+
+// objectDeletesMax is the most deleted objects remembered; past it they are forgotten.
+const objectDeletesMax = 1 << 16
+
+// objectDeletesStripes is the number of locks the publications and deletes of objects
+// share by their disk paths.
+const objectDeletesStripes = 64
+
+// objectDeletes counts the deletes of objects, so an entry read before its object was
+// deleted is not cached after the delete.
+type objectDeletes struct {
+	count atomic.Uint64
+	mu    sync.Mutex
+	// last holds, by object disk path, the count after the object's last delete.
+	last map[string]uint64
+	// floor is the count when last was cleared: earlier deletes are forgotten.
+	floor uint64
+	// loading keeps every delete while the cache loads its files: a file found by the load
+	// is indexed only when its object was not deleted since the cache was created.
+	loading bool
+	// stripes are held shared by the publications of entries and exclusively by the
+	// counting of deletes, by object disk path.
+	stripes [objectDeletesStripes]sync.RWMutex
+}
+
+var objectDeletesSeed = maphash.MakeSeed()
+
+func (o *objectDeletes) stripe(diskPath string) *sync.RWMutex {
+	return &o.stripes[maphash.String(objectDeletesSeed, diskPath)%objectDeletesStripes]
+}
+
+func (o *objectDeletes) now() uint64 {
+	return o.count.Load()
+}
+
+// deleted counts a delete of the object at diskPath, after the publications of its
+// entries under way end.
+func (o *objectDeletes) deleted(diskPath string) {
+	stripe := o.stripe(diskPath)
+	stripe.Lock()
+	defer stripe.Unlock()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(o.last) >= objectDeletesMax && !o.loading {
+		clear(o.last)
+		o.floor = o.count.Load()
+	}
+	if o.last == nil {
+		o.last = make(map[string]uint64)
+	}
+	o.last[diskPath] = o.count.Add(1)
+}
+
+// setLoading sets whether the cache loads its files.
+func (o *objectDeletes) setLoading(loading bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.loading = loading
+}
+
+// since reports whether the object at diskPath may have been deleted after the count
+// was start.
+func (o *objectDeletes) since(diskPath string, start uint64) bool {
+	if o.count.Load() == start {
+		return false
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if start < o.floor {
+		return true
+	}
+	return o.last[diskPath] > start
+}
+
+// storePrefetchedSize stores the size of the object at objectPath, told by a prefetch made
+// when the delete count was mark, unless the object was deleted since. The delete of the
+// object forgets a size stored before it.
+func (d *DiskCache) storePrefetchedSize(objectPath string, size int64, mark uint64) {
+	stripe := d.deletes.stripe(objectPath)
+	stripe.RLock()
+	defer stripe.RUnlock()
+	if !d.deletes.since(objectPath, mark) {
+		d.prefetched.store(objectPath, size)
+	}
+}
+
+// readDeletes returns the mark of an entry read now: 1 plus the delete count.
+func (d *DiskCache) readDeletes() uint64 {
+	return d.deletes.now() + 1
+}
+
+// publishUnlessDeleted runs write, which caches entry once the claim it is given holds,
+// with a claim that also fails when the object at filePath was deleted after the entry
+// was read. A delete is counted after the publications claimed end, so its removal of the
+// object's cached files finds them.
+func (d *DiskCache) publishUnlessDeleted(
+	filePath string,
+	entry IOEntry,
+	claim func() bool,
+	write func(claim func() bool) (bool, error),
+) (bool, error) {
+	if entry.readDeletes == 0 {
+		return write(claim)
+	}
+	path, err := ParsePath(filePath)
+	if err != nil {
+		return write(claim)
+	}
+	return d.publishUnlessDeletedSince(d.objectKey(path.File), entry.readDeletes-1, claim, write)
+}
+
+// publishUnlessDeletedSince runs write with a claim that also fails when the object at
+// objectPath was deleted after the delete count was mark; it reports false without the
+// error of write when it was.
+func (d *DiskCache) publishUnlessDeletedSince(
+	objectPath string,
+	mark uint64,
+	claim func() bool,
+	write func(claim func() bool) (bool, error),
+) (bool, error) {
+	stripe := d.deletes.stripe(objectPath)
+	locked, deleted := false, false
+	written, err := write(func() bool {
+		if claim != nil && !claim() {
+			return false
+		}
+		stripe.RLock()
+		locked = true
+		deleted = d.deletes.since(objectPath, mark)
+		return !deleted
+	})
+	if locked {
+		stripe.RUnlock()
+	}
+	if deleted {
+		return false, nil
+	}
+	return written, err
+}
+
+// diskCacheMissingPathsMax is the most paths noted missing; past it they are forgotten.
+const diskCacheMissingPathsMax = 1 << 16
+
+// openCacheFile is a cache file kept open for the reads of its path.
+type openCacheFile struct {
+	file *os.File
+	// refs counts the reads holding the file.
+	refs int
+	// dropped marks a file whose path changed; it is closed once no read holds it.
+	dropped bool
+	// used is when a read last took the file, in takes.
+	used uint64
+}
+
+// openFilePool keeps, by disk path, the cache files reads opened, so the reads after
+// them do not open them again. A change of a path drops its file. It is guarded by the
+// lock of the disk cache's pathOwners.
+type openFilePool struct {
+	m map[string]*openCacheFile
+	// missing are the paths a read found no file at, until they change.
+	missing map[string]struct{}
+	takes   uint64
+	// limit, when set, is the most files kept instead of DefaultDiskOpenFilesMax; less than
+	// 0 keeps none and notes no path missing.
+	limit int
+}
+
+// takeLocked returns the file kept open for path, held for a read, or nil.
+func (o *openFilePool) takeLocked(path string) *openCacheFile {
+	f := o.m[path]
+	if f == nil {
+		return nil
+	}
+	f.refs++
+	o.takes++
+	f.used = o.takes
+	return f
+}
+
+// keepLocked keeps file open for path, held for the read that opened it. With no file to
+// keep, or the most files kept and all held, it keeps nothing and returns nil.
+func (o *openFilePool) keepLocked(path string, file *os.File) (kept *openCacheFile, closeFile *os.File) {
+	if o.limit < 0 || o.m[path] != nil {
+		return nil, nil
+	}
+	if len(o.m) >= cmp.Or(o.limit, DefaultDiskOpenFilesMax) {
+		var lru string
+		var oldest *openCacheFile
+		for p, f := range o.m {
+			if f.refs == 0 && (oldest == nil || f.used < oldest.used) {
+				lru, oldest = p, f
+			}
+		}
+		if oldest == nil {
+			return nil, nil
+		}
+		delete(o.m, lru)
+		closeFile = oldest.file
+	}
+	if o.m == nil {
+		o.m = make(map[string]*openCacheFile)
+	}
+	o.takes++
+	kept = &openCacheFile{file: file, refs: 1, used: o.takes}
+	o.m[path] = kept
+	return kept, closeFile
+}
+
+// releaseLocked ends a read's hold of f, and returns the file to close when f was
+// dropped and no read holds it any more.
+func (o *openFilePool) releaseLocked(f *openCacheFile) *os.File {
+	f.refs--
+	if f.dropped && f.refs == 0 {
+		return f.file
+	}
+	return nil
+}
+
+// missingLocked reports whether path was noted missing.
+func (o *openFilePool) missingLocked(path string) bool {
+	_, ok := o.missing[path]
+	return ok
+}
+
+// noteMissingLocked notes that path has no file.
+func (o *openFilePool) noteMissingLocked(path string) {
+	if o.limit < 0 {
+		return
+	}
+	if o.missing == nil || len(o.missing) >= diskCacheMissingPathsMax {
+		o.missing = make(map[string]struct{})
+	}
+	o.missing[path] = struct{}{}
+}
+
+// dropLocked forgets the file of path, whose path changes, and returns it to close when
+// no read holds it.
+func (o *openFilePool) dropLocked(path string) *os.File {
+	delete(o.missing, path)
+	f := o.m[path]
+	if f == nil {
+		return nil
+	}
+	delete(o.m, path)
+	f.dropped = true
+	if f.refs == 0 {
+		return f.file
+	}
+	return nil
+}
+
+// dropAllLocked forgets every file, and returns those no read holds to close. No file is
+// kept after it.
+func (o *openFilePool) dropAllLocked() (files []*os.File) {
+	o.missing = nil
+	o.limit = -1
+	for p := range o.m {
+		if f := o.dropLocked(p); f != nil {
+			files = append(files, f)
+		}
+	}
+	return files
 }

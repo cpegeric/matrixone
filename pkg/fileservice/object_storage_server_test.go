@@ -1222,9 +1222,8 @@ func TestServerProbeInMemoryWriteCopiesNothing(t *testing.T) {
 	}
 }
 
-// A write from a caller's reader of many parts reuses part buffers: it allocates far less
-// than a part for each part, less than one part for each part with the race detector,
-// which drops some of the buffers put back.
+// A write from a caller's reader of many parts reuses part buffers: it allocates less
+// than one part for each part.
 func TestServerProbePartBuffersReused(t *testing.T) {
 	fs, _, _ := newPrefetchRangeFS(t, 0, 1)
 	probeSetRaw(fs, newProbeParts(probeRaw(fs)))
@@ -1240,11 +1239,7 @@ func TestServerProbePartBuffersReused(t *testing.T) {
 	}
 	write("warm")
 	n := allocated(func() { write("parts") })
-	most := uint64(minMultipartPartSize / 2)
-	if raceEnabled {
-		most = minMultipartPartSize
-	}
-	require.Less(t, n/parts, most, "allocated %d for %d parts", n, parts)
+	require.Less(t, n/parts, uint64(minMultipartPartSize), "allocated %d for %d parts", n, parts)
 }
 
 // object-storage-memory sets the memory budget of the server; unset, the budget is 5% of
