@@ -323,6 +323,50 @@ func TestIndexFileCacheDelete(t *testing.T) {
 	require.Empty(t, trash)
 }
 
+// An entry directory a delete cannot remove stays in the cache and is never read: Open
+// does not find it, a Put replaces it, and a later delete removes it. The control is
+// removed at once.
+func TestUnremovableIndexEntryIsNotRead(t *testing.T) {
+	for _, c := range []string{"put", "delete", "control"} {
+		t.Run(c, func(t *testing.T) {
+			ctx := context.Background()
+			cache := newTestIndexFileCache(t, t.TempDir(), 1<<30)
+			_, err := cache.Put(ctx, "e", indexCacheEntry([]byte("old")))
+			require.NoError(t, err)
+			path, err := cache.disk.pathForDir("e")
+			require.NoError(t, err)
+			// A non-empty directory at the name the entry is renamed to makes the rename fail.
+			trash := fmt.Sprintf("%s.%d-%d.%d%s", path, os.Getpid(), cacheDirTrashSeq.Load()+1,
+				cache.disk.cacheDirBytes(path), cacheDirTrashSuffix)
+			if c != "control" {
+				require.NoError(t, os.MkdirAll(filepath.Join(trash, "child"), 0755))
+			}
+			if err := cache.Delete(ctx, "e"); c == "control" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				require.True(t, cache.disk.cache.Contains(path), "the entry stays in the cache")
+				require.NoError(t, os.RemoveAll(trash))
+			}
+			requireIndexCacheMiss(t, cache, "e")
+			switch c {
+			case "put":
+				written, err := cache.Put(ctx, "e", indexCacheEntry([]byte("new")))
+				require.NoError(t, err)
+				require.True(t, written)
+				files, err := cache.Open(ctx, "e", "data")
+				require.NoError(t, err)
+				defer closeFiles(files)
+				require.Equal(t, []byte("new"), readAllFile(t, files[0]))
+			default:
+				require.NoError(t, cache.Delete(ctx, "e"))
+				require.False(t, cache.disk.cache.Contains(path))
+				requireEntryDir(t, cache, "e", false)
+			}
+		})
+	}
+}
+
 func requireEntryDir(t *testing.T, c *IndexFileCache, name string, exists bool) {
 	t.Helper()
 	c.disk.Flush(context.Background())

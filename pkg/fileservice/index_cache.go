@@ -647,6 +647,9 @@ func (c *IndexFileCache) HoldCached(name string) *IndexFileHold {
 // dirCached reports whether the entry directory at diskPath is cached: indexed, or on
 // disk while the index is loading.
 func (d *DiskCache) dirCached(diskPath string) bool {
+	if d.dirStale(diskPath) {
+		return false
+	}
 	if d.cache.Contains(diskPath) {
 		return true
 	}
@@ -668,13 +671,25 @@ func (c *IndexFileCache) Delete(ctx context.Context, name string) error {
 		return err
 	}
 	c.disk.deletes.deleted(diskPath)
-	return c.disk.pub.remove(ctx, diskPath, func() error {
-		if err := c.disk.removeCacheDir(diskPath); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-		c.disk.cache.Delete(context.Background(), diskPath)
-		return nil
-	})
+	return c.disk.pub.remove(ctx, diskPath, func() error { return c.disk.removeEntry(diskPath) })
+}
+
+// removeEntry removes the entry directory at diskPath and forgets it. An entry it cannot
+// remove stays in the cache, stale: no read opens it and eviction passes over it.
+func (d *DiskCache) removeEntry(diskPath string) error {
+	if err := d.removeCacheDir(diskPath); err != nil && !os.IsNotExist(err) {
+		d.ranges.stale.Store(diskPath, diskPath)
+		return err
+	}
+	d.ranges.stale.Delete(diskPath)
+	d.cache.Delete(context.Background(), diskPath)
+	return nil
+}
+
+// dirStale reports whether the entry directory at diskPath could not be removed.
+func (d *DiskCache) dirStale(diskPath string) bool {
+	_, stale := d.ranges.stale.Load(diskPath)
+	return stale
 }
 
 // dropBroken drops entry name while seen, when set, is still what is at file of the
@@ -699,13 +714,9 @@ func (c *IndexFileCache) dropBroken(ctx context.Context, name string, missing st
 		return missing == "" || os.IsNotExist(err)
 	}
 	c.disk.pub.queue(diskPath, queuedJob{"repair", diskPath}, func() error {
-		if !broken() {
-			return nil
+		if broken() {
+			_ = c.disk.removeEntry(diskPath)
 		}
-		if err := c.disk.removeCacheDir(diskPath); err != nil && !os.IsNotExist(err) {
-			return nil
-		}
-		c.disk.cache.Delete(context.Background(), diskPath)
 		return nil
 	})
 	if broken() {
@@ -856,6 +867,7 @@ func (d *DiskCache) removeIdleDir(ctx context.Context, path string, before time.
 			return err
 		}
 		removed.Store(true)
+		d.ranges.stale.Delete(path)
 		d.cache.Delete(context.Background(), path)
 		if err := d.removeTrash(trash, size); err != nil {
 			logutil.Error("index file cache: remove entry files", zap.String("path", trash), zap.Error(err))
@@ -946,7 +958,7 @@ func checkCacheDirFiles(files []IndexCacheFile) error {
 // entry directory diskPath, unless its entry was deleted after mark; it waits for the
 // publication.
 func (d *DiskCache) putDir(ctx context.Context, diskPath string, mark uint64, files []IndexCacheFile) (written bool, err error) {
-	if d.cache.Contains(diskPath) && cacheDirHasFiles(diskPath, files) {
+	if d.cache.Contains(diskPath) && !d.dirStale(diskPath) && cacheDirHasFiles(diskPath, files) {
 		return false, nil
 	}
 	pub := &d.pub
@@ -1004,17 +1016,17 @@ func (d *DiskCache) putDir(ctx context.Context, diskPath string, mark uint64, fi
 
 // publishDir publishes, on the publisher, the temporary directory tmp holding files, of
 // size bytes, as the entry directory diskPath, unless its entry was deleted after mark. An
-// entry already there with the files is kept.
+// entry already there with the files is kept unless it is stale.
 func (d *DiskCache) publishDir(ctx context.Context, diskPath, tmp string, mark uint64, files []IndexCacheFile, size int64) (written bool, err error) {
 	if existing, err := cacheDirSize(diskPath); err == nil {
-		if cacheDirHasFiles(diskPath, files) {
+		if !d.dirStale(diskPath) && cacheDirHasFiles(diskPath, files) {
 			if _, ok := d.cache.Get(ctx, diskPath); !ok {
 				d.cache.Set(ctx, diskPath, struct{}{}, existing)
 			}
 			return false, nil
 		}
-		// an incomplete entry is replaced
-		if err := d.removeCacheDir(diskPath); err != nil && !os.IsNotExist(err) {
+		// an incomplete or stale entry is replaced
+		if err := d.removeEntry(diskPath); err != nil {
 			return false, err
 		}
 	} else if !os.IsNotExist(err) {
@@ -1059,6 +1071,7 @@ func (d *DiskCache) publishDir(ctx context.Context, diskPath, tmp string, mark u
 		return false, err
 	}
 
+	d.ranges.stale.Delete(diskPath)
 	// a republished entry is the most recently used before its new size is accounted
 	if _, ok := d.cache.Get(ctx, diskPath); !ok || !d.cache.Replace(ctx, diskPath, struct{}{}, size) {
 		d.cache.Set(ctx, diskPath, struct{}{}, size)
@@ -1153,6 +1166,9 @@ func (d *DiskCache) moveCacheDirFile(ctx context.Context, from, to string) (int6
 // openDir opens files of the entry directory diskPath. An entry the cache does not hold
 // is indexed by the publisher while it is still the directory opened.
 func (d *DiskCache) openDir(ctx context.Context, name string, diskPath string, files []string) ([]*os.File, error) {
+	if d.dirStale(diskPath) {
+		return nil, moerr.NewFileNotFoundNoCtx(name)
+	}
 	// Files are opened relative to one directory handle, so all of them come from the
 	// same entry even if it is evicted and published again meanwhile.
 	root, err := os.OpenRoot(diskPath)
