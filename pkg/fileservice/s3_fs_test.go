@@ -7516,3 +7516,29 @@ func TestExactReadsShareLargeRange(t *testing.T) {
 		})
 	}
 }
+
+// CloseOwnedETL closes a file service GetForETL created for a local path or a path with
+// service arguments, and leaves the named service GetForETL returns open.
+func TestCloseOwnedETL(t *testing.T) {
+	ctx := WithSQLFileAccess(context.Background(), "sys", "moadmin")
+	shared := &closeCountingETLFS{name: "etl"}
+	services, err := NewFileServices("etl", shared)
+	require.NoError(t, err)
+
+	got, _, err := GetForETL(ctx, services, "etl:/a.csv")
+	require.NoError(t, err)
+	require.Same(t, shared, got)
+	CloseOwnedETL(ctx, "etl:/a.csv", got)
+	require.Zero(t, shared.closed.Load(), "the named service is shared")
+
+	for _, path := range []string{
+		"/tmp/a.csv",
+		"s3-opts,endpoint=http://127.0.0.1:1,region=r,bucket=b,key=k,secret=s:/a.csv",
+	} {
+		owned := &closeCountingETLFS{name: "owned"}
+		CloseOwnedETL(ctx, path, owned)
+		require.Equal(t, int64(1), owned.closed.Load(), path)
+	}
+
+	CloseOwnedETL(ctx, "/tmp/a.csv", nil)
+}

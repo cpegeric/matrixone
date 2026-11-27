@@ -19,13 +19,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
@@ -3576,4 +3581,45 @@ func TestHiveInferenceAuthorizationPrecedesListing(t *testing.T) {
 	require.ErrorContains(t, err, "only the sys account moadmin role")
 	_, err = os.Stat(parent)
 	require.ErrorIs(t, err, os.ErrNotExist)
+}
+
+// StatFile of an S3 source closes the file service made for it, which leaves no
+// connection open; OwnsETLWithType tells such a source from a named service.
+func TestStatFileClosesOwnedFileService(t *testing.T) {
+	var open, requests atomic.Int64
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Length", "3")
+		w.Header().Set("Last-Modified", "Wed, 02 Sep 2026 03:04:05 GMT")
+		w.WriteHeader(http.StatusOK)
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateNew:
+			open.Add(1)
+		case http.StateClosed, http.StateHijacked:
+			open.Add(-1)
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	param := &tree.ExternParam{}
+	param.Ctx = fileservice.WithSQLFileAccess(context.Background(), "sys", "moadmin")
+	param.ScanType = tree.S3
+	param.Filepath = "/a.csv"
+	param.S3Param = &tree.S3Parameter{
+		Endpoint: server.URL, Region: "us-east-1", APIKey: "id", APISecret: "secret", Bucket: "bucket",
+	}
+	require.True(t, OwnsETLWithType(param, param.Filepath))
+	require.NoError(t, StatFile(param))
+	require.Equal(t, int64(3), param.FileSize)
+	require.Positive(t, requests.Load())
+	require.Eventually(t, func() bool { return open.Load() == 0 }, time.Second, time.Millisecond,
+		"the file service of StatFile leaves its connection open")
+
+	named := &tree.ExternParam{}
+	named.ScanType = tree.INFILE
+	require.False(t, OwnsETLWithType(named, "etl:/a.csv"))
+	require.True(t, OwnsETLWithType(named, "/a.csv"))
 }
