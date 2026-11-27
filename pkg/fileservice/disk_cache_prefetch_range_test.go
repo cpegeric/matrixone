@@ -1110,9 +1110,8 @@ func TestDiskObjectSplitConfig(t *testing.T) {
 	require.Equal(t, objectSplitConfig{parts: 2, min: 16 << 20}, (&CacheConfig{}).diskObjectSplit())
 	require.Equal(t, objectSplitConfig{parts: 1, min: 16 << 20}, (&CacheConfig{DiskPrefetchObjectSplit: ptrTo(0)}).diskObjectSplit())
 	require.Equal(t, objectSplitConfig{parts: 4, min: 1 << 20}, (&CacheConfig{
-		DiskPrefetchObjectSplit:          ptrTo(9),
-		DiskPrefetchObjectSplitMin:       ptrTo[toml.ByteSize](1 << 20),
-		DiskPrefetchObjectSplitDownloads: ptrTo(3),
+		DiskPrefetchObjectSplit:    ptrTo(9),
+		DiskPrefetchObjectSplitMin: ptrTo[toml.ByteSize](1 << 20),
 	}).diskObjectSplit())
 }
 
@@ -1399,10 +1398,9 @@ func TestPrefetchBeforeDeleteKeepsNoSize(t *testing.T) {
 // minRequestRoom: the fewest configured connections still cache whole objects.
 func TestS3FSConfiguredConnsBoundDownloads(t *testing.T) {
 	for _, tc := range []struct {
-		conns    int
-		limit    int
-		download bool
-	}{{1, minRequestRoom / 2, true}, {minRequestRoom, minRequestRoom / 2, true}, {256, 128, true}} {
+		conns int
+		limit int
+	}{{1, minRequestRoom / 2}, {minRequestRoom, minRequestRoom / 2}, {256, 128}} {
 		ctx := context.Background()
 		fs, err := NewS3FS(ctx, ObjectStorageArguments{Name: "s3", Endpoint: "disk", Bucket: t.TempDir(), MaxConnsPerHost: tc.conns}, CacheConfig{
 			DiskPath: ptrTo(t.TempDir()), DiskCapacity: ptrTo[toml.ByteSize](64 << 20),
@@ -1418,7 +1416,7 @@ func TestS3FSConfiguredConnsBoundDownloads(t *testing.T) {
 		got, err := readFullObjectOf(fs, 100, 10)
 		require.NoError(t, err)
 		require.Equal(t, data[100:110], got)
-		require.Equal(t, tc.download, d.cache.Contains(d.wholePath("object", int64(len(data)))), "conns %d", tc.conns)
+		require.True(t, d.cache.Contains(d.wholePath("object", int64(len(data)))), "conns %d", tc.conns)
 		fs.Close(ctx)
 	}
 }
@@ -1605,7 +1603,7 @@ func TestS3FSReadEntryWriteWaitsForPublisherRoom(t *testing.T) {
 // onPublisher reports whether the calling goroutine is a worker of a cache publisher.
 func onPublisher() bool {
 	stack := string(debug.Stack())
-	return strings.Contains(stack, "(*publisher).run(") || strings.Contains(stack, "(*DiskCache).runAsyncUpdates(")
+	return strings.Contains(stack, "(*publisher).run(")
 }
 
 // Every kind of file and entry directory a cache publishes is published by a worker of the

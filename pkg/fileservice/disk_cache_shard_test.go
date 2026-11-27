@@ -259,70 +259,43 @@ func (d *DiskCache) withFilesystemAvailable(available func() uint64, ok bool) {
 	}
 }
 
-func TestDiskCacheENOSPCWithFreeSpaceKeepsCache(t *testing.T) {
-	cache, used := newDiskFullTestCache(t)
-	cache.withFilesystemAvailable(func() uint64 { return 1 << 40 }, true)
-
-	// The directory-index-full failure: plenty of blocks and inodes.
-	for i := 0; i < 20; i++ {
-		cache.evictForDiskFull(context.Background(), &fs.PathError{Op: "rename", Path: "x", Err: syscall.ENOSPC})
-	}
-	require.Equal(t, used, cache.cache.Used())
-}
-
-func TestDiskCacheENOSPCEvictsWhenFilesystemIsExhausted(t *testing.T) {
+// A disk-full error evicts a tenth of the cache when the filesystem is out of bytes or
+// inodes, its state is unknown, or a quota is exceeded; an ENOSPC with free bytes and
+// inodes (a full directory index) and a source error evict nothing.
+func TestDiskCacheEvictForDiskFull(t *testing.T) {
 	enospc := &fs.PathError{Op: "write", Path: "x", Err: syscall.ENOSPC}
-	n := int64(100 * diskFullTestItemBytes / 10)
-
-	t.Run("bytes", func(t *testing.T) {
-		cache, used := newDiskFullTestCache(t)
-		cache.withFilesystemAvailable(func() uint64 { return 0 }, true)
-		cache.evictForDiskFull(context.Background(), enospc)
-		require.Equal(t, used-n, cache.cache.Used())
-	})
-
-	t.Run("inodes", func(t *testing.T) {
-		cache, used := newDiskFullTestCache(t)
-		cache.statFilesystem = func(string) (diskCacheFilesystemStat, bool) {
-			return diskCacheFilesystemStat{availableBytes: 1 << 40, totalInodes: 1000, freeInodes: 0}, true
+	stat := func(bytes uint64, total, free uint64, ok bool) func(string) (diskCacheFilesystemStat, bool) {
+		return func(string) (diskCacheFilesystemStat, bool) {
+			return diskCacheFilesystemStat{availableBytes: bytes, totalInodes: total, freeInodes: free}, ok
 		}
-		cache.evictForDiskFull(context.Background(), enospc)
-		require.Equal(t, used-n, cache.cache.Used())
-	})
-
-	t.Run("unknown filesystem state", func(t *testing.T) {
-		cache, used := newDiskFullTestCache(t)
-		cache.withFilesystemAvailable(func() uint64 { return 1 << 40 }, false)
-		cache.evictForDiskFull(context.Background(), enospc)
-		require.Equal(t, used-n, cache.cache.Used())
-	})
-}
-
-// TestDiskCacheSmallInodeFilesystemTriggersEviction reproduces a review
-// finding: totalInodes/100 truncates to zero on a filesystem with under 100
-// inodes total, so freeInodes < 0 could never be true and zero free inodes
-// was never recognized as exhaustion.
-func TestDiskCacheSmallInodeFilesystemTriggersEviction(t *testing.T) {
-	cache, used := newDiskFullTestCache(t)
-	cache.statFilesystem = func(string) (diskCacheFilesystemStat, bool) {
-		return diskCacheFilesystemStat{availableBytes: 1 << 40, totalInodes: 64, freeInodes: 0}, true
 	}
-	cache.evictForDiskFull(context.Background(), &fs.PathError{Op: "write", Path: "x", Err: syscall.ENOSPC})
-	require.Less(t, cache.cache.Used(), used, "zero free inodes must trigger eviction even when total inodes is below 100")
-}
-
-func TestDiskCacheQuotaExceededEvictsRegardlessOfFilesystem(t *testing.T) {
-	cache, used := newDiskFullTestCache(t)
-	cache.withFilesystemAvailable(func() uint64 { return 1 << 40 }, true)
-	cache.evictForDiskFull(context.Background(), &fs.PathError{Op: "write", Path: "x", Err: syscall.EDQUOT})
-	require.Equal(t, used-int64(100*diskFullTestItemBytes/10), cache.cache.Used())
-}
-
-func TestDiskCacheSourceErrorDoesNotEvict(t *testing.T) {
-	cache, used := newDiskFullTestCache(t)
-	cache.withFilesystemAvailable(func() uint64 { return 0 }, true)
-	cache.evictForDiskFull(context.Background(), &diskCacheSourceError{err: syscall.ENOSPC})
-	require.Equal(t, used, cache.cache.Used())
+	for _, c := range []struct {
+		name   string
+		stat   func(string) (diskCacheFilesystemStat, bool)
+		err    error
+		repeat int
+		evicts bool
+	}{
+		{"free space keeps cache", stat(1<<40, 1000, 1000, true), &fs.PathError{Op: "rename", Path: "x", Err: syscall.ENOSPC}, 20, false},
+		{"bytes exhausted", stat(0, 1000, 1000, true), enospc, 1, true},
+		{"inodes exhausted", stat(1<<40, 1000, 0, true), enospc, 1, true},
+		{"inodes exhausted under 100 inodes", stat(1<<40, 64, 0, true), enospc, 1, true},
+		{"unknown filesystem state", stat(1<<40, 1000, 1000, false), enospc, 1, true},
+		{"quota exceeded", stat(1<<40, 1000, 1000, true), &fs.PathError{Op: "write", Path: "x", Err: syscall.EDQUOT}, 1, true},
+		{"source error", stat(0, 1000, 1000, true), &diskCacheSourceError{err: syscall.ENOSPC}, 1, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cache, used := newDiskFullTestCache(t)
+			cache.statFilesystem = c.stat
+			for range c.repeat {
+				cache.evictForDiskFull(context.Background(), c.err)
+			}
+			if c.evicts {
+				used -= int64(100 * diskFullTestItemBytes / 10)
+			}
+			require.Equal(t, used, cache.cache.Used())
+		})
+	}
 }
 
 func TestDiskCacheConcurrentDiskFullFailuresEvictOnce(t *testing.T) {

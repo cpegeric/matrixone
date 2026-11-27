@@ -542,31 +542,78 @@ func TestDiskCacheContentFillIsADownload(t *testing.T) {
 }
 
 // Bytes read from a download count toward its file's read share also when the file is
-// evicted as soon as it is published.
+// evicted as soon as it is published: those of a read, of a read still running when the
+// download publishes the file, and those the read that started the download captures.
 func TestDiskCacheDownloadReadsCountWhenEvictedOnPublish(t *testing.T) {
-	ctx := context.Background()
-	cache, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1024), nil, false, nil, "")
-	require.NoError(t, err)
-	t.Cleanup(func() { cache.Close(ctx) })
-	const group = 7
-	diskPath := cache.objectKey("obj")
-	cache.preloads.narrowRead(diskPath, group, func() bool { return true })
-	pw, filled := startTestCacheFill(t, ctx, cache)
-	require.Eventually(t, func() bool { return cache.download(diskPath) != nil },
-		diskCacheLifecycleTestTimeout, time.Millisecond)
-	data := make([]byte, 4096)
-	_, err = pw.Write(data)
-	require.NoError(t, err)
-	vec := waitVector(t, readRange(t, ctx, cache, 0, 4096))
-	require.True(t, vec.Entries[0].done)
-	require.NoError(t, pw.Close())
-	require.NoError(t, <-filled)
+	for _, c := range []struct {
+		name string
+		// read reads the 4096 bytes written to pw and ends the fill.
+		read  func(t *testing.T, ctx context.Context, cache *DiskCache, pw *io.PipeWriter, filled <-chan error)
+		exact bool
+	}{
+		{"read", func(t *testing.T, ctx context.Context, cache *DiskCache, pw *io.PipeWriter, filled <-chan error) {
+			vec := waitVector(t, readRange(t, ctx, cache, 0, 4096))
+			require.True(t, vec.Entries[0].done)
+			require.NoError(t, pw.Close())
+			require.NoError(t, <-filled)
+		}, false},
+		{"read across publication", func(t *testing.T, ctx context.Context, cache *DiskCache, pw *io.PipeWriter, filled <-chan error) {
+			w := blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
+			read, release := startTestBlockedRead(t, pw, w, func() error {
+				vec := &IOVector{FilePath: "obj", Entries: []IOEntry{{Offset: 0, Size: 4096, WriterForRead: w}}}
+				defer vec.Release()
+				return cache.Read(ctx, vec)
+			})
+			select {
+			case <-w.entered:
+			case <-time.After(diskCacheLifecycleTestTimeout):
+				t.Fatal("read did not reach its writer")
+			}
+			require.NoError(t, pw.Close())
+			require.NoError(t, <-filled)
+			require.False(t, cache.cache.Contains(cache.wholePath("obj", 4096)), "a file larger than the cache is evicted")
+			release()
+			require.NoError(t, <-read)
+		}, false},
+		{"capture", func(t *testing.T, ctx context.Context, cache *DiskCache, pw *io.PipeWriter, filled <-chan error) {
+			read := newFullObjectDiskCacheReader(&IOVector{FilePath: "obj", Entries: []IOEntry{{Offset: 0, Size: 4096}}})
+			download := cache.download(cache.objectKey("obj"))
+			file, finish := acquireCapture(t, read, download)
+			defer finish(false)
+			captured, err := read.capture(ctx, download, file, "obj")
+			require.NoError(t, err)
+			require.True(t, captured)
+			require.NoError(t, pw.Close())
+			require.NoError(t, <-filled)
+			finish(true)
+		}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := context.Background()
+			cache, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1024), nil, false, nil, "")
+			require.NoError(t, err)
+			t.Cleanup(func() { cache.Close(ctx) })
+			const group = 7
+			diskPath := cache.objectKey("obj")
+			cache.preloads.narrowRead(diskPath, group, func() bool { return true })
+			pw, filled := startTestCacheFill(t, ctx, cache)
+			require.Eventually(t, func() bool { return cache.download(diskPath) != nil },
+				diskCacheLifecycleTestTimeout, time.Millisecond)
+			_, err = pw.Write(make([]byte, 4096))
+			require.NoError(t, err)
+			c.read(t, ctx, cache, pw, filled)
 
-	require.False(t, cache.cache.Contains(cache.wholePath("obj", 4096)), "a file larger than the cache is evicted")
-	cache.preloads.mu.Lock()
-	defer cache.preloads.mu.Unlock()
-	require.NotNil(t, cache.preloads.groups[group])
-	require.Greater(t, cache.preloads.groups[group].average, 0.0)
+			require.False(t, cache.cache.Contains(cache.wholePath("obj", 4096)), "a file larger than the cache is evicted")
+			cache.preloads.mu.Lock()
+			defer cache.preloads.mu.Unlock()
+			require.NotNil(t, cache.preloads.groups[group])
+			require.Greater(t, cache.preloads.groups[group].average, 0.0)
+			if c.exact {
+				require.Equal(t, 1.0, cache.preloads.groups[group].average)
+				require.Equal(t, 1, cache.preloads.groups[group].samples)
+			}
+		})
+	}
 }
 
 func startTestCacheFill(t *testing.T, ctx context.Context, cache *DiskCache) (*io.PipeWriter, <-chan error) {
@@ -622,79 +669,6 @@ func startTestBlockedRead(t *testing.T, pw *io.PipeWriter, w blockingWriter, fn 
 		read <- fn()
 	}()
 	return read, release
-}
-
-// Bytes of a read still running when its download publishes the file, which is then
-// evicted at once, count toward the file's read share.
-func TestDiskCacheDownloadReadOverlappingPublicationCounts(t *testing.T) {
-	ctx := context.Background()
-	cache, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1024), nil, false, nil, "")
-	require.NoError(t, err)
-	t.Cleanup(func() { cache.Close(ctx) })
-	const group = 7
-	diskPath := cache.objectKey("obj")
-	cache.preloads.narrowRead(diskPath, group, func() bool { return true })
-	pw, filled := startTestCacheFill(t, ctx, cache)
-	require.Eventually(t, func() bool { return cache.download(diskPath) != nil },
-		diskCacheLifecycleTestTimeout, time.Millisecond)
-	_, err = pw.Write(make([]byte, 4096))
-	require.NoError(t, err)
-
-	w := blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
-	read, release := startTestBlockedRead(t, pw, w, func() error {
-		vec := &IOVector{FilePath: "obj", Entries: []IOEntry{{Offset: 0, Size: 4096, WriterForRead: w}}}
-		defer vec.Release()
-		return cache.Read(ctx, vec)
-	})
-	select {
-	case <-w.entered:
-	case <-time.After(diskCacheLifecycleTestTimeout):
-		t.Fatal("read did not reach its writer")
-	}
-	require.NoError(t, pw.Close())
-	require.NoError(t, <-filled)
-	require.False(t, cache.cache.Contains(cache.wholePath("obj", 4096)), "a file larger than the cache is evicted")
-	release()
-	require.NoError(t, <-read)
-
-	cache.preloads.mu.Lock()
-	defer cache.preloads.mu.Unlock()
-	require.NotNil(t, cache.preloads.groups[group])
-	require.Greater(t, cache.preloads.groups[group].average, 0.0)
-}
-
-// Bytes the read that started a download captures count toward the file's read share also
-// when the file is evicted as soon as it is published.
-func TestDiskCacheDownloadCaptureCountsWhenEvictedOnPublish(t *testing.T) {
-	ctx := context.Background()
-	cache, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1024), nil, false, nil, "")
-	require.NoError(t, err)
-	t.Cleanup(func() { cache.Close(ctx) })
-	const group = 7
-	diskPath := cache.objectKey("obj")
-	cache.preloads.narrowRead(diskPath, group, func() bool { return true })
-	pw, filled := startTestCacheFill(t, ctx, cache)
-	require.Eventually(t, func() bool { return cache.download(diskPath) != nil },
-		diskCacheLifecycleTestTimeout, time.Millisecond)
-	_, err = pw.Write(make([]byte, 4096))
-	require.NoError(t, err)
-	read := newFullObjectDiskCacheReader(&IOVector{FilePath: "obj", Entries: []IOEntry{{Offset: 0, Size: 4096}}})
-	download := cache.download(diskPath)
-	file, finish := acquireCapture(t, read, download)
-	defer finish(false)
-	captured, err := read.capture(ctx, download, file, "obj")
-	require.NoError(t, err)
-	require.True(t, captured)
-	require.NoError(t, pw.Close())
-	require.NoError(t, <-filled)
-	finish(true)
-
-	require.False(t, cache.cache.Contains(cache.wholePath("obj", 4096)), "a file larger than the cache is evicted")
-	cache.preloads.mu.Lock()
-	defer cache.preloads.mu.Unlock()
-	require.NotNil(t, cache.preloads.groups[group])
-	require.Equal(t, 1.0, cache.preloads.groups[group].average)
-	require.Equal(t, 1, cache.preloads.groups[group].samples)
 }
 
 func acquireCapture(t *testing.T, read *fullObjectDiskCacheReader, download *objectDownload) (*os.File, func(bool)) {

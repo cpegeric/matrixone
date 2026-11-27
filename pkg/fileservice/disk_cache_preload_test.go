@@ -53,24 +53,27 @@ func evict(p *preloadUsage, group uint64, i int, served, size int64) {
 	p.removed(path, size)
 }
 
-func TestPreloadUsageGroupThrashesAfterMinSamples(t *testing.T) {
-	p, _ := newTestPreloadUsage()
-	for i := 0; i < preloadUsageMinSamples-1; i++ {
-		evict(p, 1, i, 0, 100)
-		require.False(t, p.narrowRead("/cache/x", 1, roomFor), "fewer than %d evictions", preloadUsageMinSamples)
+// A group whose evicted files were not read thrashes after preloadUsageMinSamples
+// evictions; one whose files were partly read, after preloadUsageMoreSamples.
+func TestPreloadUsageGroupThrashesAfterSamples(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		served  int64
+		samples int
+	}{
+		{"unread", 0, preloadUsageMinSamples},
+		{"partly read", 20, preloadUsageMoreSamples},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			p, _ := newTestPreloadUsage()
+			for i := 0; i < c.samples-1; i++ {
+				evict(p, 1, i, c.served, 100)
+				require.False(t, p.narrowRead("/cache/x", 1, roomFor), "%d evictions", i+1)
+			}
+			evict(p, 1, c.samples, c.served, 100)
+			require.True(t, p.narrowRead("/cache/x", 1, roomFor))
+		})
 	}
-	evict(p, 1, preloadUsageMinSamples, 0, 100)
-	require.True(t, p.narrowRead("/cache/x", 1, roomFor))
-}
-
-func TestPreloadUsagePartlyUsedGroupNeedsMoreSamples(t *testing.T) {
-	p, _ := newTestPreloadUsage()
-	for i := 0; i < preloadUsageMoreSamples-1; i++ {
-		evict(p, 1, i, 20, 100)
-		require.False(t, p.narrowRead("/cache/x", 1, roomFor), "a share of 0.2 over %d evictions", i+1)
-	}
-	evict(p, 1, preloadUsageMoreSamples, 20, 100)
-	require.True(t, p.narrowRead("/cache/x", 1, roomFor))
 }
 
 func TestPreloadUsageGroupsAreSeparate(t *testing.T) {

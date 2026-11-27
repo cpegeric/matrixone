@@ -89,7 +89,9 @@ func (w *blockingDiskCacheWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func TestDiskCacheIOEntryWaitIsBoundedDuringAsyncFinalize(t *testing.T) {
+// A read of an entry whose asynchronous publication is held does not wait for it and is
+// not served by the cache; once published, the cache serves it.
+func TestDiskCacheReadDoesNotWaitForAsyncFinalize(t *testing.T) {
 	cache := newLifecycleTestDiskCache(t)
 	syncStarted, unblock := installBlockedDiskCacheFileSync(cache)
 	t.Cleanup(unblock)
