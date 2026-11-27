@@ -1,13 +1,14 @@
 # File-service cache v2: range fills and the object storage server
 
-Version: v1, 2026-11-26. Replaces the design of PR #32812 (closed). Builds on
+Version: v2, 2026-11-27 (v1, 2026-11-26). Replaces the design of PR #32812 (closed). Builds on
 [index-file I/O](20261024-index-file-io.md),
 [thrash-aware prefetch](20261102-thrash-aware-prefetch.md) and
 [file-service cache ownership](20261106-fileservice-cache-ownership.md).
 
 ## Review status
 
-Draft for the developer's review. No implementation follows until it is approved.
+Approved by the developer and implemented on branch `disk_cache_range_fill`. The decisions
+made during the implementation are under "Decisions and known limits".
 
 ## Problem
 
@@ -105,9 +106,11 @@ a read looks in the memory cache, then the cache's range index, then joins or ma
 - **Nothing else runs while a request holds room.** No caller code, file, registry, path,
   eviction or publisher work runs inside `Do`; only bytes move and a fill's progress is
   noted.
-- **Room.** At most min(`max-conns-per-host`, `concurrency`) requests run at once; 128 when
-  neither is set; never fewer than 64 (a smaller value is raised, with a warning); no upper
-  bound. The pool holds as many connections per host as the room.
+- **Room.** At most min(`max-conns-per-host`, `concurrency`) requests run at once; they
+  default to 128 and 1024, so the room is 128 when neither is set. When one process runs
+  several services (a launch with CN, TN and log services), the room is divided among
+  them. Never fewer than 64 (a smaller value is raised, with a warning); no upper bound.
+  The pool holds as many connections per host as the room.
 - **One order for room.** Foreground before background, then larger share, sooner due
   time, arrival. Background holds at most half the room. A running request is never
   stopped.
@@ -153,10 +156,19 @@ a read looks in the memory cache, then the cache's range index, then joins or ma
 
 ### Deletes, eviction and close
 
-- A delete stops every fill of the object in both caches, then has each publisher remove its
-  ranges, ordered after every publication of that object submitted before the delete.
-- Eviction removes ranges. A range whose file cannot be removed stays indexed until it is.
-- Close stops fills in every state and wakes their readers.
+- A delete stops every fill a prefetch made of the object before its object-storage
+  request, so it never waits for room held by fills it stops. It then stops the fills
+  reads made, and has each publisher remove the object's ranges, ordered after every
+  publication of that object submitted before the delete. A delete whose context ends
+  still has its ranges removed.
+- A read never returns bytes of two versions of an object: when a delete of the object
+  is counted while the read runs, the read reads the object again.
+- Eviction removes ranges. A range whose file cannot be removed is never read again and
+  still counts against the capacity; eviction skips it. A later delete of the object, or a
+  publication over its path, removes it. An index-file entry whose file cannot be removed
+  is never read again either.
+- Close stops fills in every state before any of them frees its room, and wakes their
+  readers.
 
 ## Deadlock freedom
 
@@ -195,6 +207,21 @@ So nothing waits in a cycle, whatever callers do.
 - TPC-H SF100 on two CNs, cold and warm Q1–Q22, at least as fast as the 2026-11-25
   baseline (cold 357 s, warm 220 s), with object-storage requests and bytes per CN.
 - Net non-test growth of `pkg/fileservice` well below PR #32812's.
+
+## Decisions and known limits
+
+- **Room is not a multiple of the CPU count.** The requests in flight needed are about
+  bandwidth × latency ÷ request size, which does not depend on the CPU count. The
+  defaults stay as on main; the room is measured on TPC-H SF100 cold at 64, 128 and 256.
+- **Removals of one path are queued once.** A removal of a path already queued for the
+  same reason (evict, reindex, repair, unload, delete) is not queued again; the newest
+  request's work runs.
+- **A file that cannot be removed is indexed again after a restart.** Which files could not
+  be removed is held only in memory, so a restart reads such a file again as cached. Main
+  has the same limit.
+- **Ignored settings** (`disk-download-max-extra-wait`,
+  `disk-prefetch-object-split-downloads`) are logged once per file service.
+- **A read racing a delete** may return "not found", as on main.
 
 ## Open questions
 
