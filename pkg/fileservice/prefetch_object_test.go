@@ -115,6 +115,8 @@ type blackBoxStorage struct {
 	total map[string]int
 	// marked counts the reads under a context of withReadMark.
 	marked map[string]int
+	// ranges are the ranges read, the end -1 for none.
+	ranges [][2]int64
 }
 
 type readMarkKey struct{}
@@ -146,6 +148,11 @@ func (g *blackBoxStorage) Read(ctx context.Context, key string, from, to *int64)
 	g.mu.Lock()
 	g.cur[key]++
 	g.total[key]++
+	end := int64(-1)
+	if to != nil {
+		end = *to
+	}
+	g.ranges = append(g.ranges, [2]int64{offset, end})
 	if ctx.Value(readMarkKey{}) != nil {
 		g.marked[key]++
 	}
@@ -1452,6 +1459,11 @@ func TestFlightTransitionColumnReadReleasesCopiedFlight(t *testing.T) {
 			}
 			if started != nil {
 				require.NoError(t, (<-started).err)
+				g.mu.Lock()
+				ranges := slices.Clone(g.ranges)
+				g.mu.Unlock()
+				require.ElementsMatch(t, [][2]int64{{unit, 2 * unit}, {0, unit}, {3 * unit, 4 * unit}}, ranges,
+					"the read joins the flight of unit 1")
 			} else {
 				_, _, total := g.counts(key)
 				require.Equal(t, 3, total, "each range is read from object storage once")
