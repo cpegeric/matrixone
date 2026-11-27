@@ -247,7 +247,6 @@ func TestAwsSDKv2BasicObjectOperations(t *testing.T) {
 	require.Nil(t, reader)
 	require.True(t, moerr.IsMoErrCode(err, moerr.ErrFileNotFound), "got %v", err)
 
-	require.True(t, sdk.SupportsParallelMultipart())
 	require.NoError(t, sdk.Delete(context.Background()))
 	require.NoError(t, sdk.Delete(context.Background(), "dir/file1"))
 	require.NoError(t, sdk.Delete(context.Background(), "dir/file1", "dir/file2"))
@@ -295,7 +294,7 @@ func TestAwsSDKv2WriteUnknownSizeMultipartCompletes(t *testing.T) {
 
 	sdk := newTestAWSClient(t, server)
 	data := bytes.Repeat([]byte("non-empty"), int(minMultipartPartSize/9)+1)
-	err := sdk.WriteMultipartParallel(context.Background(), "large", bytes.NewReader(data), nil, &ParallelMultipartOption{
+	err := writeInParts(context.Background(), sdk, "large", bytes.NewReader(data), nil, &ParallelMultipartOption{
 		PartSize: minMultipartPartSize, Concurrency: 1,
 	})
 	require.NoError(t, err)
@@ -402,7 +401,7 @@ func TestAwsSDKv2WriteUnknownSizePartFailureAborts(t *testing.T) {
 
 	sdk := newTestAWSClient(t, server)
 	data := bytes.Repeat([]byte("non-empty"), int(minMultipartPartSize/9)+1)
-	err := sdk.WriteMultipartParallel(context.Background(), "failed", bytes.NewReader(data), nil, &ParallelMultipartOption{
+	err := writeInParts(context.Background(), sdk, "failed", bytes.NewReader(data), nil, &ParallelMultipartOption{
 		PartSize: minMultipartPartSize, Concurrency: 1,
 	})
 	require.Error(t, err)
@@ -411,12 +410,6 @@ func TestAwsSDKv2WriteUnknownSizePartFailureAborts(t *testing.T) {
 	require.Equal(t, 1, created)
 	require.Equal(t, 1, aborted)
 	require.Zero(t, completed)
-}
-
-func TestAwsSDKv2WriteUnknownSizeCanceledBeforeRead(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	require.ErrorIs(t, (&AwsSDKv2{}).Write(ctx, "canceled", errReader{}, nil, nil), context.Canceled)
 }
 
 func TestAwsSDKv2ConstructorCredentialsAndRetryer(t *testing.T) {

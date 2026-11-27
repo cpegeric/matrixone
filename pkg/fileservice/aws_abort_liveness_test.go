@@ -63,12 +63,12 @@ func (t *awsAbortObservingTransport) RoundTrip(r *http.Request) (*http.Response,
 func awsCanceledMultipartWrite(ctx context.Context, sdk *AwsSDKv2, parallel bool) error {
 	data := bytes.Repeat([]byte("x"), int(minMultipartPartSize)+1)
 	if !parallel {
-		return sdk.WriteMultipartParallel(ctx, "key", bytes.NewReader(data), nil, &ParallelMultipartOption{
+		return writeInParts(ctx, sdk, "key", bytes.NewReader(data), nil, &ParallelMultipartOption{
 			PartSize: minMultipartPartSize, Concurrency: 1,
 		})
 	}
 	size := int64(len(data))
-	return sdk.WriteMultipartParallel(ctx, "key", bytes.NewReader(data), &size, &ParallelMultipartOption{
+	return writeInParts(ctx, sdk, "key", bytes.NewReader(data), &size, &ParallelMultipartOption{
 		PartSize: minMultipartPartSize, Concurrency: 2,
 	})
 }

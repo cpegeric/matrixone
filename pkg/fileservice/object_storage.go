@@ -298,23 +298,6 @@ type partWriter interface {
 	freeMemory(n int64, c requestClass)
 }
 
-// storageParts makes the requests of a write in parts on s itself; the parts it reads
-// are always held in memory.
-type storageParts struct {
-	s interface {
-		ObjectStorage
-		multipartStorage
-	}
-}
-
-func (p storageParts) Do(ctx context.Context, req request) (result, error) {
-	return makeRequest(ctx, p.s, req)
-}
-
-func (storageParts) takeMemory(int64, requestClass) bool { return true }
-
-func (storageParts) freeMemory(int64, requestClass) {}
-
 const multipartAbortTimeout = 30 * time.Second
 
 // multipartUpload creates a multipart upload of key, uploads the parts next returns, and
@@ -649,18 +632,6 @@ func newObjectStorageCopyCredentialDomain(keyID, keySecret string, extras ...str
 
 func (d objectStorageCopyCredentialDomain) matches(other objectStorageCopyCredentialDomain) bool {
 	return d.valid && other.valid && d.digest == other.digest
-}
-
-// ParallelMultipartWriter is implemented by storages that support parallel multipart uploads.
-type ParallelMultipartWriter interface {
-	SupportsParallelMultipart() bool
-	WriteMultipartParallel(
-		ctx context.Context,
-		key string,
-		r io.Reader,
-		sizeHint *int64,
-		opt *ParallelMultipartOption,
-	) error
 }
 
 // ParallelMultipartOption controls part size and parallelism of multipart uploads.

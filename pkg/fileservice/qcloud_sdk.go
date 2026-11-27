@@ -163,7 +163,6 @@ func (a *QCloudSDK) CopyObject(
 }
 
 var _ ObjectStorage = new(QCloudSDK)
-var _ ParallelMultipartWriter = new(QCloudSDK)
 
 func (a *QCloudSDK) List(
 	ctx context.Context,
@@ -327,10 +326,18 @@ func (a *QCloudSDK) Write(
 ) {
 	defer wrapSizeMismatchErr(&err)
 
-	if sizeHint != nil && *sizeHint < smallObjectThreshold {
+	seeker, seekable := r.(io.Seeker)
+	if !seekable || sizeHint == nil || *sizeHint < smallObjectThreshold {
 		body, size, err := bodyOf(r)
 		if err != nil {
 			return err
+		}
+		// A reader that cannot be read again is sent only when it holds sizeHint bytes.
+		if !seekable && sizeHint != nil && size != *sizeHint {
+			return moerr.NewSizeNotMatchNoCtx(key)
+		}
+		if sizeHint == nil {
+			sizeHint = &size
 		}
 		_, err = DoWithRetryContext(ctx, "write", func() (int, error) {
 			return 0, a.putObject(
@@ -346,18 +353,6 @@ func (a *QCloudSDK) Write(
 		}
 
 	} else {
-		seeker, ok := r.(io.Seeker)
-		if !ok {
-			err := a.WriteMultipartParallel(ctx, key, r, sizeHint, &ParallelMultipartOption{
-				PartSize:    defaultParallelMultipartPartSize,
-				Concurrency: 1,
-				Expire:      expire,
-			})
-			if err != nil {
-				return err
-			}
-			return nil
-		}
 		offset, err := seeker.Seek(0, io.SeekCurrent)
 		if err != nil {
 			return err
@@ -401,6 +396,7 @@ func isRetryableQCloudPutError(err error) bool {
 	return errors.As(err, &httpErr) && httpErr.Op == "Put" && errors.Is(httpErr.Err, io.EOF)
 }
 
+// SupportsParallelMultipart reports that COS takes writes in parts.
 func (a *QCloudSDK) SupportsParallelMultipart() bool {
 	return true
 }
@@ -488,16 +484,6 @@ func (a *QCloudSDK) initiateMultipartUpload(
 		}
 	}
 	return nil, lastErr
-}
-
-func (a *QCloudSDK) WriteMultipartParallel(
-	ctx context.Context,
-	key string,
-	r io.Reader,
-	sizeHint *int64,
-	opt *ParallelMultipartOption,
-) error {
-	return writeParts(ctx, storageParts{a}, key, r, sizeHint, opt)
 }
 
 var _ multipartStorage = new(QCloudSDK)

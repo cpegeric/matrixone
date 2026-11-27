@@ -321,26 +321,24 @@ func (a *AliyunSDK) Write(
 ) {
 	defer wrapSizeMismatchErr(&err)
 
-	if sizeHint != nil && *sizeHint <= smallObjectThreshold {
-		body, size, err := bodyOf(r)
-		if err != nil {
-			return err
-		}
-		_, err = DoWithRetryContext(ctx, "write", func() (int, error) {
-			return 0, a.putObject(
-				ctx,
-				key,
-				io.NewSectionReader(body, 0, size),
-				sizeHint,
-				expire,
-			)
-		}, maxRetryAttemps, IsRetryableError)
-		if err != nil {
-			return err
-		}
-
-	} else {
-		return writeParts(ctx, storageParts{a}, key, r, sizeHint, &ParallelMultipartOption{Concurrency: 1, Expire: expire})
+	body, size, err := bodyOf(r)
+	if err != nil {
+		return err
+	}
+	if sizeHint == nil {
+		sizeHint = &size
+	}
+	_, err = DoWithRetryContext(ctx, "write", func() (int, error) {
+		return 0, a.putObject(
+			ctx,
+			key,
+			io.NewSectionReader(body, 0, size),
+			sizeHint,
+			expire,
+		)
+	}, maxRetryAttemps, IsRetryableError)
+	if err != nil {
+		return err
 	}
 
 	return

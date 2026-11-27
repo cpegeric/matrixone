@@ -247,7 +247,6 @@ func NewAwsSDKv2(
 }
 
 var _ ObjectStorage = new(AwsSDKv2)
-var _ ParallelMultipartWriter = new(AwsSDKv2)
 
 func (a *AwsSDKv2) List(
 	ctx context.Context,
@@ -443,16 +442,13 @@ func (a *AwsSDKv2) Write(
 ) {
 	defer wrapSizeMismatchErr(&err)
 
-	if sizeHint == nil {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		return writeParts(ctx, storageParts{a}, key, r, nil, &ParallelMultipartOption{Concurrency: 1, Expire: expire})
-
-	} else if *sizeHint < smallObjectThreshold || exclusiveWrite(ctx) {
+	if _, seeker := r.(io.Seeker); sizeHint == nil || !seeker || *sizeHint < smallObjectThreshold || exclusiveWrite(ctx) {
 		body, size, err := bodyOf(r)
 		if err != nil {
 			return err
+		}
+		if sizeHint == nil {
+			sizeHint = &size
 		}
 		_, err = DoWithRetryContext(ctx, "write", func() (*s3.PutObjectOutput, error) {
 			return a.putObject(
@@ -474,17 +470,6 @@ func (a *AwsSDKv2) Write(
 		}
 
 	} else {
-		if _, ok := r.(io.Seeker); !ok {
-			// Large non-seekable readers are incompatible with the raw PutObject path
-			// on some S3-compatible backends (for example OBS behind non-TLS or custom
-			// payload-hash behavior). Fall back to multipart upload with concurrency=1
-			// so callers do not need parallel-mode=1 just to avoid the 64MB raw PUT path.
-			return a.WriteMultipartParallel(ctx, key, r, sizeHint, &ParallelMultipartOption{
-				PartSize:    defaultParallelMultipartPartSize,
-				Concurrency: 1,
-				Expire:      expire,
-			})
-		}
 		_, err = a.putObject(
 			ctx,
 			&s3.PutObjectInput{
@@ -517,20 +502,6 @@ func (a *AwsSDKv2) abortMultipartUpload(ctx context.Context, key string, uploadI
 		UploadId: uploadID,
 	})
 	return err
-}
-
-func (a *AwsSDKv2) SupportsParallelMultipart() bool {
-	return true
-}
-
-func (a *AwsSDKv2) WriteMultipartParallel(
-	ctx context.Context,
-	key string,
-	r io.Reader,
-	sizeHint *int64,
-	opt *ParallelMultipartOption,
-) error {
-	return writeParts(ctx, storageParts{a}, key, r, sizeHint, opt)
 }
 
 var _ multipartStorage = new(AwsSDKv2)

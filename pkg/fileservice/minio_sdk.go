@@ -437,26 +437,23 @@ func (a *MinioSDK) Write(
 ) {
 	defer wrapSizeMismatchErr(&err)
 
-	if sizeHint != nil && (*sizeHint <= smallObjectThreshold || exclusiveWrite(ctx)) {
-		body, size, err := bodyOf(r)
-		if err != nil {
-			return err
-		}
-		if size != *sizeHint {
-			return moerr.NewSizeNotMatchNoCtx(key)
-		}
-		_, err = DoWithRetryContext(ctx, "write", func() (minio.UploadInfo, error) {
-			return a.putObject(
-				ctx,
-				key,
-				io.NewSectionReader(body, 0, size),
-				sizeHint,
-				expire,
-			)
-		}, maxRetryAttemps, minioRetryable())
+	body, size, err := bodyOf(r)
+	if err != nil {
 		return err
 	}
-	return writeParts(ctx, storageParts{a}, key, r, sizeHint, &ParallelMultipartOption{Concurrency: 1, Expire: expire})
+	if sizeHint != nil && size != *sizeHint {
+		return moerr.NewSizeNotMatchNoCtx(key)
+	}
+	_, err = DoWithRetryContext(ctx, "write", func() (minio.UploadInfo, error) {
+		return a.putObject(
+			ctx,
+			key,
+			io.NewSectionReader(body, 0, size),
+			&size,
+			expire,
+		)
+	}, maxRetryAttemps, minioRetryable())
+	return err
 }
 
 func (a *MinioSDK) Read(

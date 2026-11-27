@@ -82,10 +82,12 @@ func TestNormalizeParallelOption(t *testing.T) {
 	}
 }
 
-// partStorage is object storage that records the writes of an object in parts.
+// partStorage is object storage that records the writes of an object in parts, and
+// counts in outside the requests made without the room of a server.
 type partStorage struct {
 	ObjectStorage
-	exists bool
+	exists  bool
+	outside atomic.Int64
 
 	mu      sync.Mutex
 	puts    map[string][]byte
@@ -102,7 +104,22 @@ func newPartStorage() *partStorage {
 
 func (p *partStorage) Exists(context.Context, string) (bool, error) { return p.exists, nil }
 
-func (p *partStorage) Write(_ context.Context, key string, r io.Reader, _ *int64, _ *time.Time) error {
+// served counts a request made under ctx without the room of a server.
+func (p *partStorage) served(ctx context.Context) {
+	r, _ := ctx.Value(requestKey{}).(*requestRoom)
+	if r == nil {
+		p.outside.Add(1)
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.held {
+		p.outside.Add(1)
+	}
+}
+
+func (p *partStorage) Write(ctx context.Context, key string, r io.Reader, _ *int64, _ *time.Time) error {
+	p.served(ctx)
 	data, err := io.ReadAll(r)
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -110,14 +127,16 @@ func (p *partStorage) Write(_ context.Context, key string, r io.Reader, _ *int64
 	return err
 }
 
-func (p *partStorage) createMultipart(_ context.Context, _ string, expire *time.Time) (string, error) {
+func (p *partStorage) createMultipart(ctx context.Context, _ string, expire *time.Time) (string, error) {
+	p.served(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.creates = append(p.creates, expire)
 	return "upload", nil
 }
 
-func (p *partStorage) uploadPart(_ context.Context, _, _ string, num int32, body io.ReaderAt, size int64) (string, error) {
+func (p *partStorage) uploadPart(ctx context.Context, _, _ string, num int32, body io.ReaderAt, size int64) (string, error) {
+	p.served(ctx)
 	data, err := io.ReadAll(io.NewSectionReader(body, 0, size))
 	if err != nil {
 		return "", err
@@ -133,7 +152,8 @@ func (p *partStorage) uploadPart(_ context.Context, _, _ string, num int32, body
 	return "etag", nil
 }
 
-func (p *partStorage) completeMultipart(_ context.Context, _, _ string, parts []multipartPart) error {
+func (p *partStorage) completeMultipart(ctx context.Context, _, _ string, parts []multipartPart) error {
+	p.served(ctx)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, part := range parts {
@@ -157,7 +177,7 @@ func newPartFS(t *testing.T, storage ObjectStorage, mode ParallelMode, room int)
 
 // A write that ends within its first part is one put; a longer one is a multipart upload
 // whose parts are uploaded at once only in parallel mode, and at most as many at once as
-// the server has room for.
+// the server has room for. Every request holds the room of the server.
 func TestS3FSWriteInParts(t *testing.T) {
 	small := []byte("hello")
 	large := bytes.Repeat([]byte("abcdefg"), int(3*minMultipartPartSize/7)+2)
@@ -186,6 +206,7 @@ func TestS3FSWriteInParts(t *testing.T) {
 			}
 			expire := time.Now().Add(time.Hour)
 			require.NoError(t, fs.Write(context.Background(), IOVector{FilePath: "obj", ExpireAt: expire, Entries: []IOEntry{entry}}))
+			require.Zero(t, storage.outside.Load())
 			if c.parts == 0 {
 				require.Equal(t, c.data, storage.puts["obj"])
 				require.Empty(t, storage.creates)
