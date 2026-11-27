@@ -1218,13 +1218,19 @@ func (d *DiskCache) dropPrefetches(ctx context.Context, diskPath string) error {
 	return nil
 }
 
-// closePrefetches ends the waiting fills, stops the others and waits for them, or ctx.
+// closePrefetches ends the waiting fills, stops the others at once and waits for them, or
+// ctx.
 func (d *DiskCache) closePrefetches(ctx context.Context) {
 	f := &d.prefetchObjects
 	f.mu.Lock()
 	f.closed = true
 	for len(f.waitingFills) > 0 {
 		d.endLocked(f.waitingFills[0], nil)
+	}
+	for _, fills := range f.m {
+		for _, p := range fills {
+			p.stop()
+		}
 	}
 	cancelReads := f.cancelReads
 	f.mu.Unlock()

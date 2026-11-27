@@ -650,6 +650,9 @@ func (g *objectStorageServer) doHeld(ctx context.Context, r *requestRoom, req re
 	if err := r.resume(ctx); err != nil {
 		return result{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return result{}, err
+	}
 	if op := req.op(); op < opCount {
 		g.ops[op].Inc()
 	}
