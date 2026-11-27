@@ -1390,6 +1390,28 @@ func TestRoomBelowMinimumIsRaised(t *testing.T) {
 	require.ErrorContains(t, err, "max-conns-per-host")
 }
 
+// The room of each server is the configured room divided by the services of the process,
+// at least minRequestRoom.
+func TestServerRoomSplitAmongProcessServices(t *testing.T) {
+	t.Cleanup(func() { SetProcessServices(0) })
+	for _, tc := range []struct {
+		services, conns, room int
+	}{
+		{0, 384, 384},
+		{1, 384, 384},
+		{3, 384, 128},
+		{3, 0, minRequestRoom},
+		{2, 1000, 500},
+	} {
+		SetProcessServices(tc.services)
+		fs, err := NewS3FS(context.Background(), ObjectStorageArguments{Name: "s3", Endpoint: "disk", Bucket: t.TempDir(), MaxConnsPerHost: tc.conns},
+			CacheConfig{MemoryCapacity: ptrTo[toml.ByteSize](0)}, nil, false, true)
+		require.NoError(t, err)
+		require.Equal(t, tc.room, fs.server.capacity, "services %d conns %d", tc.services, tc.conns)
+		fs.Close(context.Background())
+	}
+}
+
 func TestDownloadConnsAreHalfTheConfiguredLimit(t *testing.T) {
 	ctx := context.Background()
 	fs, err := NewS3FS(ctx, ObjectStorageArguments{Name: "s3", Endpoint: "disk", Bucket: t.TempDir(), MaxConnsPerHost: 100},

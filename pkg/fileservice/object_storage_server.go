@@ -102,6 +102,15 @@ var errServerClosed = moerr.NewInternalErrorNoCtx("fileservice: object storage s
 // minRequestRoom is the least room of a server.
 const minRequestRoom = 64
 
+// processServices is the number of services in the process that make file services.
+var processServices atomic.Int32
+
+// SetProcessServices sets the number of services in the process that make file services;
+// the room of each object storage server is the configured room divided by it.
+func SetProcessServices(n int) {
+	processServices.Store(int32(n))
+}
+
 const (
 	// serverMemoryDefault is the memory budget of a server when the memory available on
 	// the node cannot be measured.

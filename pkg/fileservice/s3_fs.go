@@ -111,8 +111,10 @@ func NewS3FS(
 
 	args.NoDefaultCredentials = args.NoDefaultCredentials || noDefaultCredential || args.callerCredentialsOnly
 	args.raiseRequestRoom()
-	// The room of the server is the connections of its own pool to each host.
+	// The room of the server is the connections of its own pool to each host: the
+	// process's room split among the services of the process, at least minRequestRoom.
 	room := min(cmp.Or(args.MaxConnsPerHost, maxConnsPerHost), int(cmp.Or(args.Concurrency, 1024)))
+	room = max(minRequestRoom, room/max(1, int(processServices.Load())))
 	if args.MaxConnsPerHost >= 0 && args.Concurrency >= 0 {
 		args.MaxConnsPerHost = room
 	}

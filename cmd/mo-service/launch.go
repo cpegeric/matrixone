@@ -30,6 +30,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/backup"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/stopper"
+	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	logpb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
@@ -73,6 +74,7 @@ func startCluster(
 		Because we can get all config files conveniently.
 	*/
 	backup.SaveLaunchConfigPath(backup.LaunchConfig, []string{*launchFile})
+	fileservice.SetProcessServices(len(cfg.LogServiceConfigFiles) + len(cfg.TNServiceConfigsFiles) + len(cfg.CNServiceConfigsFiles))
 	backup.SaveLaunchConfigPath(backup.LogConfig, cfg.LogServiceConfigFiles)
 	backup.SaveLaunchConfigPath(backup.DnConfig, cfg.TNServiceConfigsFiles)
 	backup.SaveLaunchConfigPath(backup.CnConfig, cfg.CNServiceConfigsFiles)
