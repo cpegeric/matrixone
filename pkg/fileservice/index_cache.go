@@ -24,7 +24,6 @@ import (
 	"io/fs"
 	"net/url"
 	"os"
-	"path"
 	pathpkg "path"
 	"path/filepath"
 	"slices"
@@ -1519,7 +1518,7 @@ type indexObjects struct {
 // IndexObjectEntry returns the index-file cache entry of the object at file: the whole
 // object, as its file IndexObjectFile.
 func IndexObjectEntry(file string) string {
-	return path.Join(indexObjectPrefix, path.Clean(file))
+	return pathpkg.Join(indexObjectPrefix, pathpkg.Clean(file))
 }
 
 // IndexObjectCache returns fs's SHARED file service, which reads the objects of tables,

@@ -4759,6 +4759,7 @@ func TestReadStartedSplitHonorsConfiguredPartCount(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			require.NoError(t, fs.Read(ctx, vector))
+			flushPublishers(fs)
 			require.Equal(t, data[tc.offset:tc.offset+16], vector.Entries[0].Data)
 			require.EqualValues(t, 4, storage.reads.Load(), "the known-size object fits four aligned parts, including a boundary at the read's first needed block")
 		})
