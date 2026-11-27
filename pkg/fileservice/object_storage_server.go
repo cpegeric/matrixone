@@ -848,12 +848,10 @@ func (e *bodyCloseError) Error() string { return e.err.Error() }
 func (e *bodyCloseError) Unwrap() error { return e.err }
 
 // fillProgress is where a read records the bytes it writes into a fill: a part of a
-// download, a memory flight or a stream. Recording takes only the fill's own short lock
-// and never waits.
+// download or a stream. Recording takes only the fill's own short lock and never waits.
 type fillProgress struct {
 	download *objectDownload
 	part     int
-	flight   *memoryPrefetchObject
 	stream   *streamDownload
 }
 
@@ -875,8 +873,6 @@ func (p fillProgress) wrote(n int64) {
 	switch {
 	case p.download != nil:
 		p.download.advance(p.part, n)
-	case p.flight != nil:
-		p.flight.wrote(int(n))
 	case p.stream != nil:
 		p.stream.wrote(n)
 	}

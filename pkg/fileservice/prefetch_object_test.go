@@ -57,7 +57,7 @@ func fileObjects(d *DiskCache) int {
 	n := 0
 	for _, objects := range f.m {
 		for _, o := range objects {
-			if _, ok := o.(*filePrefetchObject); ok {
+			if d := o.joinableDownload(); d == nil || !d.memory {
 				n++
 			}
 		}
@@ -758,10 +758,10 @@ func TestBlackBoxPrefetchKeepsJoinedReadDownload(t *testing.T) {
 	<-entered
 	f := &d.prefetchObjects
 	diskPath := d.objectKey("object")
-	var started *filePrefetchObject
+	var started *cacheFill
 	f.mu.Lock()
-	for _, o := range f.m[diskPath] {
-		if p, ok := o.(*filePrefetchObject); ok && p.readStarted {
+	for _, p := range f.m[diskPath] {
+		if p.readStarted {
 			started = p
 		}
 	}
@@ -1584,11 +1584,11 @@ func TestJoinedReadOfIdleStoppedFlightReadsItsBytes(t *testing.T) {
 		f := &fs.diskCache.prefetchObjects
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		for _, o := range f.m[diskPath] {
-			if fl, ok := o.(*memoryPrefetchObject); ok {
-				fl.idle.mu.Lock()
-				w := fl.idle.waiting
-				fl.idle.mu.Unlock()
+		for _, fl := range f.m[diskPath] {
+			if o := fl.joinableDownload(); o != nil && o.memory {
+				o.idle.mu.Lock()
+				w := o.idle.waiting
+				o.idle.mu.Unlock()
 				if w > 0 {
 					return true
 				}
@@ -1692,7 +1692,7 @@ func TestDebugPrefetchObjectsListsWaitingObjects(t *testing.T) {
 	}
 	objectPath := fs.diskCache.objectKey("object")
 	require.Eventually(t, func() bool {
-		return strings.Contains(page(), "memory "+objectPath+" [0, 1024) waiting for room")
+		return strings.Contains(page(), "fill "+objectPath+" [0, 1024) waiting for room")
 	}, 5*time.Second, time.Millisecond, "the waiting object is listed")
 	require.Eventually(t, func() bool {
 		return strings.Contains(page(), fmt.Sprintf("background running %d of %d waiting 1", fs.server.backgroundMax, fs.server.backgroundMax))
@@ -1851,11 +1851,11 @@ func flightRefs(fs *S3FS, offset int64) int {
 	f := &fs.diskCache.prefetchObjects
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, o := range f.m[fs.diskCache.objectKey("object")] {
-		if fl, ok := o.(*memoryPrefetchObject); ok && fl.start == offset {
+	for _, fl := range f.m[fs.diskCache.objectKey("object")] {
+		if fl.start == offset {
 			fl.mu.Lock()
 			defer fl.mu.Unlock()
-			return fl.refs
+			return fl.holds + 1
 		}
 	}
 	return 0
@@ -2003,11 +2003,11 @@ func memoryWaiters(fs *S3FS, diskPath string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	n := 0
-	for _, o := range f.m[diskPath] {
-		if fl, ok := o.(*memoryPrefetchObject); ok {
-			fl.mu.Lock()
-			n += len(fl.waiters)
-			fl.mu.Unlock()
+	for _, fl := range f.m[diskPath] {
+		if o := fl.joinableDownload(); o != nil && o.memory {
+			o.mu.Lock()
+			n += len(o.waiters)
+			o.mu.Unlock()
 		}
 	}
 	return n
@@ -2246,10 +2246,9 @@ func TestReadJoiningPrefetchObjectsAcrossDeleteReturnsOneVersion(t *testing.T) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		out := make([]int, 0, len(f.m[key]))
-		for _, o := range f.m[key] {
-			m := o.(*memoryPrefetchObject)
+		for _, m := range f.m[key] {
 			m.mu.Lock()
-			out = append(out, m.refs)
+			out = append(out, m.holds)
 			m.mu.Unlock()
 		}
 		return out

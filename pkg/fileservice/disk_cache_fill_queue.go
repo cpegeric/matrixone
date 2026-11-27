@@ -18,9 +18,7 @@ import (
 	"cmp"
 	"container/heap"
 	"context"
-	"errors"
 	"slices"
-	"sync"
 	"sync/atomic"
 
 	"github.com/matrixorigin/matrixone/pkg/logutil"
@@ -131,93 +129,52 @@ type fillKey struct {
 	index    bool
 }
 
-// queuedFill is a fill a prefetch made: the bytes [start, end) of an object, or the whole
-// object, into one cache. It waits in the registry holding nothing, then runs: a fill of
-// ranges becomes the prefetch objects it registers as it starts, a fill of the whole
-// object stays registered until reads can join its download.
-type queuedFill struct {
-	req        ObjectPrefetch
-	key        fillKey
-	src        objectSource
-	start, end int64
-	whole      bool
-	scans      []*PrefetchScan
-	seq        uint64
-	pos        int // in the waiting fills; -1 when not waiting
-	joiners    int
-	// splitAt is where the first read that joined a waiting fill of the whole object
-	// needs its bytes from.
-	splitAt int64
-	running bool
-	// background is set while it runs counted among the background fills.
-	background bool
-	promoted   chan struct{}
-	// cancel, when set, ends the wait of its memory flight for room.
-	cancel context.CancelFunc
-	// started is closed once reads can join what it downloads, or it ended.
-	started     chan struct{}
-	startedOnce sync.Once
+// liveScan reports whether a read joined p, waiting, or a scan p is for has not ended.
+func (p *cacheFill) liveScan() bool {
+	return p.joiners > 0 || slices.ContainsFunc(p.scans, (*PrefetchScan).live)
 }
 
-func (q *queuedFill) size() int64 { return q.end - q.start }
-
-func (q *queuedFill) isPromoted() bool {
-	select {
-	case <-q.promoted:
-		return true
-	default:
-		return false
-	}
-}
-
-func (q *queuedFill) markStarted() { q.startedOnce.Do(func() { close(q.started) }) }
-
-// live reports whether a read joined q or a scan q is for has not ended.
-func (q *queuedFill) live() bool {
-	return q.joiners > 0 || slices.ContainsFunc(q.scans, (*PrefetchScan).live)
-}
-
-// before reports whether q starts before o: it is foreground and o is not, the read reads
+// before reports whether p starts before o: it is foreground and o is not, the read reads
 // a larger share of it, a read reaches it sooner, or as soon and it was asked for first.
-func (q *queuedFill) before(o *queuedFill) bool {
-	if a, b := q.isPromoted(), o.isPromoted(); a != b {
+func (p *cacheFill) before(o *cacheFill) bool {
+	if a, b := p.isPromoted(), o.isPromoted(); a != b {
 		return a
 	}
-	if a, b := q.req.share(), o.req.share(); a != b {
+	if a, b := p.req.share(), o.req.share(); a != b {
 		return a > b
 	}
-	if q.req.Due != o.req.Due {
-		return q.req.Due < o.req.Due
+	if p.req.Due != o.req.Due {
+		return p.req.Due < o.req.Due
 	}
-	return q.seq < o.seq
+	return p.seq < o.seq
 }
 
-// merge merges into q, waiting, the request req for bytes it holds: the sooner due time,
+// merge merges into p, waiting, the request req for bytes it holds: the sooner due time,
 // the larger share and its scan.
-func (q *queuedFill) merge(req ObjectPrefetch) {
-	q.req.Due = min(q.req.Due, req.Due)
-	q.req.deletes = min(q.req.deletes, req.deletes)
-	if req.share() > q.req.share() {
-		q.req.Reads, q.req.Blocks = req.Reads, req.Blocks
+func (p *cacheFill) merge(req ObjectPrefetch) {
+	p.req.Due = min(p.req.Due, req.Due)
+	p.req.deletes = min(p.req.deletes, req.deletes)
+	if req.share() > p.req.share() {
+		p.req.Reads, p.req.Blocks = req.Reads, req.Blocks
 	}
-	q.scans = slices.DeleteFunc(q.scans, func(s *PrefetchScan) bool { return !s.live() })
-	if !slices.Contains(q.scans, req.Scan) {
-		q.scans = append(q.scans, req.Scan)
+	p.scans = slices.DeleteFunc(p.scans, func(s *PrefetchScan) bool { return !s.live() })
+	if !slices.Contains(p.scans, req.Scan) {
+		p.scans = append(p.scans, req.Scan)
 	}
 }
 
-// holdsNeeded reports whether q holds bytes of an entry of vector not done.
-func (q *queuedFill) holdsNeeded(vector *IOVector) bool {
+// holdsNeeded reports whether p holds bytes of an entry of vector not done.
+func (p *cacheFill) holdsNeeded(vector *IOVector) bool {
 	for i := range vector.Entries {
 		e := &vector.Entries[i]
-		if !e.done && (q.whole || (e.Size < 0 || q.start < e.Offset+e.Size) && e.Offset < q.end) {
+		if !e.done && (p.whole || (e.Size < 0 || p.start < e.Offset+e.Size) && e.Offset < p.end) {
 			return true
 		}
 	}
 	return false
 }
 
-type fillHeap []*queuedFill
+type fillHeap []*cacheFill
 
 func (h fillHeap) Len() int           { return len(h) }
 func (h fillHeap) Less(i, j int) bool { return h[i].before(h[j]) }
@@ -226,53 +183,17 @@ func (h fillHeap) Swap(i, j int) {
 	h[i].pos, h[j].pos = i, j
 }
 func (h *fillHeap) Push(x any) {
-	q := x.(*queuedFill)
-	q.pos = len(*h)
-	*h = append(*h, q)
+	p := x.(*cacheFill)
+	p.pos = len(*h)
+	*h = append(*h, p)
 }
 func (h *fillHeap) Pop() any {
 	old := *h
-	q := old[len(old)-1]
+	p := old[len(old)-1]
 	old[len(old)-1] = nil
 	*h = old[:len(old)-1]
-	q.pos = -1
-	return q
-}
-
-type queuedFillKey struct{}
-
-// withQueuedFill returns ctx of the run of q: its requests are background until q is
-// promoted, and reads under it join no fill.
-func withQueuedFill(ctx context.Context, q *queuedFill) context.Context {
-	ctx = withPromotion(ctx, q.promoted)
-	ctx = context.WithValue(ctx, queuedFillKey{}, q)
-	return withDownloadStarted(ctx, q.markStarted)
-}
-
-func queuedFillOf(ctx context.Context) *queuedFill {
-	q, _ := ctx.Value(queuedFillKey{}).(*queuedFill)
-	return q
-}
-
-type downloadStartedKey struct{}
-
-// withDownloadStarted returns ctx, through which a download calls started once reads
-// can join it.
-func withDownloadStarted(ctx context.Context, started func()) context.Context {
-	return context.WithValue(ctx, downloadStartedKey{}, started)
-}
-
-// isDownload reports whether ctx is that of a fill's download.
-func isDownload(ctx context.Context) bool {
-	_, ok := ctx.Value(downloadStartedKey{}).(func())
-	return ok
-}
-
-// downloadStarted tells the fill whose download ctx is for that reads can join it.
-func downloadStarted(ctx context.Context) {
-	if started, ok := ctx.Value(downloadStartedKey{}).(func()); ok {
-		started()
-	}
+	p.pos = -1
+	return p
 }
 
 // rangeFillPolicy is the policy a fill of ranges caches them under.
@@ -320,104 +241,94 @@ func (d *DiskCache) addFills(req ObjectPrefetch, have bool, src objectSource) {
 		return
 	}
 	for _, o := range f.m[key.diskPath] {
-		if o.target().index != key.index || !o.live() || !o.endsCached() {
-			continue
-		}
-		start, end := o.span()
-		if held := subtractRange(pieces, start, end); !slices.Equal(held, pieces) {
-			if p, ok := o.(*filePrefetchObject); ok {
-				p.kept = true
-			}
-			pieces = held
-		}
-	}
-	for _, q := range f.fills[key] {
 		if len(pieces) == 0 {
 			break
 		}
-		held := subtractRange(pieces, q.start, q.end)
+		if o.index != key.index || !o.live() || !o.endsCached() {
+			continue
+		}
+		held := subtractRange(pieces, o.start, o.end)
 		if slices.Equal(held, pieces) {
 			continue
 		}
-		metric.FSPrefetchMergedCounter.Inc()
-		if q.pos >= 0 {
-			q.merge(req)
-			heap.Fix(&f.waitingFills, q.pos)
+		if o.queued {
+			metric.FSPrefetchMergedCounter.Inc()
+		}
+		if o.pos >= 0 {
+			o.merge(req)
+			heap.Fix(&f.waitingFills, o.pos)
+		} else {
+			o.kept = true
 		}
 		pieces = held
 	}
 	for _, r := range pieces {
-		d.pushFillLocked(&queuedFill{req: req, key: key, src: src, start: r.Offset, end: r.Offset + r.Size})
+		p := d.newFill(req.FilePath, r.Offset, r.Offset+r.Size, src)
+		p.req, p.index = req, key.index
+		d.pushFillLocked(p)
 	}
 }
 
 // addWholeLocked is addFills of req, a request of the whole object of key.
 func (d *DiskCache) addWholeLocked(req ObjectPrefetch, key fillKey, src objectSource) {
 	f := &d.prefetchObjects
-	for _, q := range f.fills[key] {
-		if q.whole {
+	for _, o := range f.m[key.diskPath] {
+		if o.whole && o.index == key.index && o.live() {
 			metric.FSPrefetchMergedCounter.Inc()
-			if q.pos >= 0 {
-				q.merge(req)
-				heap.Fix(&f.waitingFills, q.pos)
+			if o.pos >= 0 {
+				o.merge(req)
+				heap.Fix(&f.waitingFills, o.pos)
 			}
 			return
 		}
 	}
+	whole := d.newFill(req.FilePath, 0, req.Size, src)
+	whole.req, whole.index, whole.whole = req, key.index, true
+	var taken []*cacheFill
 	for _, o := range f.m[key.diskPath] {
-		if p, ok := o.(*filePrefetchObject); ok && p.whole && p.index == key.index && p.live() {
-			metric.FSPrefetchMergedCounter.Inc()
-			return
+		if o.index == key.index && o.pos >= 0 && o.joiners == 0 && !o.isPromoted() {
+			taken = append(taken, o)
 		}
 	}
-	whole := &queuedFill{req: req, key: key, src: src, end: req.Size, whole: true}
-	var taken []*queuedFill
-	for _, q := range f.fills[key] {
-		if q.pos >= 0 && q.joiners == 0 && !q.isPromoted() {
-			taken = append(taken, q)
-		}
-	}
-	for _, q := range taken {
-		whole.req.Due = min(whole.req.Due, q.req.Due)
-		whole.scans = append(whole.scans, q.scans...)
-		heap.Remove(&f.waitingFills, q.pos)
-		f.queuedBytes -= q.size()
-		d.forgetFillLocked(q)
+	for _, o := range taken {
+		whole.req.Due = min(whole.req.Due, o.req.Due)
+		whole.scans = append(whole.scans, o.scans...)
+		heap.Remove(&f.waitingFills, o.pos)
+		f.queuedBytes -= o.size()
+		f.forgetLocked(o)
 	}
 	if d.pushFillLocked(whole) {
-		for _, q := range taken {
-			q.markStarted()
+		for _, o := range taken {
+			o.done = true
+			close(o.endedCh)
+			o.markReady()
 		}
 		return
 	}
 	// The fills of ranges stay queued when the whole object does not fit.
-	for _, q := range taken {
-		heap.Push(&f.waitingFills, q)
-		f.queuedBytes += q.size()
-		f.fills[key] = append(f.fills[key], q)
+	for _, o := range taken {
+		heap.Push(&f.waitingFills, o)
+		f.queuedBytes += o.size()
+		f.registerLocked(o)
 	}
 }
 
-// pushFillLocked queues q, a new background fill, unless it does not fit the bytes of the
-// waiting background fills, and reports whether it did.
-func (d *DiskCache) pushFillLocked(q *queuedFill) bool {
+// pushFillLocked registers p, a new waiting background fill, unless it does not fit the
+// bytes of the waiting background fills, and reports whether it did.
+func (d *DiskCache) pushFillLocked(p *cacheFill) bool {
 	f := &d.prefetchObjects
-	if !d.roomLocked(q) {
+	if !d.roomLocked(p) {
 		metric.FSPrefetchDroppedCounter.Inc()
 		return false
 	}
 	f.fillSeq++
-	q.seq, q.pos = f.fillSeq, -1
-	q.promoted, q.started = make(chan struct{}), make(chan struct{})
-	if !slices.Contains(q.scans, q.req.Scan) {
-		q.scans = append(q.scans, q.req.Scan)
+	p.seq, p.queued = f.fillSeq, true
+	if !slices.Contains(p.scans, p.req.Scan) {
+		p.scans = append(p.scans, p.req.Scan)
 	}
-	heap.Push(&f.waitingFills, q)
-	f.queuedBytes += q.size()
-	if f.fills == nil {
-		f.fills = make(map[fillKey][]*queuedFill)
-	}
-	f.fills[q.key] = append(f.fills[q.key], q)
+	heap.Push(&f.waitingFills, p)
+	f.queuedBytes += p.size()
+	f.registerLocked(p)
 	metric.FSPrefetchQueuedCounter.Inc()
 	return true
 }
@@ -425,22 +336,22 @@ func (d *DiskCache) pushFillLocked(q *queuedFill) bool {
 // fillQueueLimit is the most bytes of waiting background fills: half the disk cache keeps.
 func (d *DiskCache) fillQueueLimit() int64 { return d.capacityFunc() / 2 }
 
-// roomLocked reports whether q fits the bytes of the waiting background fills, after
-// dropping those whose scans all ended and no read joined, then the last in order while q
+// roomLocked reports whether p fits the bytes of the waiting background fills, after
+// dropping those whose scans all ended and no read joined, then the last in order while p
 // starts before it.
-func (d *DiskCache) roomLocked(q *queuedFill) bool {
+func (d *DiskCache) roomLocked(p *cacheFill) bool {
 	f := &d.prefetchObjects
 	limit := d.fillQueueLimit()
-	if q.size() > limit {
+	if p.size() > limit {
 		return false
 	}
-	for f.queuedBytes+q.size() > limit {
-		var last *queuedFill
+	for f.queuedBytes+p.size() > limit {
+		var last *cacheFill
 		for _, o := range f.waitingFills {
 			if o.isPromoted() {
 				continue
 			}
-			if !o.live() {
+			if !o.liveScan() {
 				last = o
 				break
 			}
@@ -448,7 +359,7 @@ func (d *DiskCache) roomLocked(q *queuedFill) bool {
 				last = o
 			}
 		}
-		if last == nil || last.live() && !q.before(last) {
+		if last == nil || last.liveScan() && !p.before(last) {
 			return false
 		}
 		d.dropLocked(last)
@@ -456,37 +367,14 @@ func (d *DiskCache) roomLocked(q *queuedFill) bool {
 	return true
 }
 
-// removeWaitingLocked removes q, waiting, from the registry.
-func (d *DiskCache) removeWaitingLocked(q *queuedFill) {
-	f := &d.prefetchObjects
-	if q.pos >= 0 {
-		heap.Remove(&f.waitingFills, q.pos)
-		if !q.isPromoted() {
-			f.queuedBytes -= q.size()
-		}
-	}
-	d.forgetFillLocked(q)
-	q.markStarted()
-}
-
-func (d *DiskCache) forgetFillLocked(q *queuedFill) {
-	f := &d.prefetchObjects
-	fills := slices.DeleteFunc(f.fills[q.key], func(o *queuedFill) bool { return o == q })
-	if len(fills) == 0 {
-		delete(f.fills, q.key)
-	} else {
-		f.fills[q.key] = fills
-	}
-}
-
-// dropLocked drops q, waiting.
-func (d *DiskCache) dropLocked(q *queuedFill) {
-	if q.live() {
+// dropLocked drops p, waiting.
+func (d *DiskCache) dropLocked(p *cacheFill) {
+	if p.liveScan() {
 		metric.FSPrefetchDroppedCounter.Inc()
 	} else {
 		metric.FSPrefetchEndedCounter.Inc()
 	}
-	d.removeWaitingLocked(q)
+	d.endLocked(p, nil)
 }
 
 // memoryBacked reports whether a fill of n bytes is made to be held in memory: it is at
@@ -506,162 +394,67 @@ func (d *DiskCache) memoryBacked(n int64, background bool) bool {
 func (d *DiskCache) startFillsLocked() {
 	f := &d.prefetchObjects
 	for len(f.waitingFills) > 0 && !f.closed {
-		q := f.waitingFills[0]
-		if !q.live() {
-			d.dropLocked(q)
+		p := f.waitingFills[0]
+		if !p.liveScan() {
+			d.dropLocked(p)
 			continue
 		}
-		background := !q.isPromoted()
+		background := !p.isPromoted()
 		if background && !d.server.takeFill(f.fillsMax) {
 			return
 		}
 		heap.Pop(&f.waitingFills)
 		if background {
-			f.queuedBytes -= q.size()
+			f.queuedBytes -= p.size()
 		}
-		d.startFillLocked(q, background, !q.whole && d.memoryBacked(q.size(), background))
+		p.background = background
+		d.startFillLocked(p)
 	}
 }
 
-// startFillLocked starts q, taken from the waiting fills. A fill of the whole object runs
-// on its own goroutine, registered until reads can join its download. A fill of a range
-// that finds its bytes cached, held by a prefetch object or its object deleted ends;
-// otherwise it runs one prefetch object of its range on its own goroutine: when memory is
-// set, a memory flight admitted with the room of its request and its buffer, or a file
-// fill once its buffer does not fit; a file fill otherwise. The requests of q wait in its
-// order: its share, then its due time.
-func (d *DiskCache) startFillLocked(q *queuedFill, background bool, memory bool) {
+// startFillLocked starts p, taken from the waiting fills, on its own goroutine. Its
+// requests are background until it is promoted and wait in its order: its share, then its
+// due time. A fill of a range that finds its bytes cached, held by another fill or its
+// object deleted ends instead.
+func (d *DiskCache) startFillLocked(p *cacheFill) {
 	f := &d.prefetchObjects
-	closing, _ := f.openLocked()
-	q.running, q.background = true, background
-	ctx := withRequestOrder(withQueuedFill(context.Background(), q), requestOrder{share: q.req.share(), due: q.req.Due})
-	if q.whole {
-		f.reads.Add(1)
-		run := f.runWhole
-		go func() {
-			defer f.reads.Done()
-			ctx, cancel := context.WithCancel(ctx)
-			defer cancel()
-			defer context.AfterFunc(closing, cancel)()
-			run(ctx, q)
-			d.endWhole(q)
-		}()
-		return
-	}
-	diskPath, filePath := q.key.diskPath, q.req.FilePath
-	end := func() {
-		d.forgetFillLocked(q)
-		q.markStarted()
-		d.endFillLocked(q)
-	}
-	if d.deletes.since(diskPath, q.req.deletes) {
-		metric.FSPrefetchEndedCounter.Inc()
-		end()
-		return
-	}
-	if _, cached := d.ranges.covering(diskPath, q.start, q.size()); cached {
-		metric.FSPrefetchCachedCounter.Inc()
-		end()
-		return
-	}
-	if o := f.holdingLocked(diskPath, false, q.start, q.end); o != nil {
-		if p, ok := o.(*filePrefetchObject); ok {
-			p.kept = true
-		}
-		metric.FSPrefetchMergedCounter.Inc()
-		end()
-		return
-	}
-	deletes := q.req.deletes
-	needs := flightNeeds{caching: true, deletes: &deletes}
-	if memory {
-		// The fill stays in the registry while its flight waits for room.
-		ctx, q.cancel = context.WithCancel(ctx)
-		f.reads.Add(1)
-		go d.runRangeFill(ctx, q, needs)
-		return
-	}
-	d.forgetFillLocked(q)
-	q.markStarted()
-	p := d.newFileObject(ctx, filePath, q.start, q.end, q.src, needs)
-	p.fill = q
-	setStateLocked(p, objectRegistered)
-	p.registerLocked(ctx, closing)
-	go p.run()
-}
-
-// runRangeFill runs q, a fill of a range that may be held in memory: its memory flight,
-// once admitted with its buffer, otherwise a file fill of its range. A fill that finds its
-// bytes cached, held by a prefetch object, its object deleted or the cache closed ends.
-func (d *DiskCache) runRangeFill(ctx context.Context, q *queuedFill, needs flightNeeds) {
-	f := &d.prefetchObjects
-	defer f.reads.Done()
-	fl := d.newFlight(q.req.FilePath, q.start, q.end, rangeFillPolicy, q.src, needs)
-	fl.fill = q
-	var o waitingObject = fl
-	got, err := admit(ctx, fl)
-	f.mu.Lock()
-	cancel := q.cancel
-	q.cancel = nil
-	d.forgetFillLocked(q)
-	f.mu.Unlock()
-	defer cancel()
-	q.markStarted()
-	if errors.Is(err, errNoBuffer) {
-		p := d.newFileObject(ctx, q.req.FilePath, q.start, q.end, q.src, needs)
-		p.fill = q
-		o = p
-		got, err = admit(ctx, p)
-	}
-	if got == prefetchObject(o) {
-		got.release()
-		o.run()
-		return
-	}
-	o.abandon()
-	if got != nil {
-		defer got.release()
-	}
-	f.mu.Lock()
-	defer f.mu.Unlock()
 	switch {
-	case got != nil:
-		if p, ok := got.(*filePrefetchObject); ok {
-			p.kept = true
-		}
-		metric.FSPrefetchMergedCounter.Inc()
-	case err == nil:
-		metric.FSPrefetchCachedCounter.Inc()
-	case errors.Is(err, errPrefetchDeleted):
+	case !p.whole && d.deletes.since(p.diskPath, p.req.deletes):
 		metric.FSPrefetchEndedCounter.Inc()
+		d.endLocked(p, nil)
+		return
+	case !p.whole && d.rangesCover(p):
+		metric.FSPrefetchCachedCounter.Inc()
+		d.endLocked(p, nil)
+		return
 	}
-	d.endFillLocked(q)
-	d.startFillsLocked()
-}
-
-// rangeEndedLocked ends q, whose prefetch object ended with err, why it cached nothing.
-func (d *DiskCache) rangeEndedLocked(q *queuedFill, err error) {
-	d.countPrefetch(q.req, err)
-	d.endFillLocked(q)
-	d.startFillsLocked()
-}
-
-// endWhole ends q, a fill of the whole object, whose run returned.
-func (d *DiskCache) endWhole(q *queuedFill) {
-	f := &d.prefetchObjects
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	d.forgetFillLocked(q)
-	q.markStarted()
-	d.endFillLocked(q)
-	d.startFillsLocked()
-}
-
-func (d *DiskCache) endFillLocked(q *queuedFill) {
-	if q.background {
-		d.server.endFill()
-		q.background = false
+	if o := f.holdingLocked(p); o != nil && !p.whole {
+		o.kept = true
+		metric.FSPrefetchMergedCounter.Inc()
+		d.endLocked(p, nil)
+		return
 	}
+	p.closing, _ = f.openLocked()
+	p.running, p.counted = true, true
+	p.deletes, p.policy = &p.req.deletes, rangeFillPolicy
+	f.reads.Add(1)
+	p.setContext(withRequestOrder(withPromotion(context.Background(), p.promoted), requestOrder{share: p.req.share(), due: p.req.Due}))
+	if !p.whole {
+		go p.run(nil)
+		return
+	}
+	run := f.runWhole
+	go func() {
+		defer context.AfterFunc(p.closing, p.cancel)()
+		run(p.ctx, p)
+		p.finish(nil)
+	}()
+}
+
+// rangesCover reports whether cached ranges hold the bytes of p.
+func (d *DiskCache) rangesCover(p *cacheFill) bool {
+	_, cached := d.ranges.covering(p.diskPath, p.start, p.size())
+	return cached
 }
 
 // endFill ends a background fill the server counted, and starts the waiting fills.
@@ -673,30 +466,32 @@ func (d *DiskCache) endFill() {
 	d.startFillsLocked()
 }
 
-// promoteLocked makes q foreground: it starts before every background fill, its requests
-// are foreground, and it leaves the bytes of the waiting background fills.
-func (d *DiskCache) promoteLocked(q *queuedFill) {
-	if q == nil || q.isPromoted() {
+// promoteObjectLocked makes p, which a read joins, foreground: it starts before every
+// background fill and leaves the bytes of the waiting background fills, its requests are
+// foreground, and its buffer moves to the foreground memory.
+func (d *DiskCache) promoteObjectLocked(p *cacheFill) {
+	if o := p.joinableDownload(); o != nil {
+		o.promote()
+	}
+	if p.isPromoted() {
 		return
 	}
-	f := &d.prefetchObjects
-	close(q.promoted)
-	if q.pos >= 0 {
+	close(p.promoted)
+	if p.pos >= 0 {
+		f := &d.prefetchObjects
 		metric.FSPrefetchMissedCounter.Inc()
-		f.queuedBytes -= q.size()
-		heap.Fix(&f.waitingFills, q.pos)
+		f.queuedBytes -= p.size()
+		heap.Fix(&f.waitingFills, p.pos)
+		d.startFillsLocked()
 	}
 }
 
-// promoteObjectLocked promotes the fill of o, which a read joins, and moves the buffer of
-// a background flight to the foreground charge.
-func (d *DiskCache) promoteObjectLocked(o prefetchObject) {
-	t := o.target()
-	d.promoteLocked(t.fill)
-	if fl, ok := o.(*memoryPrefetchObject); ok && fl.background && fl.charge > 0 {
-		d.server.promoteMemory(fl.charge)
-		fl.background = false
-	}
+// promoteObject promotes p, which a read joins.
+func (d *DiskCache) promoteObject(p *cacheFill) {
+	f := &d.prefetchObjects
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d.promoteObjectLocked(p)
 }
 
 // joinFills joins the fills of the cache of vector waiting, or running before reads can
@@ -713,60 +508,54 @@ func (s *S3FS) joinFills(ctx context.Context, vector *IOVector, src readSources)
 		return false
 	}
 	d := s.diskCache
-	key := fillKey{diskPath: d.objectKey(path.File), index: s.indexObject(vector.Policy)}
+	index := s.indexObject(vector.Policy)
 	f := &d.prefetchObjects
 	f.mu.Lock()
-	var joined []*queuedFill
-	for _, q := range f.fills[key] {
-		if !q.holdsNeeded(vector) {
+	var joined []*cacheFill
+	for _, p := range f.m[d.objectKey(path.File)] {
+		if !p.queued || p.index != index || p.joinableDownload() != nil || !p.holdsNeeded(vector) {
 			continue
 		}
-		q.joiners++
-		if q.whole && q.pos >= 0 && !q.isPromoted() {
-			q.splitAt = firstNeeded(vector)
+		p.joiners++
+		if p.whole && p.pos >= 0 && !p.isPromoted() {
+			p.splitAt = firstNeeded(vector)
 		}
-		d.promoteLocked(q)
-		joined = append(joined, q)
+		joined = append(joined, p)
 	}
+	for _, p := range joined {
+		d.promoteObjectLocked(p)
+	}
+	f.mu.Unlock()
 	if len(joined) == 0 {
-		f.mu.Unlock()
 		return false
 	}
-	d.startFillsLocked()
-	f.mu.Unlock()
-	for _, q := range joined {
+	for _, p := range joined {
 		select {
-		case <-q.started:
+		case <-p.ready:
 		case <-ctx.Done():
 		}
 	}
 	f.mu.Lock()
-	for _, q := range joined {
-		if q.joiners--; q.pos >= 0 && !q.live() {
-			d.dropLocked(q)
+	for _, p := range joined {
+		if p.joiners--; p.pos >= 0 && !p.liveScan() {
+			d.dropLocked(p)
 		}
 	}
 	f.mu.Unlock()
 	return true
 }
 
-// dropFills drops the waiting fills of the object at filePath into both caches.
+// dropFills ends the waiting fills of the object at filePath into both caches and stops
+// those made by a prefetch that wait for room.
 func (d *DiskCache) dropFills(filePath string) {
 	f := &d.prefetchObjects
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	d.dropFillsLocked(d.objectKey(filePath))
-}
-
-func (d *DiskCache) dropFillsLocked(diskPath string) {
-	f := &d.prefetchObjects
-	for _, index := range []bool{false, true} {
-		for _, q := range slices.Clone(f.fills[fillKey{diskPath: diskPath, index: index}]) {
-			if q.pos >= 0 {
-				d.removeWaitingLocked(q)
-			} else if q.cancel != nil {
-				q.cancel()
-			}
+	for _, p := range slices.Clone(f.m[d.objectKey(filePath)]) {
+		if p.pos >= 0 {
+			d.endLocked(p, nil)
+		} else if p.queued && !p.whole && p.joinableDownload() == nil {
+			p.stop()
 		}
 	}
 	d.startFillsLocked()
@@ -777,16 +566,7 @@ func (d *DiskCache) fillsUnderWay(filePath string) bool {
 	f := &d.prefetchObjects
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	diskPath := d.objectKey(filePath)
-	if len(f.m[diskPath]) > 0 {
-		return true
-	}
-	for _, index := range []bool{false, true} {
-		if slices.ContainsFunc(f.fills[fillKey{diskPath: diskPath, index: index}], func(q *queuedFill) bool { return q.running }) {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(f.m[d.objectKey(filePath)], func(p *cacheFill) bool { return p.pos < 0 })
 }
 
 func (s *S3FS) PrefetchObject(ctx context.Context, req ObjectPrefetch) error {
@@ -870,7 +650,7 @@ func (s *S3FS) haveObject(req ObjectPrefetch) bool {
 
 // runWholeFill downloads the whole object of q at its known size, from the block of its
 // split.
-func (s *S3FS) runWholeFill(ctx context.Context, q *queuedFill) {
+func (s *S3FS) runWholeFill(ctx context.Context, q *cacheFill) {
 	req := q.req
 	ctx = withBackgroundRequests(ctx)
 	// A fill started after its object was deleted downloads nothing.

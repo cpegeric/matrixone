@@ -4257,9 +4257,6 @@ func registeredPrefetchObjects(d *DiskCache) prefetchObjectSet {
 			set[o] = struct{}{}
 		}
 	}
-	for o := range f.waiting {
-		set[o] = struct{}{}
-	}
 	return set
 }
 
@@ -5152,8 +5149,9 @@ func TestPrefetchBufferReleasedBeforeDecode(t *testing.T) {
 				f := &d.prefetchObjects
 				f.mu.Lock()
 				defer f.mu.Unlock()
-				for o := range f.waiting {
-					if target := o.target(); target.filePath == "bystander" && target.state == objectWaitingRoom {
+				_, waiting := d.server.counts()
+				for _, o := range f.m[d.objectKey("bystander")] {
+					if o.joinableDownload() == nil && waiting[foregroundRequest] > 0 {
 						charged = heldMemory(d)
 						return true
 					}
@@ -6523,7 +6521,7 @@ func TestReadOfDownloadJoinsNoPrefetchObject(t *testing.T) {
 			t.Cleanup(sync.OnceFunc(func() { close(s.gate) }))
 			require.NoError(t, fs.PrefetchObject(context.Background(), ObjectPrefetch{FilePath: "object", Size: r.Size, Ranges: []PrefetchRange{r}}))
 			require.Eventually(t, s.hit.Load, 5*time.Second, time.Millisecond)
-			ctx, cancel := context.WithTimeout(withDownloadStarted(context.Background(), func() {}), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.WithValue(context.Background(), fillCtxKey{}, &cacheFill{}), 5*time.Second)
 			defer cancel()
 			vec := &IOVector{FilePath: "object", Policy: policy | SkipMemoryCache, Entries: []IOEntry{{Offset: r.Offset, Size: r.Size}}}
 			defer vec.Release()
@@ -6627,8 +6625,9 @@ func TestFileDownloadPicksLiveObject(t *testing.T) {
 	diskPath := d.objectKey("object")
 	tempPath := t.TempDir() + "/download"
 	require.NoError(t, os.WriteFile(tempPath, make([]byte, 64<<10), 0600))
-	object := func(written int64, stopped bool) *filePrefetchObject {
-		p := newFilePrefetchObject(context.Background(), 0, 64<<10)
+	object := func(written int64, stopped bool) *cacheFill {
+		p := &cacheFill{d: d, diskPath: diskPath, end: 64 << 10, pos: -1}
+		p.setContext(context.Background())
 		o := newObjectDownload(tempPath, nil)
 		t.Cleanup(o.retire)
 		o.begin(0)
@@ -6637,26 +6636,26 @@ func TestFileDownloadPicksLiveObject(t *testing.T) {
 		}
 		p.download = o
 		if stopped {
-			p.cancelRead()
+			p.cancel()
 		}
 		return p
 	}
 	slow, fast, stoppedFast := object(0, false), object(64<<10, false), object(64<<10, true)
 	f := &d.prefetchObjects
 	f.mu.Lock()
-	f.registerLocked(diskPath, stoppedFast)
-	f.registerLocked(diskPath, slow)
-	f.registerLocked(diskPath, fast)
+	f.registerLocked(stoppedFast)
+	f.registerLocked(slow)
+	f.registerLocked(fast)
 	f.mu.Unlock()
 	got, _ := d.fileDownload(diskPath, 100, 200)
 	require.Same(t, slow.download, got)
 	f.mu.Lock()
-	f.forgetLocked(diskPath, slow)
+	f.forgetLocked(slow)
 	f.mu.Unlock()
 	got, _ = d.fileDownload(diskPath, 100, 200)
 	require.Same(t, fast.download, got)
 	f.mu.Lock()
-	f.forgetLocked(diskPath, fast)
+	f.forgetLocked(fast)
 	f.mu.Unlock()
 	got, _ = d.fileDownload(diskPath, 100, 200)
 	require.Nil(t, got)
@@ -7064,7 +7063,7 @@ func TestSourcesForTable(t *testing.T) {
 			for _, streams := range []int64{0, 1, fs.diskCache.memoryPrefetchMax + 1} {
 				ctx := context.Background()
 				if download {
-					ctx = withDownloadStarted(ctx, func() {})
+					ctx = context.WithValue(ctx, fillCtxKey{}, &cacheFill{})
 				}
 				vec := &IOVector{FilePath: "object", Policy: p, Entries: []IOEntry{{Size: 1}}}
 				if streams > 0 {
@@ -7121,14 +7120,7 @@ func TestCloseCancelsUnclaimedPrefetchPublication(t *testing.T) {
 				active := slices.Clone(objects.m[d.objectKey("object")])
 				objects.mu.Unlock()
 				require.Len(t, active, 1)
-				switch flight := active[0].(type) {
-				case *memoryPrefetchObject:
-					canceled = flight.ctx.Done()
-				case *filePrefetchObject:
-					canceled = flight.ctx.Done()
-				default:
-					t.Fatalf("unexpected range owner %T", flight)
-				}
+				canceled = active[0].ctx.Done()
 			}
 
 			closed := make(chan struct{})
@@ -7361,17 +7353,10 @@ func TestExactReadsShareLargeRange(t *testing.T) {
 				defer objects.mu.Unlock()
 				for _, object := range objects.m[fs.diskCache.objectKey("object")] {
 					var waiters int
-					switch flight := object.(type) {
-					case *memoryPrefetchObject:
-						flight.mu.Lock()
-						waiters = len(flight.waiters)
-						flight.mu.Unlock()
-					case *filePrefetchObject:
-						if download := flight.joinableDownload(); download != nil {
-							download.mu.Lock()
-							waiters = len(download.waiters)
-							download.mu.Unlock()
-						}
+					if download := object.joinableDownload(); download != nil {
+						download.mu.Lock()
+						waiters = len(download.waiters)
+						download.mu.Unlock()
 					}
 					if waiters == 2 {
 						return true

@@ -1553,7 +1553,7 @@ func TestIndexObjectPrefetchFillsIndexFileCache(t *testing.T) {
 	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: int64(len(data))}))
 	f := &fs.diskCache.prefetchObjects
 	f.mu.Lock()
-	req := f.fills[fillKey{diskPath: fs.diskCache.objectKey("object"), index: true}][0].req
+	req := f.m[fs.diskCache.objectKey("object")][0].req
 	f.mu.Unlock()
 	require.True(t, req.indexObject)
 	fs.diskCache.dropFills("object")
@@ -2584,7 +2584,7 @@ type reviewIndexJoinContext struct {
 }
 
 func (c reviewIndexJoinContext) Value(key any) any {
-	if _, ok := key.(downloadStartedKey); ok {
+	if _, ok := key.(fillCtxKey); ok {
 		c.beforeJoin()
 	}
 	return c.Context.Value(key)
@@ -2624,7 +2624,7 @@ func TestIndexReadSeesConcurrentPublication(t *testing.T) {
 			unblockJoin := sync.OnceFunc(func() { close(resumeJoin) })
 			var readCtx context.Context = ctx
 			if overlap {
-				// With disk reads skipped, the first lookup of downloadStartedKey is
+				// With disk reads skipped, the first lookup of fillCtxKey is
 				// inside readIndexDownload, after the index-file lookup missed.
 				readCtx = reviewIndexJoinContext{Context: ctx, beforeJoin: sync.OnceFunc(func() {
 					close(atJoin)

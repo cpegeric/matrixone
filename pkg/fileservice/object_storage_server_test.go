@@ -329,12 +329,6 @@ func TestServerRetryWaitsWithoutRoom(t *testing.T) {
 	require.Zero(t, heldRoom(g))
 }
 
-// readFlight reads the range of fl through open.
-func readFlight(fl *memoryPrefetchObject, open func(ctx context.Context, start, end int64) (io.ReadCloser, error)) error {
-	fl.src = openerSource(open)
-	return fl.read(context.Background())
-}
-
 // getterStorage is object storage whose reads open their range through its function.
 type getterStorage struct {
 	ObjectStorage
@@ -1771,7 +1765,7 @@ func TestPrefetchBufferCountedUntilLastRelease(t *testing.T) {
 		n := 0
 		for _, objects := range f.m {
 			for _, o := range objects {
-				if _, ok := o.(*memoryPrefetchObject); ok {
+				if d := o.joinableDownload(); d != nil && d.memory {
 					n++
 				}
 			}

@@ -671,7 +671,7 @@ func startTestBlockedRead(t *testing.T, pw *io.PipeWriter, w blockingWriter, fn 
 	return read, release
 }
 
-func acquireCapture(t *testing.T, read *fullObjectDiskCacheReader, download *objectDownload) (*os.File, func(bool)) {
+func acquireCapture(t *testing.T, read *fullObjectDiskCacheReader, download *objectDownload) (io.ReaderAt, func(bool)) {
 	t.Helper()
 	file, ok := download.acquire()
 	require.True(t, ok)
@@ -700,7 +700,7 @@ func (d *DiskCache) download(diskPath string) *objectDownload {
 }
 
 // registerWholeFill registers o as the download of a fill of the whole object at diskPath.
-func registerWholeFill(d *DiskCache, diskPath string, o *objectDownload) *filePrefetchObject {
+func registerWholeFill(d *DiskCache, diskPath string, o *objectDownload) *cacheFill {
 	p := d.newContentFill(diskPath)
 	d.startDownload(p, o)
 	p.started(o)

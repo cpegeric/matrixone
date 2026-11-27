@@ -974,7 +974,7 @@ func (d *DiskCache) writeFileTo(
 	}()
 	// A whole-object download is a FilePrefetchObject, not registered after a delete of
 	// the object since the mark of ctx.
-	var whole *filePrefetchObject
+	var whole *cacheFill
 	if fill == storageFill {
 		_, index := target.(indexFillTarget)
 		whole = d.newWholeObject(ctx, diskPath, index)
@@ -997,14 +997,16 @@ func (d *DiskCache) writeFileTo(
 		if ok, err = whole.admitWhole(); !ok {
 			return false, err
 		}
-		ctx = whole.ctx
+		if fillOf(ctx) != whole {
+			ctx = whole.ctx
+		}
 		bounds, lead = whole.splitParts(objectSize)
 		if t, ok := target.(*wholeFillTarget); ok && whole.end != math.MaxInt64 {
 			t.sizeAt(whole.end)
 		}
 	}
 
-	p, _ := ctx.Value(fileDownloadKey{}).(*filePrefetchObject)
+	p := fillOf(ctx)
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -1034,7 +1036,6 @@ func (d *DiskCache) writeFileTo(
 		d.startDownload(own, download)
 		w.finish = func() { d.finishDownload(download, own) }
 		own.started(download)
-		downloadStarted(ctx)
 		dst = downloadProgressWriter{w: f, download: download}
 	}
 
@@ -1053,7 +1054,7 @@ func (d *DiskCache) writeFileTo(
 		target.noteWritten(n)
 	}
 	if whole != nil {
-		mark = readMark{object: diskPath, deletes: *whole.needs.deletes, set: true}
+		mark = readMark{object: diskPath, deletes: *whole.deletes, set: true}
 	}
 	object := mark.object
 	if t, ok := target.(indexFillTarget); ok {

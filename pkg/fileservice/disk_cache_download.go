@@ -15,6 +15,7 @@
 package fileservice
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"errors"
@@ -29,19 +30,27 @@ import (
 	metric "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 )
 
-// objectDownload is a whole-object file being written to the disk cache. Readers of the
-// object read the bytes already written through the download's own handle on the file,
-// which keeps them readable after the file is published or removed.
+// objectDownload is the bytes a fill writes: into its cache file, or into buf. Readers
+// read the bytes already written through the download's own handle on the file, which
+// keeps them readable after the file is published or removed, or from buf, which is kept
+// until it is retired and no reader holds it.
 type objectDownload struct {
-	mu          sync.Mutex
-	parts       []downloadPart // the ranges of the object written at once, in order
-	began       chan struct{}  // closed once a part began
-	ended       bool           // no more bytes will be written
-	complete    bool           // every byte of the object was written
-	err         error          // the failed read of object storage that ended it, or nil
-	waiters     byteWaiters
-	idle        idleReaders // the readers of the download's source
-	file        *os.File    // closed once the download is retired and no reader holds it
+	mu       sync.Mutex
+	parts    []downloadPart // the ranges of the object written at once, in order
+	began    chan struct{}  // closed once a part began
+	ended    bool           // no more bytes will be written
+	complete bool           // every byte of the object was written
+	err      error          // the failed read of object storage that ended it, or nil
+	waiters  byteWaiters
+	idle     idleReaders // the readers of the download's source
+	file     *os.File    // closed once the download is retired and no reader holds it
+	// buf, when set, holds the bytes instead of file; charge bytes of the memory of class
+	// of server g are freed with it.
+	buf         []byte
+	memory      bool
+	g           *objectStorageServer
+	charge      int64
+	class       requestClass
 	readers     int
 	onReadsDone []func() // eviction accounting deferred until active readers finish
 	retired     bool
@@ -113,21 +122,47 @@ func newObjectDownload(tempPath string, bounds []int64) *objectDownload {
 	return o
 }
 
-// acquire returns the download's file for reading, which the reader gives back with
-// release, or false once the file is closed.
-func (o *objectDownload) acquire() (*os.File, bool) {
+// newBufferDownload returns a download into buf, of charge bytes of the memory of class c
+// of g.
+func newBufferDownload(buf []byte, g *objectStorageServer, charge int64, c requestClass) *objectDownload {
+	return &objectDownload{parts: []downloadPart{{end: int64(len(buf))}}, began: make(chan struct{}), buf: buf, memory: true, g: g, charge: charge, class: c}
+}
+
+// writtenFrom returns the bytes written from off on.
+func (o *objectDownload) writtenFrom(off int64) int64 {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.file == nil || o.retired {
+	return o.availableLocked(off) - off
+}
+
+// acquire returns the download's bytes for reading, which the reader gives back with
+// release, or false once they are released.
+func (o *objectDownload) acquire() (io.ReaderAt, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.retired || o.file == nil && o.buf == nil {
 		return nil, false
 	}
 	o.readers++
+	if o.buf != nil {
+		return bytes.NewReader(o.buf), true
+	}
 	return o.file, true
 }
 
-// with calls fn with the download's file while it holds it, reporting false once the
-// file is closed.
-func (o *objectDownload) with(fn func(*os.File) error) (bool, error) {
+// promote moves the memory of the buffer of o to the foreground.
+func (o *objectDownload) promote() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.charge > 0 && o.class == backgroundRequest {
+		o.g.promoteMemory(o.charge)
+		o.class = foregroundRequest
+	}
+}
+
+// with calls fn with the download's bytes while it holds them, reporting false once they
+// are released.
+func (o *objectDownload) with(fn func(io.ReaderAt) error) (bool, error) {
 	f, ok := o.acquire()
 	if !ok {
 		return false, nil
@@ -181,9 +216,19 @@ func (o *objectDownload) retire() {
 }
 
 func (o *objectDownload) closeIfUnusedLocked() {
-	if o.retired && o.readers == 0 && o.file != nil {
+	if !o.retired || o.readers > 0 {
+		return
+	}
+	if o.file != nil {
 		_ = o.file.Close()
 		o.file = nil
+	}
+	if o.buf != nil {
+		putFlightBuf(o.buf)
+		o.buf = nil
+		if o.charge > 0 {
+			o.g.freeMemory(o.charge, o.class)
+		}
 	}
 }
 
@@ -735,11 +780,11 @@ func copyPart(ctx context.Context, f *os.File, download *objectDownload, src *ob
 
 // startDownload registers p, the fill of the download o, when it is a fill of bytes the
 // write path holds.
-func (d *DiskCache) startDownload(p *filePrefetchObject, o *objectDownload) {
+func (d *DiskCache) startDownload(p *cacheFill, o *objectDownload) {
 	if p.content {
 		f := &d.prefetchObjects
 		f.mu.Lock()
-		f.registerLocked(p.diskPath, p)
+		f.registerLocked(p)
 		f.mu.Unlock()
 	}
 }
@@ -747,7 +792,7 @@ func (d *DiskCache) startDownload(p *filePrefetchObject, o *objectDownload) {
 // finishDownload ends the download o of the fill p, once its file is published or
 // dropped: p is forgotten, and a fill of bytes the write path
 // holds ends. Only the first call takes effect.
-func (d *DiskCache) finishDownload(o *objectDownload, p *filePrefetchObject) {
+func (d *DiskCache) finishDownload(o *objectDownload, p *cacheFill) {
 	o.mu.Lock()
 	finished := o.finished
 	o.finished = true
@@ -757,11 +802,17 @@ func (d *DiskCache) finishDownload(o *objectDownload, p *filePrefetchObject) {
 	}
 	o.end(false)
 	if p != nil {
-		d.forgetFill(p.diskPath, p)
+		f := &d.prefetchObjects
+		f.mu.Lock()
+		f.forgetLocked(p)
+		f.mu.Unlock()
+		p.stopContext()
 		if p.content {
 			close(p.endedCh)
 			p.markReady()
 		}
+		p.retireDownload()
+		return
 	}
 	o.retire()
 }
@@ -780,7 +831,7 @@ func (d *DiskCache) readFromDownload(ctx context.Context, diskPath string, index
 // readDownloadEntry is readFromDownload of entry from the fill p, whose download is o. A
 // read whose bytes are not written yet promotes p and waits for them as long as its
 // context allows; a download that ends without them leaves the read to the caller.
-func (d *DiskCache) readDownloadEntry(ctx context.Context, p *filePrefetchObject, o *objectDownload, entry *IOEntry, vector *IOVector) (downloading, filled bool, err error) {
+func (d *DiskCache) readDownloadEntry(ctx context.Context, p *cacheFill, o *objectDownload, entry *IOEntry, vector *IOVector) (downloading, filled bool, err error) {
 	base := p.start
 	end := entry.Offset + entry.Size
 	if o.writtenTo(entry.Offset-base, end-base) {
@@ -796,7 +847,7 @@ func (d *DiskCache) readDownloadEntry(ctx context.Context, p *filePrefetchObject
 		}
 		metric.FSDiskCacheDownloadReadWaitedCounter.Inc()
 	}
-	held, err := o.with(func(f *os.File) error {
+	held, err := o.with(func(f io.ReaderAt) error {
 		if _, err := d.readEntryFrom(ctx, entry, io.NewSectionReader(f, entry.Offset-base, entry.Size)); err != nil {
 			return err
 		}
@@ -809,14 +860,6 @@ func (d *DiskCache) readDownloadEntry(ctx context.Context, p *filePrefetchObject
 		return false, false, nil
 	}
 	return true, err == nil, err
-}
-
-// promoteObject promotes the fill of o, which a read joins.
-func (d *DiskCache) promoteObject(o prefetchObject) {
-	f := &d.prefetchObjects
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	d.promoteObjectLocked(o)
 }
 
 const (

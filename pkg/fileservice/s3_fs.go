@@ -1827,7 +1827,7 @@ func (s *S3FS) readFullObjectToDiskCacheStreaming(
 			// bytes stay readable whatever the download does next.
 			var admitted admittedDownload
 			var download *objectDownload
-			if fill, ok := ctx.Value(fileDownloadKey{}).(*filePrefetchObject); ok {
+			if fill := fillOf(ctx); fill != nil {
 				download = fill.joinableDownload()
 			}
 			if download != nil {
