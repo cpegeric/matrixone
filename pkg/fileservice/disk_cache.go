@@ -238,7 +238,7 @@ func newDiskCache(
 	prepareEvict := func(path string, _ struct{}, size int64, _ uint64) func() {
 		object := ret.ranges.objectOfFile(path)
 		return func() {
-			ret.pub.queue(object, func() error {
+			ret.pub.queue(object, queuedJob{"evict", path}, func() error {
 				err := ret.removeEvictedFile(path, size)
 				if err != nil {
 					logutil.Error("delete disk cache file",
@@ -324,7 +324,7 @@ func (d *DiskCache) indexLoadedFile(ctx context.Context, objectPath, diskPath st
 // objectPath, found at startup, while it is not indexed and is still the file info
 // describes.
 func (d *DiskCache) removeLoadedFile(objectPath, diskPath string, info fs.FileInfo) {
-	d.pub.queue(objectPath, func() error {
+	d.pub.queue(objectPath, queuedJob{"unload", diskPath}, func() error {
 		if !d.cache.Contains(diskPath) && sameFileAt(info, diskPath) {
 			_ = os.Remove(diskPath)
 			d.files.changed(diskPath)
@@ -353,7 +353,7 @@ func (d *DiskCache) reindexRead(ctx context.Context, diskPath, objectPath string
 	if err != nil {
 		return false, err
 	}
-	d.pub.queue(objectPath, func() error {
+	d.pub.queue(objectPath, queuedJob{"reindex", diskPath}, func() error {
 		if !d.cache.Contains(diskPath) && !d.deletes.since(objectPath, 0) && sameFileAt(stat, diskPath) {
 			d.cache.Set(context.Background(), diskPath, struct{}{}, fileSize(stat))
 		}

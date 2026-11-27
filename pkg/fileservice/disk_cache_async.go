@@ -54,6 +54,8 @@ type publication struct {
 	// before it, and a publication after every removal of its object taken before it.
 	object  string
 	removal bool
+	// job names a removal queued without waiting.
+	job queuedJob
 	// publish makes it durable, renames it into place and indexes it, and reports whether
 	// it did.
 	publish func(ctx context.Context) (bool, error)
@@ -108,10 +110,16 @@ type publisher struct {
 		// the order they were taken; finished is closed and replaced when one is done.
 		taken    map[string][]*publication
 		finished chan struct{}
-		// queued holds the removals queued without waiting, taken before jobs.
-		queued []*publication
+		// queued holds the removals queued without waiting, taken before jobs; waiting
+		// holds them by job, one of each.
+		queued  []*publication
+		waiting map[queuedJob]*publication
 	}
 }
+
+// queuedJob names a removal queued without waiting: its kind ("evict", "reindex",
+// "repair" or "unload") and the path it changes.
+type queuedJob struct{ kind, path string }
 
 type diskCacheWriteFailureState struct {
 	failed          atomic.Bool
@@ -152,6 +160,7 @@ func (p *publisher) init(d *DiskCache) {
 	p.mu.idle = make(chan struct{})
 	close(p.mu.idle)
 	p.mu.taken = make(map[string][]*publication)
+	p.mu.waiting = make(map[queuedJob]*publication)
 	p.mu.finished = make(chan struct{})
 	p.taking = make(chan struct{}, 1)
 	p.taking <- struct{}{}
@@ -409,15 +418,23 @@ func (p *publisher) takeQueued() *publication {
 	}
 	pub := p.mu.queued[0]
 	p.mu.queued = p.mu.queued[1:]
+	delete(p.mu.waiting, pub.job)
 	p.mu.taken[pub.object] = append(p.mu.taken[pub.object], pub)
 	return pub
 }
 
-// queue has a worker run remove as a removal of object, without waiting for it. Nothing
-// is queued once the publisher is closed.
-func (p *publisher) queue(object string, remove func() error) {
+// queue has a worker run remove as job, a removal of object, without waiting for it. A
+// job queued and not yet taken is replaced by the later one in its place. Nothing is
+// queued once the publisher is closed.
+func (p *publisher) queue(object string, job queuedJob, remove func() error) {
+	publish := func(context.Context) (bool, error) { return true, remove() }
 	p.mu.Lock()
 	if p.mu.closed {
+		p.mu.Unlock()
+		return
+	}
+	if pub, ok := p.mu.waiting[job]; ok {
+		pub.object, pub.publish = object, publish
 		p.mu.Unlock()
 		return
 	}
@@ -425,13 +442,16 @@ func (p *publisher) queue(object string, remove func() error) {
 		p.mu.idle = make(chan struct{})
 	}
 	p.mu.pending++
-	p.mu.queued = append(p.mu.queued, &publication{
+	pub := &publication{
 		diskPath: object,
 		object:   object,
 		removal:  true,
-		publish:  func(context.Context) (bool, error) { return true, remove() },
+		job:      job,
+		publish:  publish,
 		release:  func() error { return nil },
-	})
+	}
+	p.mu.queued = append(p.mu.queued, pub)
+	p.mu.waiting[job] = pub
 	p.mu.Unlock()
 	p.startOnce.Do(p.start)
 	select {

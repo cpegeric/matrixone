@@ -1281,6 +1281,46 @@ func TestEvictionRemovesFileOnPublisher(t *testing.T) {
 	}
 }
 
+// Reads of a file the cache does not hold, while the publisher is busy, queue one job to
+// index it, however many read it; once the job runs the file is indexed. The control reads
+// it once.
+func TestReadsOfUnindexedFileQueueOneJob(t *testing.T) {
+	for _, reads := range []int{100, 1} {
+		t.Run(map[int]string{100: "many", 1: "control"}[reads], func(t *testing.T) {
+			ctx := context.Background()
+			fs, storage, data := newPrefetchRangeFS(t, 0, 64<<10)
+			d := fs.diskCache
+			<-d.load.done
+			path := d.pathForIOEntry("object", IOEntry{Offset: 200, Size: 10})
+			require.NoError(t, os.MkdirAll(filepath.Dir(path), 0755))
+			require.NoError(t, os.WriteFile(path, data[200:210], 0644))
+			release := holdObject(t, fs, 20000, 10)
+			before := storage.reads.Load()
+			for range reads {
+				require.Equal(t, data[200:210], readRangeOfNoWait(t, fs, 200, 10))
+			}
+			require.Equal(t, before, storage.reads.Load(), "the reads read the file")
+			d.pub.mu.Lock()
+			queued := len(d.pub.mu.queued)
+			d.pub.mu.Unlock()
+			require.Equal(t, 1, queued)
+			release()
+			d.Flush(ctx)
+			require.True(t, d.cache.Contains(path))
+		})
+	}
+}
+
+// readRangeOfNoWait reads size bytes at offset of "object" through fs.
+func readRangeOfNoWait(t *testing.T, fs *S3FS, offset, size int64) []byte {
+	t.Helper()
+	vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache,
+		Entries: []IOEntry{{Offset: offset, Size: size}}}
+	defer vec.Release()
+	require.NoError(t, fs.Read(context.Background(), vec))
+	return slices.Clone(vec.Entries[0].Data)
+}
+
 // A cached range found short by a read is removed by the publisher, after the publications
 // of its object taken before, and the range is cached again; the control removes it once
 // the publisher is idle.

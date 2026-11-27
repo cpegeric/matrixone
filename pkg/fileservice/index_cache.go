@@ -698,7 +698,7 @@ func (c *IndexFileCache) dropBroken(ctx context.Context, name string, missing st
 		_, err := os.Stat(filepath.Join(diskPath, missing))
 		return missing == "" || os.IsNotExist(err)
 	}
-	c.disk.pub.queue(diskPath, func() error {
+	c.disk.pub.queue(diskPath, queuedJob{"repair", diskPath}, func() error {
 		if !broken() {
 			return nil
 		}
@@ -1190,7 +1190,7 @@ func (d *DiskCache) openDir(ctx context.Context, name string, diskPath string, f
 			closeOpened()
 			return nil, err
 		}
-		d.pub.queue(diskPath, func() error {
+		d.pub.queue(diskPath, queuedJob{"reindex", diskPath}, func() error {
 			if size, err := cacheDirSize(diskPath); err == nil && !d.cache.Contains(diskPath) && sameFileAt(dir, diskPath) {
 				d.cache.Set(context.Background(), diskPath, struct{}{}, size)
 			}

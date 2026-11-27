@@ -1097,7 +1097,7 @@ func (d *DiskCache) dropCachedRange(key, diskPath string, f *os.File) {
 	if err != nil {
 		return
 	}
-	d.pub.queue(key, func() error {
+	d.pub.queue(key, queuedJob{"repair", diskPath}, func() error {
 		if !sameFileAt(info, diskPath) {
 			return nil
 		}
