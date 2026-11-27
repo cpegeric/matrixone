@@ -27,8 +27,65 @@ import (
 
 	btoml "github.com/BurntSushi/toml"
 	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/buffer"
+	"go.uber.org/zap/zapcore"
+	"go.uber.org/zap/zaptest/observer"
 )
+
+// Settings the redesigned cache does not use are accepted from a config and ignored, with
+// one log each when a file service starts, and the file service caches as without them.
+// The control sets none and logs none.
+func TestIgnoredCacheSettingsAreLogged(t *testing.T) {
+	for _, set := range []bool{true, false} {
+		t.Run(map[bool]string{true: "set", false: "control"}[set], func(t *testing.T) {
+			ctx := context.Background()
+			text := "disk-capacity = \"64MiB\"\nmemory-capacity = \"1B\"\n"
+			if set {
+				text += "disk-download-max-extra-wait = \"200ms\"\ndisk-prefetch-object-split-downloads = 3\n"
+			}
+			var config CacheConfig
+			_, err := btoml.Decode(text, &config)
+			require.NoError(t, err)
+			config.DiskPath = ptrTo(t.TempDir())
+			const event = "fileservice: setting ignored"
+			core, logs := observer.New(zap.DebugLevel)
+			previous := logutil.GetReportZapFunc()
+			logutil.SetLogReporter(&logutil.TraceReporter{
+				ReportZap: func(enc zapcore.Encoder, entry zapcore.Entry, fields []zapcore.Field) (*buffer.Buffer, error) {
+					if entry.Message == event {
+						_ = core.Write(entry, fields)
+					}
+					return previous(enc, entry, fields)
+				},
+			})
+			defer logutil.SetLogReporter(&logutil.TraceReporter{ReportZap: previous})
+			fs, err := NewS3FS(ctx, ObjectStorageArguments{Name: "ignored", Endpoint: "disk", Bucket: t.TempDir()}, config, nil, false, false)
+			require.NoError(t, err)
+			defer fs.Close(ctx)
+			entries := logs.FilterMessage(event).All()
+			settings := make([]string, 0, len(entries))
+			for _, e := range entries {
+				settings = append(settings, e.ContextMap()["setting"].(string))
+			}
+			if set {
+				require.ElementsMatch(t, []string{"disk-download-max-extra-wait", "disk-prefetch-object-split-downloads"}, settings)
+			} else {
+				require.Empty(t, settings)
+			}
+			data := bytes.Repeat([]byte("x"), 4096)
+			require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: 4096, Data: data}}}))
+			vec := &IOVector{FilePath: "object", Policy: SkipMemoryCache, Entries: []IOEntry{{Offset: 10, Size: 10}}}
+			require.NoError(t, fs.Read(ctx, vec))
+			require.Equal(t, data[10:20], vec.Entries[0].Data)
+			vec.Release()
+			fs.diskCache.Flush(ctx)
+			require.NotEmpty(t, fs.diskCache.ranges.of(fs.diskCache.objectKey("object")), "the disk cache caches")
+		})
+	}
+}
 
 // downloading starts a whole-object fill of "obj" whose source is a pipe the test writes.
 func downloading(t *testing.T) (*DiskCache, *io.PipeWriter, chan error) {
@@ -403,14 +460,6 @@ func TestDiskCacheReadJoinsDownloadFarBehind(t *testing.T) {
 	require.NoError(t, <-filled)
 }
 
-// A configuration that still sets the removed disk-download-max-extra-wait loads.
-func TestDiskDownloadMaxExtraWaitRemovedConfigLoads(t *testing.T) {
-	var config CacheConfig
-	_, err := btoml.Decode("disk-download-max-extra-wait = \"7ms\"\ndisk-path = \"cache\"\n", &config)
-	require.NoError(t, err)
-	require.Equal(t, "cache", *config.DiskPath)
-}
-
 // Bytes a read takes from a download count as read from the cached file once the
 // download publishes it.
 func TestDiskCacheDownloadReadsCountAsCachedFileReads(t *testing.T) {
@@ -679,7 +728,7 @@ func (d *DiskCache) download(diskPath string) *objectDownload {
 // registerWholeFill registers o as the download of a fill of the whole object at diskPath.
 func registerWholeFill(d *DiskCache, diskPath string, o *objectDownload) *filePrefetchObject {
 	p := d.newContentFill(diskPath)
-	d.startDownload(p, o, false)
+	d.startDownload(p, o)
 	p.started(o)
 	return p
 }

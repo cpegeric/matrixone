@@ -51,9 +51,10 @@ type CacheConfig struct {
 	// DiskPrefetchObjectSplitMin is the size of the smallest object download or prefetch
 	// run that is split. Default DefaultDiskPrefetchObjectSplitMin.
 	DiskPrefetchObjectSplitMin *toml.ByteSize `toml:"disk-prefetch-object-split-min"`
-	// DiskPrefetchObjectSplitDownloads is the most downloads in flight with which another
-	// download is split. Default DefaultDiskPrefetchObjectSplitDownloads.
-	DiskPrefetchObjectSplitDownloads *int `toml:"disk-prefetch-object-split-downloads"`
+	// DiskPrefetchObjectSplitDownloads and DiskDownloadMaxExtraWait are accepted and
+	// ignored.
+	DiskPrefetchObjectSplitDownloads *int           `toml:"disk-prefetch-object-split-downloads"`
+	DiskDownloadMaxExtraWait         *toml.Duration `toml:"disk-download-max-extra-wait"`
 	// DiskPrefetchMemoryMax is the most bytes a prefetch downloads into memory, as a
 	// MemoryPrefetchObject; a larger one downloads to a file, as a FilePrefetchObject.
 	// Default DefaultDiskPrefetchMemoryMax, at least minDiskPrefetchMemoryMax.
@@ -120,6 +121,14 @@ func newFileServiceCaches(
 			caches.close(context.WithoutCancel(ctx))
 		}
 	}()
+	for setting, set := range map[string]bool{
+		"disk-prefetch-object-split-downloads": config.DiskPrefetchObjectSplitDownloads != nil,
+		"disk-download-max-extra-wait":         config.DiskDownloadMaxExtraWait != nil,
+	} {
+		if set {
+			logutil.Warn("fileservice: setting ignored", zap.String("name", name), zap.String("setting", setting))
+		}
+	}
 
 	if config.RemoteCacheEnabled && config.QueryClient == nil {
 		return fileServiceCaches{}, moerr.NewInternalError(ctx, "query client is nil")
@@ -238,9 +247,6 @@ const (
 	DefaultDiskPrefetchObjectSplitMin = 16 << 20
 	// diskPrefetchObjectSplitMax is the most ranges a whole-object download reads at once.
 	diskPrefetchObjectSplitMax = 4
-	// DefaultDiskPrefetchObjectSplitDownloads is the default
-	// DiskPrefetchObjectSplitDownloads.
-	DefaultDiskPrefetchObjectSplitDownloads = 8
 	// DefaultDiskPrefetchMemoryMax is the default DiskPrefetchMemoryMax.
 	DefaultDiskPrefetchMemoryMax = 32 << 20
 	// minDiskPrefetchMemoryMax is the least DiskPrefetchMemoryMax.
@@ -269,15 +275,12 @@ func (c *CacheConfig) diskPrefetchMemoryMax() int64 {
 }
 
 func (c *CacheConfig) diskObjectSplit() objectSplitConfig {
-	split := objectSplitConfig{parts: DefaultDiskPrefetchObjectSplit, min: DefaultDiskPrefetchObjectSplitMin, downloads: DefaultDiskPrefetchObjectSplitDownloads}
+	split := objectSplitConfig{parts: DefaultDiskPrefetchObjectSplit, min: DefaultDiskPrefetchObjectSplitMin}
 	if c.DiskPrefetchObjectSplit != nil {
 		split.parts = min(max(*c.DiskPrefetchObjectSplit, 1), diskPrefetchObjectSplitMax)
 	}
 	if c.DiskPrefetchObjectSplitMin != nil {
 		split.min = int64(*c.DiskPrefetchObjectSplitMin)
-	}
-	if c.DiskPrefetchObjectSplitDownloads != nil && *c.DiskPrefetchObjectSplitDownloads > 0 {
-		split.downloads = *c.DiskPrefetchObjectSplitDownloads
 	}
 	return split
 }

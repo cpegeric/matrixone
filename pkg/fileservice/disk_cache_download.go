@@ -590,9 +590,6 @@ type objectSplitConfig struct {
 	// parts is how many ranges the download of an object of at least min bytes reads.
 	parts int
 	min   int64
-	// downloads is the most downloads in flight with which another is split; 0 is
-	// DefaultDiskPrefetchObjectSplitDownloads.
-	downloads int
 }
 
 // objectLayout returns the size of an object to download, and the offset, or 0, a read
@@ -736,32 +733,9 @@ func copyPart(ctx context.Context, f *os.File, download *objectDownload, src *ob
 	return n, nil
 }
 
-// downloadCount counts the downloads of file fills in flight.
-type downloadCount struct {
-	n atomic.Int64
-}
-
-// take counts a download about to start while fewer than limit are counted, so a decision
-// bounded by the downloads in flight and the start are one step.
-func (c *downloadCount) take(limit int64) bool {
-	for {
-		n := c.n.Load()
-		if n >= limit {
-			return false
-		}
-		if c.n.CompareAndSwap(n, n+1) {
-			return true
-		}
-	}
-}
-
-// startDownload counts o, the download of the fill p, in flight, and registers p when it
-// is a fill of bytes the write path holds; taken is set when downloadCount.take counted it
-// already.
-func (d *DiskCache) startDownload(p *filePrefetchObject, o *objectDownload, taken bool) {
-	if !taken {
-		d.prefetchObjects.downloads.n.Add(1)
-	}
+// startDownload registers p, the fill of the download o, when it is a fill of bytes the
+// write path holds.
+func (d *DiskCache) startDownload(p *filePrefetchObject, o *objectDownload) {
 	if p.content {
 		f := &d.prefetchObjects
 		f.mu.Lock()
@@ -771,7 +745,7 @@ func (d *DiskCache) startDownload(p *filePrefetchObject, o *objectDownload, take
 }
 
 // finishDownload ends the download o of the fill p, once its file is published or
-// dropped: o no longer counts in flight, p is forgotten, and a fill of bytes the write path
+// dropped: p is forgotten, and a fill of bytes the write path
 // holds ends. Only the first call takes effect.
 func (d *DiskCache) finishDownload(o *objectDownload, p *filePrefetchObject) {
 	o.mu.Lock()
@@ -782,7 +756,6 @@ func (d *DiskCache) finishDownload(o *objectDownload, p *filePrefetchObject) {
 		return
 	}
 	o.end(false)
-	d.prefetchObjects.downloads.n.Add(-1)
 	if p != nil {
 		d.forgetFill(p.diskPath, p)
 		if p.content {

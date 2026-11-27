@@ -16,7 +16,6 @@ package fileservice
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"errors"
 	"io"
@@ -1384,8 +1383,6 @@ type prefetchObjects struct {
 	mu     sync.Mutex
 	m      map[string][]prefetchObject
 	closed bool
-	// downloads counts the downloads of file fills in flight.
-	downloads downloadCount
 	// waiting are the prefetch objects of runs waiting for their resources.
 	waiting map[waitingObject]struct{}
 	// waitingFills are the fills waiting to start, in order; fills are the fills waiting
@@ -1627,23 +1624,18 @@ func (d *DiskCache) newContentFill(diskPath string) *filePrefetchObject {
 
 // splitParts sets the end of p, the fill of a whole object, at the object's size layout
 // gives, and returns the bounds of the parts it reads at once and the part a read needs
-// first, or nil to read it as one range. It splits only when fewer than the limit of
-// downloads are in flight once it is counted; taken reports that it is counted.
-func (p *filePrefetchObject) splitParts(layout objectLayout) (bounds []int64, lead int, taken bool) {
+// first, or nil to read it as one range.
+func (p *filePrefetchObject) splitParts(layout objectLayout) (bounds []int64, lead int) {
 	if layout == nil {
-		return nil, 0, false
+		return nil, 0
 	}
 	size, splitAt, err := layout(p.ctx)
 	if err != nil {
-		return nil, 0, false
+		return nil, 0
 	}
 	p.endAt(size)
-	d := p.d
-	b := d.objectSplit.bounds(size, splitAt)
-	if b == nil || !d.prefetchObjects.downloads.take(int64(cmp.Or(d.objectSplit.downloads, DefaultDiskPrefetchObjectSplitDownloads))) {
-		return nil, 0, false
-	}
-	return b, leadPart(b, splitAt), true
+	b := p.d.objectSplit.bounds(size, splitAt)
+	return b, leadPart(b, splitAt)
 }
 
 // wholeFill returns the registered fill of the whole object at diskPath whose download

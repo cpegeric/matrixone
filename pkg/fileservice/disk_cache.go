@@ -135,21 +135,7 @@ func NewDiskCache(
 	cacheDataAllocator CacheDataAllocator,
 	name string,
 ) (ret *DiskCache, err error) {
-	return newDiskCacheWithMetricScope(ctx, path, capacity, perfCounterSets, asyncLoad, cacheDataAllocator, name, "")
-}
-
-func newDiskCacheWithMetricScope(
-	ctx context.Context,
-	path string,
-	capacity fscache.CapacityFunc,
-	perfCounterSets []*perfcounter.CounterSet,
-	asyncLoad bool,
-	cacheDataAllocator CacheDataAllocator,
-	name string,
-	metricScope string,
-) (ret *DiskCache, err error) {
-	return newDiskCache(ctx, path, capacity, perfCounterSets, asyncLoad, cacheDataAllocator, name, metricScope,
-		diskCacheOptions{})
+	return newDiskCache(ctx, path, capacity, perfCounterSets, asyncLoad, cacheDataAllocator, name, "", diskCacheOptions{})
 }
 
 type diskCacheOptions struct {
@@ -1005,23 +991,16 @@ func (d *DiskCache) writeFileTo(
 	defer func() { d.endFileWrite(diskPath, &w, &err) }()
 	// Each part of a whole-object download is its own request.
 	var bounds []int64
-	lead, taken := 0, false
+	lead := 0
 	if fill == storageFill {
 		var ok bool
 		if ok, err = whole.admitWhole(); !ok {
 			return false, err
 		}
 		ctx = whole.ctx
-		bounds, lead, taken = whole.splitParts(objectSize)
+		bounds, lead = whole.splitParts(objectSize)
 		if t, ok := target.(*wholeFillTarget); ok && whole.end != math.MaxInt64 {
 			t.sizeAt(whole.end)
-		}
-		if taken {
-			defer func() {
-				if taken {
-					d.prefetchObjects.downloads.n.Add(-1)
-				}
-			}()
 		}
 	}
 
@@ -1052,8 +1031,7 @@ func (d *DiskCache) writeFileTo(
 		if t, ok := target.(*wholeFillTarget); ok {
 			t.download = download
 		}
-		d.startDownload(own, download, taken)
-		taken = false
+		d.startDownload(own, download)
 		w.finish = func() { d.finishDownload(download, own) }
 		own.started(download)
 		downloadStarted(ctx)

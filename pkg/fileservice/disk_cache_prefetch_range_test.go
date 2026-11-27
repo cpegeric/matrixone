@@ -978,19 +978,45 @@ func TestS3FSObjectSplitSkipsSmallObjects(t *testing.T) {
 	require.Empty(t, storage.starts, "an open-ended read of the object")
 }
 
-// With the most downloads in flight that a split allows, a large object downloads as one
-// range.
-func TestS3FSObjectSplitSkipsSharedLink(t *testing.T) {
-	fs, storage, data := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 128 << 10}, 300<<10)
-	d := fs.diskCache
-	for i := 0; i < DefaultDiskPrefetchObjectSplitDownloads; i++ {
-		d.prefetchObjects.downloads.n.Add(1)
+// Every whole-object download of a large object splits, however many downloads are in
+// flight: nine held at once read two parts each. The control downloads one.
+func TestS3FSObjectSplitWithManyDownloads(t *testing.T) {
+	for _, n := range []int{9, 1} {
+		t.Run(map[int]string{9: "many", 1: "control"}[n], func(t *testing.T) {
+			const size = 300 << 10
+			ctx := context.Background()
+			fs, _, data := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 128 << 10}, size)
+			d := fs.diskCache
+			<-d.load.done
+			names := make([]string, n)
+			for i := range names {
+				names[i] = fmt.Sprintf("o%d", i)
+				require.NoError(t, fs.Write(ctx, IOVector{FilePath: names[i], Policy: SkipAllCache,
+					Entries: []IOEntry{{Size: size, Data: data}}}))
+				d.prefetched.store(d.objectKey(names[i]), size)
+			}
+			storage := newBlackBoxStorage(fs.server.raw, func(string, int64) bool { return true })
+			fs.server.raw = storage
+			done := make(chan error, n)
+			for _, name := range names {
+				go func() { done <- fs.PrefetchFile(ctx, name) }()
+			}
+			opens := func() int {
+				total := 0
+				for _, name := range names {
+					_, _, c := storage.counts(fs.pathToKey(name))
+					total += c
+				}
+				return total
+			}
+			require.Eventually(t, func() bool { return opens() == 2*n }, diskCacheLifecycleTestTimeout, time.Millisecond)
+			close(storage.gate)
+			for range names {
+				require.NoError(t, <-done)
+			}
+			require.Equal(t, 2*n, opens())
+		})
 	}
-	got, err := readFullObjectOf(fs, 100, 10)
-	require.NoError(t, err)
-	require.Equal(t, data[100:110], got)
-	require.Equal(t, int64(1), storage.reads.Load())
-	require.Empty(t, storage.starts, "an open-ended read of the object")
 }
 
 // A download of an object no prefetch told the size of reads it as one range, and never
@@ -1081,9 +1107,9 @@ func TestObjectSplitBounds(t *testing.T) {
 }
 
 func TestDiskObjectSplitConfig(t *testing.T) {
-	require.Equal(t, objectSplitConfig{parts: 2, min: 16 << 20, downloads: 8}, (&CacheConfig{}).diskObjectSplit())
-	require.Equal(t, objectSplitConfig{parts: 1, min: 16 << 20, downloads: 8}, (&CacheConfig{DiskPrefetchObjectSplit: ptrTo(0)}).diskObjectSplit())
-	require.Equal(t, objectSplitConfig{parts: 4, min: 1 << 20, downloads: 3}, (&CacheConfig{
+	require.Equal(t, objectSplitConfig{parts: 2, min: 16 << 20}, (&CacheConfig{}).diskObjectSplit())
+	require.Equal(t, objectSplitConfig{parts: 1, min: 16 << 20}, (&CacheConfig{DiskPrefetchObjectSplit: ptrTo(0)}).diskObjectSplit())
+	require.Equal(t, objectSplitConfig{parts: 4, min: 1 << 20}, (&CacheConfig{
 		DiskPrefetchObjectSplit:          ptrTo(9),
 		DiskPrefetchObjectSplitMin:       ptrTo[toml.ByteSize](1 << 20),
 		DiskPrefetchObjectSplitDownloads: ptrTo(3),
