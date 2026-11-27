@@ -147,51 +147,34 @@ func requireReturns(t *testing.T, done <-chan downloadContractRead) []byte {
 
 // The read that starts a download returns once its own bytes are written, other reads of
 // written bytes take them from the download, a read of bytes not yet written waits for
-// them, and the object is fetched from storage once.
+// them without reading its range, and the object is fetched from storage once.
 func TestDesignDownloadFetchedOnce(t *testing.T) {
-	fs, storage, data := newDownloadContractFS(t)
+	for _, gateAt := range []int64{1 << 20, 128 << 10} {
+		fs, storage, data := newDownloadContractFS(t)
+		storage.gateAt = gateAt
 
-	leader := requireReturns(t, storage.readAsync(fs, 1024, 4))
-	require.Equal(t, data[1024:1028], leader, "the first reader returned before the download finished")
-	diskPath := fs.diskCache.objectKey("object")
-	require.NotNil(t, fs.diskCache.download(diskPath), "the download continues in the background")
+		leader := requireReturns(t, storage.readAsync(fs, 1024, 4))
+		require.Equal(t, data[1024:1028], leader, "the first reader returned before the download finished")
+		diskPath := fs.diskCache.objectKey("object")
+		require.NotNil(t, fs.diskCache.download(diskPath), "the download continues in the background")
 
-	written := requireReturns(t, storage.readAsync(fs, 4096, 13))
-	require.Equal(t, data[4096:4109], written)
+		written := requireReturns(t, storage.readAsync(fs, 4096, 13))
+		require.Equal(t, data[4096:4109], written)
+		ranges := storage.ranges.Load()
 
-	done := storage.readAsync(fs, 6<<20, 17)
-	select {
-	case result := <-done:
-		t.Fatalf("a read of bytes not yet written returned before they were: %v", result.err)
-	case <-time.After(50 * time.Millisecond):
+		done := storage.readAsync(fs, 6<<20, 17)
+		select {
+		case result := <-done:
+			t.Fatalf("a read of bytes not yet written returned before they were: %v", result.err)
+		case <-time.After(50 * time.Millisecond):
+		}
+		require.Equal(t, ranges, storage.ranges.Load(), "the read fetched no range")
+		close(storage.release)
+		pending := requireReturns(t, done)
+		require.Equal(t, data[6<<20:6<<20+17], pending)
+
+		fs.FlushCache(context.Background())
+		require.Equal(t, int64(1), storage.opens.Load(), "the object was fetched from storage once")
+		require.FileExists(t, fs.diskCache.wholePath("object", int64(len(data))))
 	}
-	close(storage.release)
-	pending := requireReturns(t, done)
-	require.Equal(t, data[6<<20:6<<20+17], pending)
-
-	fs.FlushCache(context.Background())
-	require.Equal(t, int64(1), storage.opens.Load(), "the object was fetched from storage once")
-	require.FileExists(t, fs.diskCache.wholePath("object", int64(len(data))))
-}
-
-// A read far behind a download stalled after its first bytes waits for it instead of
-// reading its range, and gets the right bytes once the download goes on.
-func TestDesignDownloadFarBehindWaits(t *testing.T) {
-	fs, storage, data := newDownloadContractFS(t)
-	storage.gateAt = 128 << 10
-
-	requireReturns(t, storage.readAsync(fs, 1024, 4))
-	ranges := storage.ranges.Load()
-
-	done := storage.readAsync(fs, 6<<20, 17)
-	select {
-	case result := <-done:
-		t.Fatalf("a read far behind the download returned before its bytes were written: %v", result.err)
-	case <-time.After(50 * time.Millisecond):
-	}
-	require.Equal(t, ranges, storage.ranges.Load(), "the read fetched no range")
-	close(storage.release)
-	far := requireReturns(t, done)
-	require.Equal(t, data[6<<20:6<<20+17], far)
-	require.Equal(t, int64(1), storage.opens.Load(), "the object was fetched from storage once")
 }

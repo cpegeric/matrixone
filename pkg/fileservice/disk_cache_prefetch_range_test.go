@@ -28,6 +28,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -90,18 +91,35 @@ func readRangeOf(t *testing.T, fs *S3FS, policy Policy, offset, size int64) []by
 	return data
 }
 
-// A short range read caches the aligned prefetch range around it, which serves a later
-// read within it without object storage.
+// A short range read caches the aligned prefetch range around it, which serves later reads
+// within it without object storage: at the object's end the range holds the bytes up to
+// the end, a read crossing a unit boundary reads the units it spans as one range, and a
+// read wider than the prefetch window reads its range alone.
 func TestS3FSPrefetchRangeServesLaterReads(t *testing.T) {
-	fs, storage, data := newPrefetchRangeFS(t, 4096, 64<<10)
-	require.Equal(t, data[5000:5002], readRangeOf(t, fs, 0, 5000, 2))
-	require.Equal(t, int64(1), storage.reads.Load())
-	require.Equal(t, int64(4096), storage.bytes.Load())
-	require.Equal(t, data[6000:6100], readRangeOf(t, fs, 0, 6000, 100))
-	require.Equal(t, data[4096:4097], readRangeOf(t, fs, 0, 4096, 1))
-	require.Equal(t, int64(1), storage.reads.Load(), "reads within the prefetch range")
-	require.Equal(t, data[9000:9010], readRangeOf(t, fs, 0, 9000, 10))
-	require.Equal(t, int64(2), storage.reads.Load(), "a read in another unit")
+	// reads and bytes are the storage counts after the read, bytes unchecked for -1.
+	type step struct{ off, size, reads, bytes int64 }
+	for _, tc := range []struct {
+		name  string
+		size  int
+		steps []step
+	}{
+		{"unit", 64 << 10, []step{{5000, 2, 1, 4096}, {6000, 100, 1, 4096}, {4096, 1, 1, 4096}, {9000, 10, 2, -1}}},
+		{"object end", 10000, []step{{9990, 10, 1, -1}, {8200, 100, 1, -1}}},
+		{"across units", 64 << 10, []step{{4000, 200, 1, 8192}, {0, 8192, 1, 8192}}},
+		{"wider than the window", (prefetchWindowBlocks + 2) * 4096,
+			[]step{{100, prefetchWindowBlocks*4096 + 1, 1, prefetchWindowBlocks*4096 + 1}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, storage, data := newPrefetchRangeFS(t, 4096, tc.size)
+			for _, s := range tc.steps {
+				require.Equal(t, data[s.off:s.off+s.size], readRangeOf(t, fs, 0, s.off, s.size), s.off)
+				require.Equal(t, s.reads, storage.reads.Load(), s.off)
+				if s.bytes >= 0 {
+					require.Equal(t, s.bytes, storage.bytes.Load(), s.off)
+				}
+			}
+		})
+	}
 }
 
 // A read near the end of a unit reads from its own block, and the blocks of the unit
@@ -135,30 +153,6 @@ func TestS3FSPrefetchRangeSkipsCanceledRead(t *testing.T) {
 	require.Zero(t, opens.Load())
 }
 
-// The entries inside a prefetch range are not cached again as ranges of their own.
-func TestS3FSPrefetchRangeCachesOnlyTheRange(t *testing.T) {
-	fs, _, _ := newPrefetchRangeFS(t, 4096, 64<<10)
-	readRangeOf(t, fs, 0, 5000, 2)
-	fs.diskCache.ranges.mu.Lock()
-	defer fs.diskCache.ranges.mu.Unlock()
-	var ranges []cachedRange
-	fs.diskCache.ranges.byObject.Range(func(_, v any) bool {
-		ranges = append(ranges, v.(*rangeSnapshot).ranges...)
-		return true
-	})
-	require.Len(t, ranges, 1)
-	require.Equal(t, int64(4096), ranges[0].offset)
-	require.Equal(t, int64(4096), ranges[0].size)
-}
-
-// A prefetch range past the end of the object holds the bytes up to the end.
-func TestS3FSPrefetchRangeAtObjectEnd(t *testing.T) {
-	fs, storage, data := newPrefetchRangeFS(t, 4096, 10000)
-	require.Equal(t, data[9990:10000], readRangeOf(t, fs, 0, 9990, 10))
-	require.Equal(t, data[8200:8300], readRangeOf(t, fs, 0, 8200, 100))
-	require.Equal(t, int64(1), storage.reads.Load())
-}
-
 // A run of a FilePrefetchObject past the object's end caches nothing and learns the
 // object's size; with the size known, a run ends there and is cached.
 func TestS3FSFileRunPastObjectEnd(t *testing.T) {
@@ -180,40 +174,6 @@ func TestS3FSFileRunPastObjectEnd(t *testing.T) {
 	require.Equal(t, int64(1), storage.reads.Load(), "the run ending at the object's end is cached")
 }
 
-// A read crossing a unit boundary reads the units it spans as one range.
-func TestS3FSPrefetchRangeAcrossUnits(t *testing.T) {
-	fs, storage, data := newPrefetchRangeFS(t, 4096, 64<<10)
-	require.Equal(t, data[4000:4200], readRangeOf(t, fs, 0, 4000, 200))
-	require.Equal(t, int64(8192), storage.bytes.Load())
-	require.Equal(t, data[8000:8096], readRangeOf(t, fs, 0, 0, 8192)[8000:8096])
-	require.Equal(t, int64(1), storage.reads.Load())
-}
-
-// Reads wider than the prefetch window, and every read with prefetch ranges turned off,
-// read their range alone.
-func TestS3FSPrefetchRangeOff(t *testing.T) {
-	fs, storage, _ := newPrefetchRangeFS(t, 4096, (prefetchWindowBlocks+2)*4096)
-	readRangeOf(t, fs, 0, 100, prefetchWindowBlocks*4096+1)
-	require.Equal(t, int64(prefetchWindowBlocks*4096+1), storage.bytes.Load())
-
-	fs, storage, _ = newPrefetchRangeFS(t, 0, 64<<10)
-	readRangeOf(t, fs, 0, 5000, 2)
-	require.Equal(t, int64(2), storage.bytes.Load())
-}
-
-func TestAutoPrefetchUnit(t *testing.T) {
-	require.Equal(t, int64(64<<10), autoPrefetchUnit(0))
-	require.Equal(t, int64(64<<10), autoPrefetchUnit(1000))
-	require.Equal(t, int64(4<<20), autoPrefetchUnit(25e-3*100*(1<<20)))
-	require.Equal(t, int64(2<<20), autoPrefetchUnit(2<<20))
-	require.Equal(t, int64(8<<20), autoPrefetchUnit(100e-3*2000*(1<<20)))
-
-	rangeCosts(t, 0.025, 100<<20)
-	require.Equal(t, int64(4<<20), prefetchRangeConfig{on: true}.unit())
-	require.Equal(t, int64(16<<20), prefetchRangeConfig{on: true, fixed: 16 << 20}.unit())
-	require.Equal(t, int64(0), prefetchRangeConfig{fixed: 16 << 20}.unit())
-}
-
 type blockingStorage struct {
 	ObjectStorage
 	reads   atomic.Int64
@@ -227,116 +187,6 @@ func (b *blockingStorage) Read(ctx context.Context, key string, min, max *int64)
 		<-b.release
 	}
 	return b.ObjectStorage.Read(ctx, key, min, max)
-}
-
-// A read within a prefetch range under way waits for it instead of reading object
-// storage.
-func TestS3FSPrefetchRangeReadersShareTheRead(t *testing.T) {
-	fs, _, data := newPrefetchRangeFS(t, 4096, 64<<10)
-	storage := &blockingStorage{ObjectStorage: fs.server.raw.(*countingStorage).ObjectStorage,
-		started: make(chan struct{}), release: make(chan struct{})}
-	fs.server.raw = storage
-
-	first := make(chan []byte, 1)
-	go func() { first <- readRangeOf(t, fs, 0, 5000, 2) }()
-	<-storage.started
-	second := make(chan []byte, 1)
-	go func() { second <- readRangeOf(t, fs, 0, 6000, 100) }()
-	require.Eventually(t, func() bool {
-		fs.diskCache.prefetchObjects.mu.Lock()
-		defer fs.diskCache.prefetchObjects.mu.Unlock()
-		return len(fs.diskCache.prefetchObjects.m) == 1
-	}, diskCacheLifecycleTestTimeout, time.Millisecond)
-	time.Sleep(10 * time.Millisecond)
-	close(storage.release)
-	require.Equal(t, data[5000:5002], <-first)
-	require.Equal(t, data[6000:6100], <-second)
-	require.Equal(t, int64(1), storage.reads.Load())
-	fs.diskCache.prefetchObjects.mu.Lock()
-	defer fs.diskCache.prefetchObjects.mu.Unlock()
-	require.Empty(t, fs.diskCache.prefetchObjects.m)
-}
-
-// A read that skips disk-cache reads reads object storage itself instead of waiting for
-// a prefetch range under way.
-func TestS3FSCacheBypassReadSkipsActiveRange(t *testing.T) {
-	fs, _, data := newPrefetchRangeFS(t, 4096, 64<<10)
-	storage := &blockingStorage{ObjectStorage: fs.server.raw.(*countingStorage).ObjectStorage,
-		started: make(chan struct{}), release: make(chan struct{})}
-	fs.server.raw = storage
-	release := sync.OnceFunc(func() { close(storage.release) })
-	t.Cleanup(release)
-
-	first := make(chan []byte, 1)
-	go func() { first <- readRangeOf(t, fs, 0, 5000, 2) }()
-	<-storage.started
-
-	ctx, cancel := context.WithTimeout(context.Background(), diskCacheLifecycleTestTimeout)
-	defer cancel()
-	vec := &IOVector{FilePath: "object", Policy: SkipAllCache, Entries: []IOEntry{{Offset: 6000, Size: 100}}}
-	require.NoError(t, fs.Read(ctx, vec))
-	require.Equal(t, data[6000:6100], vec.Entries[0].Data)
-	require.Equal(t, int64(2), storage.reads.Load())
-
-	release()
-	require.Equal(t, data[5000:5002], <-first)
-}
-
-// A read that takes bytes from a cached range keeps the range file open for later reads.
-func TestS3FSPrefetchRangeKeepsCachedRangeOpen(t *testing.T) {
-	fs, storage, data := newPrefetchRangeFS(t, 4096, 64<<10)
-	readRangeOf(t, fs, 0, 5000, 2)
-	ranges := fs.diskCache.ranges.of(fs.diskCache.objectKey("object"))
-	require.Len(t, ranges, 1)
-	require.Equal(t, data[6000:9000], readRangeOf(t, fs, 0, 6000, 3000))
-	require.Equal(t, int64(2), storage.reads.Load(), "the cached range is not read again")
-	fs.diskCache.files.mu.Lock()
-	defer fs.diskCache.files.mu.Unlock()
-	kept := fs.diskCache.files.m[ranges[0].diskPath]
-	require.NotNil(t, kept, "the cached range's file is kept open")
-	require.Zero(t, kept.refs)
-}
-
-// addFlight registers a buffered fill of diskPath being read.
-func addFlight(d *DiskCache, diskPath string, start, end int64) *cacheFill {
-	f := &d.prefetchObjects
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	fl := &cacheFill{d: d, diskPath: diskPath, start: start, end: end, pos: -1,
-		ready: make(chan struct{}), endedCh: make(chan struct{}), promoted: make(chan struct{})}
-	fl.setContext(context.Background())
-	f.registerLocked(fl)
-	fl.started(newBufferDownload(make([]byte, end-start), nil, 0, foregroundRequest))
-	return fl
-}
-
-// deliver publishes content as the next bytes of the fill.
-func deliver(fl *cacheFill, content []byte) {
-	o := fl.download
-	copy(o.buf[o.writtenFrom(0):], content)
-	o.advance(0, int64(len(content)))
-}
-
-// endFlight ends the fill with the bytes it got.
-func endFlight(fl *cacheFill) {
-	fl.download.end(false)
-	fl.finish(nil)
-}
-
-// A reader of a failed prefetch range reads its own range.
-func TestS3FSPrefetchRangeWaiterFallsBackOnFailure(t *testing.T) {
-	fs, _, data := newPrefetchRangeFS(t, 4096, 64<<10)
-	diskPath := fs.diskCache.objectKey("object")
-	fl := addFlight(fs.diskCache, diskPath, 4096, 8192)
-	storage := fs.server.raw.(*countingStorage)
-	done := make(chan []byte, 1)
-	go func() { done <- readRangeOf(t, fs, 0, 5000, 2) }()
-	time.Sleep(20 * time.Millisecond)
-	require.Zero(t, storage.reads.Load(), "waits for the range being read")
-	endFlight(fl)
-	require.Equal(t, data[5000:5002], <-done)
-	require.Equal(t, int64(1), storage.reads.Load())
-	require.Equal(t, int64(2), storage.bytes.Load())
 }
 
 // A closed cache starts no prefetch reads.
@@ -360,99 +210,6 @@ func TestS3FSPrefetchRangeMergesCachedUnits(t *testing.T) {
 	require.Equal(t, data[4000:16000], readRangeOf(t, fs, 0, 4000, 12000))
 	require.Equal(t, int64(4), storage.reads.Load(), "only the first unit")
 	require.Equal(t, int64(4*4096), storage.bytes.Load())
-}
-
-// A read spanning a unit being read and a missing unit reads only the missing one and
-// waits for the other.
-func TestS3FSPrefetchRangeNeverReadsABlockTwice(t *testing.T) {
-	fs, storage, data := newPrefetchRangeFS(t, 4096, 64<<10)
-	diskPath := fs.diskCache.objectKey("object")
-	fl := addFlight(fs.diskCache, diskPath, 4096, 8192)
-	done := make(chan []byte, 1)
-	go func() { done <- readRangeOf(t, fs, 0, 6000, 4000) }()
-	require.Eventually(t, func() bool { return storage.reads.Load() == 1 }, diskCacheLifecycleTestTimeout, time.Millisecond)
-	require.Equal(t, int64(4096), storage.bytes.Load(), "only the unit not being read")
-	deliver(fl, data[4096:8192])
-	endFlight(fl)
-	require.Equal(t, data[6000:10000], <-done)
-	require.Equal(t, int64(1), storage.reads.Load())
-}
-
-// A read joins the first registered flight holding its bytes, and a range is covered by
-// the flights holding its bytes, each taking from where it starts the one holding the most
-// bytes, and the gaps between them.
-func TestPrefetchCoverByFlights(t *testing.T) {
-	var d DiskCache
-	a := addFlight(&d, "p", 100, 200)
-	b := addFlight(&d, "p", 150, 400)
-	c := addFlight(&d, "p", 500, 600)
-	f := &d.prefetchObjects
-	f.mu.Lock()
-	require.Same(t, a, f.joinableLocked("p", false, 160, 190, true))
-	require.Same(t, b, f.joinableLocked("p", false, 160, 300, true))
-	require.Nil(t, f.joinableLocked("p", false, 160, 500, true))
-	require.Nil(t, f.joinableLocked("p", true, 160, 190, true), "a read of the other cache joins none")
-	pieces := f.coverLocked("p", false, 0, 700, true)
-	whole := f.coverLocked("p", false, 520, 580, true)
-	f.mu.Unlock()
-	require.Equal(t, []coverPiece{
-		{start: 0, end: 100}, {start: 100, end: 200, o: a}, {start: 200, end: 400, o: b},
-		{start: 400, end: 500}, {start: 500, end: 600, o: c}, {start: 600, end: 700},
-	}, pieces)
-	require.Equal(t, []coverPiece{{start: 520, end: 580, o: c}}, whole)
-	for _, fl := range []*cacheFill{a, b, c} {
-		endFlight(fl)
-	}
-	require.Empty(t, d.prefetchObjects.m)
-}
-
-// A read of entries far apart fetches the units they are in, not the bytes between them.
-func TestS3FSPrefetchRangeSkipsGapsBetweenEntries(t *testing.T) {
-	fs, storage, data := newPrefetchRangeFS(t, 4096, 64<<10)
-	vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache, Entries: []IOEntry{
-		{Offset: 100, Size: 10}, {Offset: 40000, Size: 5000},
-	}}
-	require.NoError(t, fs.Read(context.Background(), vec))
-	fs.diskCache.prefetchObjects.reads.Wait()
-	require.Equal(t, data[100:110], vec.Entries[0].Data)
-	require.Equal(t, data[40000:45000], vec.Entries[1].Data)
-	require.Equal(t, int64(2), storage.reads.Load())
-	require.Equal(t, int64(4096+8192), storage.bytes.Load())
-	require.Equal(t, data[41000:41100], readRangeOf(t, fs, 0, 41000, 100))
-	require.Equal(t, int64(2), storage.reads.Load())
-}
-
-// A reader waiting on a flight takes its bytes once they arrive, before the flight ends.
-func TestS3FSPrefetchRangeServesBytesAsTheyArrive(t *testing.T) {
-	fs, storage, data := newPrefetchRangeFS(t, 8192, 64<<10)
-	diskPath := fs.diskCache.objectKey("object")
-	fl := addFlight(fs.diskCache, diskPath, 0, 8192)
-	done := make(chan []byte, 1)
-	go func() { done <- readRangeOf(t, fs, 0, 100, 10) }()
-	deliver(fl, data[:4096])
-	require.Equal(t, data[100:110], <-done)
-	require.Zero(t, storage.reads.Load())
-	endFlight(fl)
-}
-
-// Objects whose paths have a separator read their ranges alone: the range index does
-// not hold their range files.
-func TestS3FSPrefetchRangeSkipsPathsWithSeparator(t *testing.T) {
-	fs, _, _ := newPrefetchRangeFS(t, 4096, 64<<10)
-	_, ok := fs.diskCache.prefetchUnit(&IOVector{FilePath: "dir/object", Policy: SkipFullFilePreloads,
-		Entries: []IOEntry{{Offset: 0, Size: 10}}})
-	require.False(t, ok)
-	_, ok = fs.diskCache.prefetchUnit(&IOVector{FilePath: "object", Policy: SkipFullFilePreloads,
-		Entries: []IOEntry{{Offset: 0, Size: 10}}})
-	require.True(t, ok)
-}
-
-// A prefetch read is a sample of the latency of range reads.
-func TestS3FSPrefetchRangeSamplesLatency(t *testing.T) {
-	rangeCosts(t, 10, rangeReadCosts.get().bytesPerS)
-	fs, _, _ := newPrefetchRangeFS(t, 4096, 64<<10)
-	readRangeOf(t, fs, 0, 5000, 2)
-	require.Less(t, rangeReadCosts.get().latency, 10.0)
 }
 
 type trackedReader struct {
@@ -538,54 +295,6 @@ func TestDeleteRemovesCachedRanges(t *testing.T) {
 	require.Equal(t, int64(2), storage.reads.Load(), "the read goes to object storage")
 }
 
-// stuckStorage blocks a read until its context is canceled or the test ends.
-type stuckStorage struct {
-	ObjectStorage
-	started chan struct{}
-	end     chan struct{}
-}
-
-func (b *stuckStorage) Read(ctx context.Context, key string, min, max *int64) (io.ReadCloser, error) {
-	b.started <- struct{}{}
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-b.end:
-		return nil, io.ErrUnexpectedEOF
-	}
-}
-
-// Closing the disk cache cancels the prefetch range reads under way, which outlive the
-// reads that start them.
-func TestCloseCancelsPrefetchRangeReads(t *testing.T) {
-	fs, _, _ := newPrefetchRangeFS(t, 4096, 64<<10)
-	storage := &stuckStorage{ObjectStorage: fs.server.raw, started: make(chan struct{}, 1), end: make(chan struct{})}
-	fs.server.raw = storage
-	t.Cleanup(func() { close(storage.end) })
-	readCtx, cancel := context.WithCancel(context.Background())
-	readDone := make(chan struct{})
-	go func() {
-		defer close(readDone)
-		vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache, Entries: []IOEntry{{Offset: 5000, Size: 2}}}
-		_ = fs.Read(readCtx, vec)
-		vec.Release()
-	}()
-	<-storage.started
-	cancel()
-	<-readDone
-
-	closed := make(chan struct{})
-	go func() {
-		fs.diskCache.Close(context.Background())
-		close(closed)
-	}()
-	select {
-	case <-closed:
-	case <-time.After(10 * time.Second):
-		t.Fatal("close waits for a blocked prefetch range read")
-	}
-}
-
 // stallingStorage serves the first after bytes of the first read, then holds it until
 // its context ends or release is closed.
 type stallingStorage struct {
@@ -635,53 +344,15 @@ func (r *stallingReader) Read(p []byte) (int, error) {
 
 func (r *stallingReader) Close() error { return r.r.Close() }
 
-// Deleting an object stops the read of a prefetch range under way before its range is
-// cached: after a delete and recreation, another offset of that range is read from the
-// new object.
-func TestDeleteDropsPrefetchRangeUnderWay(t *testing.T) {
-	fs, _, data := newPrefetchRangeFS(t, 64<<10, 256<<10)
-	ctx := context.Background()
-	storage := &stallingStorage{ObjectStorage: fs.server.raw, after: 4096, stalled: make(chan struct{}), release: make(chan struct{})}
-	fs.server.raw = storage
-
-	vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache, Entries: []IOEntry{{Offset: 100, Size: 10}}}
-	require.NoError(t, fs.Read(ctx, vec))
-	require.Equal(t, data[100:110], vec.Entries[0].Data)
-	vec.Release()
-	<-storage.stalled
-
-	require.NoError(t, fs.Delete(ctx, "object"))
-	require.True(t, storage.canceled.Load(), "the delete cancels the read under way")
-	close(storage.release)
-	fs.diskCache.prefetchObjects.reads.Wait()
-	require.Empty(t, fs.diskCache.ranges.of(fs.diskCache.objectKey("object")))
-
-	recreated := slices.Clone(data)
-	for i := range recreated {
-		recreated[i] ^= 0xff
-	}
-	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(recreated)), Data: recreated}}, Policy: SkipDiskCache | SkipMemoryCache}))
-	require.Equal(t, recreated[30000:30010], readRangeOf(t, fs, 0, 30000, 10))
-}
-
 // A flight's buffer is kept for reuse only once the flight is forgotten and no read copies
-// from it. Buffers are of a power-of-two size up to 32 MiB, past which a flight allocates
-// its own.
+// from it.
 func TestPrefetchFlightBufferReusedAfterLastHolder(t *testing.T) {
 	o := newBufferDownload(getFlightBuf(100<<10), nil, 0, foregroundRequest)
-	require.Equal(t, 128<<10, cap(o.buf))
 	require.True(t, o.hold())
 	o.retire()
 	require.NotNil(t, o.buf, "a reader still holds it")
 	o.release()
 	require.Nil(t, o.buf)
-
-	require.Equal(t, int64(64<<10), flightBufSize(1))
-	require.Equal(t, int64(32<<20), flightBufSize(20<<20))
-	require.Equal(t, int64(40<<20), flightBufSize(40<<20), "past the pooled sizes, its own size")
-	require.Len(t, getFlightBuf(40<<20), 40<<20)
-	putFlightBuf(make([]byte, 40<<20))
-	putFlightBuf(make([]byte, 100))
 }
 
 // The memory budget of a server is a share of the memory available, measured at most once
@@ -708,30 +379,6 @@ func TestServerMemoryFollowsAvailableMemory(t *testing.T) {
 	require.Equal(t, int64(serverMemoryDefault), d.server.memoryBudget())
 	d.server.memoryLimit = 7
 	require.Equal(t, int64(7), d.server.memoryBudget())
-}
-
-// A read of a stopped MemoryPrefetchObject misses its bytes; a read of one whose read
-// failed gets the read's error.
-func TestMemoryPrefetchObjectUseErrors(t *testing.T) {
-	ctx := context.Background()
-	var d DiskCache
-	buf := make([]byte, 10)
-
-	stopped := addFlight(&d, "p", 0, 10)
-	stopped.download.endWith(false, nil)
-	require.ErrorIs(t, stopped.readAt(ctx, 0, buf), errPrefetchMissed)
-
-	readErr := errors.New("read failed")
-	failed := addFlight(&d, "p", 0, 10)
-	failed.download.endWith(false, readErr)
-	require.ErrorIs(t, failed.readAt(ctx, 0, buf), readErr)
-
-	short := addFlight(&d, "p", 0, 10)
-	deliver(short, []byte{1, 2, 3})
-	short.download.end(false)
-	require.NoError(t, short.readAt(ctx, 1, buf[:2]))
-	require.Equal(t, []byte{2, 3}, buf[:2])
-	require.ErrorIs(t, short.readAt(ctx, 0, buf), errPrefetchMissed)
 }
 
 // A range read takes its bytes from a prefetch object that caches nothing: a read that
@@ -775,34 +422,6 @@ func TestS3FSRangeReadCachesItsEntriesNotItsPrefetchObject(t *testing.T) {
 		filepath.Base(fs.diskCache.pathForIOEntry("object", IOEntry{Offset: 5000, Size: 10})),
 		filepath.Base(fs.diskCache.pathForIOEntry("object", IOEntry{Offset: 5010, Size: 10})),
 	}, cacheFiles(), "the entries, not the prefetch object's range")
-}
-
-// A prefetch of ranges past the bytes of a MemoryPrefetchObject runs at most fillsMax of
-// their fills at once, each downloading to its file, and downloads them all.
-func TestPrefetchFilesBoundsRangesAtOnce(t *testing.T) {
-	fs, _, _ := newPrefetchRangeFS(t, 0, 300<<10)
-	fs.diskCache.memoryPrefetchMax = 512
-	fs.diskCache.setFillsMax(3)
-	key := fs.pathToKey("object")
-	g := newBlackBoxStorage(fs.server.raw, func(k string, _ int64) bool { return k == key })
-	fs.server.raw = g
-	release := sync.OnceFunc(func() { close(g.gate) })
-	defer release()
-	ranges := columnRanges(14, 20<<10, 1<<10)
-	require.NoError(t, fs.PrefetchObject(context.Background(), ObjectPrefetch{FilePath: "object", Size: 14 << 10, Ranges: ranges}))
-	inFlight := func() int { cur, _, _ := g.counts(key); return cur }
-	require.Eventually(t, func() bool { return inFlight() == 3 }, 5*time.Second, time.Millisecond)
-	require.Never(t, func() bool { return inFlight() > 3 }, 100*time.Millisecond, time.Millisecond)
-	release()
-	waitFillsEnd(fs.diskCache, "object")
-	_, most, total := g.counts(key)
-	require.Equal(t, 3, most)
-	require.Equal(t, len(ranges), total)
-	objectKey := fs.diskCache.objectKey("object")
-	for _, r := range ranges {
-		_, ok := fs.diskCache.ranges.covering(objectKey, r.Offset, r.Size)
-		require.True(t, ok, "range %d cached", r.Offset)
-	}
 }
 
 // A read of a cached range whose file is short or removed returns storage's bytes, and
@@ -882,33 +501,6 @@ func flushPublishers(fs *S3FS) {
 	}
 }
 
-// The download of an object of at least the split size reads its 64KiB-aligned halves
-// at once and caches the whole object.
-func TestS3FSObjectSplitDownloadReadsParts(t *testing.T) {
-	fs, storage, data := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 128 << 10}, 300<<10+17)
-	got, err := readFullObjectOf(fs, 250<<10, 10)
-	require.NoError(t, err)
-	require.Equal(t, data[250<<10:250<<10+10], got)
-	require.Equal(t, int64(2), storage.reads.Load())
-	require.ElementsMatch(t, []int64{0, 192 << 10}, storage.starts)
-	require.True(t, fs.diskCache.cache.Contains(fs.diskCache.wholePath("object", int64(len(data)))))
-
-	got, err = readFullObjectOf(fs, 0, int64(len(data)))
-	require.NoError(t, err)
-	require.Equal(t, data, got)
-	require.Equal(t, int64(2), storage.reads.Load(), "the cached whole object serves later reads")
-}
-
-// An object smaller than the split size downloads as one range.
-func TestS3FSObjectSplitSkipsSmallObjects(t *testing.T) {
-	fs, storage, data := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 1 << 20}, 300<<10)
-	got, err := readFullObjectOf(fs, 100, 10)
-	require.NoError(t, err)
-	require.Equal(t, data[100:110], got)
-	require.Equal(t, int64(1), storage.reads.Load())
-	require.Empty(t, storage.starts, "an open-ended read of the object")
-}
-
 // Every whole-object download of a large object splits, however many downloads are in
 // flight: nine held at once read two parts each. The control downloads one.
 func TestS3FSObjectSplitWithManyDownloads(t *testing.T) {
@@ -950,21 +542,6 @@ func TestS3FSObjectSplitWithManyDownloads(t *testing.T) {
 	}
 }
 
-// A download of an object no prefetch told the size of reads it as one range, and never
-// asks object storage for its size.
-func TestS3FSObjectSplitNeedsKnownSize(t *testing.T) {
-	fs, counting, data := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 128 << 10}, 300<<10)
-	fs.diskCache.prefetched = prefetchedObjects{}
-	storage := &statCountingStorage{ObjectStorage: fs.server.raw}
-	fs.server.raw = storage
-	got, err := readFullObjectOf(fs, 100, 10)
-	require.NoError(t, err)
-	require.Equal(t, data[100:110], got)
-	require.Equal(t, int64(1), counting.reads.Load())
-	require.Empty(t, counting.starts, "an open-ended read of the object")
-	require.Zero(t, storage.stats.Load())
-}
-
 // A failed part fails the download, which publishes no whole object; the read has its
 // bytes from the part that did not fail.
 func TestS3FSObjectSplitFailedPartPublishesNothing(t *testing.T) {
@@ -983,69 +560,6 @@ func TestS3FSObjectSplitFailedPartPublishesNothing(t *testing.T) {
 	require.Equal(t, data[10:20], got)
 }
 
-// A reader of a part waits only for that part.
-func TestObjectDownloadWaitsForItsPart(t *testing.T) {
-	ctx := context.Background()
-	o := newObjectDownload("", []int64{0, 4, 8})
-	short := func() context.Context {
-		ctx, cancel := context.WithTimeout(ctx, time.Millisecond)
-		t.Cleanup(cancel)
-		return ctx
-	}
-	require.False(t, o.hasBegun())
-	o.begin(0)
-	o.begin(1)
-	require.True(t, o.hasBegun())
-	o.advance(1, 4)
-	written, ok := o.waitFor(short(), 4, 8)
-	require.True(t, ok)
-	require.Equal(t, int64(8), written)
-	require.True(t, o.writtenTo(4, 8))
-
-	_, ok = o.waitFor(short(), 0, 1)
-	require.False(t, ok, "the first part has no byte")
-	require.False(t, o.writtenTo(0, 8))
-
-	o.advance(0, 2)
-	written, ok = o.waitFor(short(), 0, 2)
-	require.True(t, ok)
-	require.Equal(t, int64(2), written, "the bytes written from the start stop at the gap")
-	o.advance(0, 2)
-	o.end(true)
-	written, ok = o.waitFor(short(), 0, -1)
-	require.True(t, ok)
-	require.Equal(t, int64(8), written)
-}
-
-func TestObjectSplitBounds(t *testing.T) {
-	split := objectSplitConfig{parts: 2, min: 1 << 20}
-	require.Nil(t, split.bounds(1<<20-1, 0))
-	require.Equal(t, []int64{0, 704 << 10, 1<<20 + 300<<10}, split.bounds(1<<20+300<<10, 0))
-	require.Equal(t, []int64{0, 384 << 10, 768 << 10, 1152 << 10, 1<<20 + 300<<10},
-		objectSplitConfig{parts: 4, min: 1 << 20}.bounds(1<<20+300<<10, 0))
-	require.Nil(t, objectSplitConfig{parts: 1, min: 0}.bounds(64<<20, 0))
-	require.Equal(t, []int64{0, 1 << 20, 1<<20 + 300<<10}, split.bounds(1<<20+300<<10, 1<<20+1000),
-		"a part starts at the 64KiB block holding the read's first byte")
-	require.Equal(t, []int64{0, 704 << 10, 1<<20 + 300<<10}, split.bounds(1<<20+300<<10, 1000), "inside the first block")
-	require.Equal(t, []int64{0, 704 << 10, 1<<20 + 300<<10}, split.bounds(1<<20+300<<10, 2<<20), "past the object")
-	four := objectSplitConfig{parts: 4, min: 1 << 20}
-	require.Equal(t, []int64{0, 384 << 10, 768 << 10, 1 << 20, 1<<20 + 300<<10}, four.bounds(1<<20+300<<10, 1<<20+1000))
-	require.Equal(t, []int64{0, 448 << 10, 768 << 10, 1152 << 10, 1<<20 + 300<<10}, four.bounds(1<<20+300<<10, 448<<10))
-	require.Equal(t, []int64{0, 128 << 10, 768 << 10, 1152 << 10, 1<<20 + 300<<10}, four.bounds(1<<20+300<<10, 128<<10))
-	require.Equal(t, []int64{0, 384 << 10, 768 << 10, 1152 << 10, 1<<20 + 300<<10}, four.bounds(1<<20+300<<10, 768<<10))
-	require.Equal(t, []int64{0, 64 << 10, 128 << 10}, objectSplitConfig{parts: 2, min: 0}.bounds(128<<10, 64<<10))
-	require.Equal(t, []int64{0, 64 << 10, 100 << 10}, objectSplitConfig{parts: 4, min: 0}.bounds(100<<10, 64<<10))
-}
-
-func TestDiskObjectSplitConfig(t *testing.T) {
-	require.Equal(t, objectSplitConfig{parts: 2, min: 16 << 20}, (&CacheConfig{}).diskObjectSplit())
-	require.Equal(t, objectSplitConfig{parts: 1, min: 16 << 20}, (&CacheConfig{DiskPrefetchObjectSplit: ptrTo(0)}).diskObjectSplit())
-	require.Equal(t, objectSplitConfig{parts: 4, min: 1 << 20}, (&CacheConfig{
-		DiskPrefetchObjectSplit:    ptrTo(9),
-		DiskPrefetchObjectSplitMin: ptrTo[toml.ByteSize](1 << 20),
-	}).diskObjectSplit())
-}
-
 // disk-prefetch-memory-max defaults to 32 MiB and is at least 8 MiB.
 func TestDiskPrefetchMemoryMaxConfig(t *testing.T) {
 	require.Equal(t, int64(32<<20), (&CacheConfig{}).diskPrefetchMemoryMax())
@@ -1054,60 +568,39 @@ func TestDiskPrefetchMemoryMaxConfig(t *testing.T) {
 	require.Equal(t, int64(32<<20), (&CacheConfig{DiskPrefetchMemoryMax: ptrTo[toml.ByteSize](0)}).diskPrefetchMemoryMax())
 }
 
-// A full-object read does not wait for the read that holds its merge.
-func TestS3FSFullObjectReadSkipsMergeWait(t *testing.T) {
-	fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
-	originalShortWait := shortIOWaitDuration
-	shortIOWaitDuration = 10 * time.Second
-	t.Cleanup(func() { shortIOWaitDuration = originalShortWait })
-	key := fs.readMergeKey(&IOVector{FilePath: "object", Policy: SkipMemoryCache, Entries: []IOEntry{{Offset: 100, Size: 10}}})
-	require.True(t, key.FullObject)
-	done, wait := fs.ioMerger.Merge(key, maxIOWaitDuration)
-	require.NotNil(t, done)
-	require.Nil(t, wait)
-	defer done()
-
-	t0 := time.Now()
-	got, err := readFullObjectOf(fs, 100, 10)
-	require.NoError(t, err)
-	require.Equal(t, data[100:110], got)
-	require.Less(t, time.Since(t0), 2*time.Second)
-}
-
-// The parts of a split download are each a request: with room for one they read one after
-// the other, and each frees its room once it ends.
-func TestS3FSDownloadConnsReservedPerPart(t *testing.T) {
-	fs, storage, data := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 128 << 10}, 300<<10)
-	d := fs.diskCache
-	limitRoom(t, fs.server, 1, 1)
-	got, err := readFullObjectOf(fs, 100, 10)
-	require.NoError(t, err)
-	require.Equal(t, data[100:110], got)
-	require.Equal(t, int64(2), storage.reads.Load())
-	require.ElementsMatch(t, []int64{0, 192 << 10}, storage.starts, "the split stays with room for one")
-	require.Zero(t, heldRoom(fs.server), "its requests free their room")
-	require.True(t, d.cache.Contains(d.wholePath("object", int64(len(data)))))
-}
-
-// A download with no room free waits for room, and downloads once it is freed.
+// A download with no room free waits for room without failing, and downloads once it is
+// freed: the whole object of a read, and the file-backed fill of a column read past
+// disk-prefetch-memory-max.
 func TestS3FSDownloadWaitsForConn(t *testing.T) {
-	fs, _, data := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 128 << 10}, 300<<10)
-	d := fs.diskCache
-	limitRoom(t, fs.server, 1, 1)
-	free := occupy(t, fs.server, foregroundRequest, 1)
-	done := make(chan []byte, 1)
-	go func() {
-		got, err := readFullObjectOf(fs, 100, 10)
-		require.NoError(t, err)
-		done <- got
-	}()
-	require.Eventually(t, func() bool { return waitingForConn(d, d.objectKey("object")) }, 10*time.Second, time.Millisecond,
-		"the download waits for room")
-	require.False(t, d.cache.Contains(d.wholePath("object", int64(len(data)))))
-	free()
-	require.Equal(t, data[100:110], <-done)
-	require.True(t, d.cache.Contains(d.wholePath("object", int64(len(data)))))
-	require.Zero(t, heldRoom(fs.server))
+	for _, whole := range []bool{true, false} {
+		t.Run(map[bool]string{true: "whole object", false: "file-backed column read"}[whole], func(t *testing.T) {
+			fs, _, data := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 128 << 10}, 300<<10)
+			d := fs.diskCache
+			d.memoryPrefetchMax = 1
+			limitRoom(t, fs.server, 1, 1)
+			free := occupy(t, fs.server, foregroundRequest, 1)
+			done := make(chan []byte, 1)
+			go func() {
+				read := readFullObjectOf
+				if !whole {
+					read = func(fs *S3FS, offset, size int64) ([]byte, error) {
+						return readColumnRange(context.Background(), fs, PrefetchRange{Offset: offset, Size: size})
+					}
+				}
+				got, err := read(fs, 100, 10)
+				assert.NoError(t, err)
+				done <- got
+			}()
+			require.Eventually(t, func() bool { _, waiting := fs.server.counts(); return waiting[foregroundRequest] > 0 },
+				10*time.Second, time.Millisecond, "the download waits for room")
+			require.Never(t, func() bool { return len(done) > 0 }, 100*time.Millisecond, time.Millisecond)
+			require.False(t, d.cache.Contains(d.wholePath("object", int64(len(data)))))
+			free()
+			require.Equal(t, data[100:110], <-done)
+			require.Equal(t, whole, d.cache.Contains(d.wholePath("object", int64(len(data)))))
+			require.Zero(t, heldRoom(fs.server))
+		})
+	}
 }
 
 // waitingForConn reports whether a whole-object download of the object at diskPath is
@@ -1273,20 +766,6 @@ func TestS3FSRangeFillWaitsForPublisherRoom(t *testing.T) {
 	}
 }
 
-// A whole-object download of an object deleted since the mark of its context, before it
-// began, downloads nothing.
-func TestWholeObjectDownloadDeletedBeforeItBegins(t *testing.T) {
-	fs, storage, _ := newObjectSplitFS(t, objectSplitConfig{}, 300<<10)
-	d := fs.diskCache
-	diskPath := d.objectKey("object")
-	mark := d.deletes.now()
-	d.deletes.deleted(diskPath)
-	err := fs.PrefetchFile(withDeletesMark(context.Background(), mark), "object")
-	require.ErrorIs(t, err, context.Canceled)
-	require.Zero(t, storage.reads.Load())
-	require.Empty(t, d.objectFiles("object"))
-}
-
 // Deleting an object forgets the size a prefetch told of: after the path is written again
 // at another length, a read to the end of it reads the new object whole.
 func TestDeleteForgetsPrefetchedSize(t *testing.T) {
@@ -1304,95 +783,6 @@ func TestDeleteForgetsPrefetchedSize(t *testing.T) {
 	got, err := readFullObjectOf(fs, 0, -1)
 	require.NoError(t, err)
 	require.Equal(t, longer, got)
-}
-
-// A prefetch queued before an object is deleted is dropped, and one already taken from the
-// queue does not store the size it was told.
-func TestPrefetchBeforeDeleteKeepsNoSize(t *testing.T) {
-	fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
-	ctx := context.Background()
-	busyFills(t, fs)
-	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: int64(len(data))}))
-	require.True(t, fs.diskCache.isQueued("object"))
-	taken := fs.diskCache.waitingFillsOf("object")[0].req
-	require.NoError(t, fs.Delete(ctx, "object"))
-	require.False(t, fs.diskCache.isQueued("object"), "the delete drops the queued prefetch")
-
-	fs.diskCache.setFillsMax(0)
-	fs.prefetchObject(ctx, taken)
-	_, known := fs.diskCache.prefetched.size(fs.diskCache.objectKey("object"))
-	require.False(t, known, "a prefetch made before the delete does not store its size")
-}
-
-// Background requests run at most half the connections per host, which are at least
-// minRequestRoom: the fewest configured connections still cache whole objects.
-func TestS3FSConfiguredConnsBoundDownloads(t *testing.T) {
-	for _, tc := range []struct {
-		conns int
-		limit int
-	}{{1, minRequestRoom / 2}, {minRequestRoom, minRequestRoom / 2}, {256, 128}} {
-		ctx := context.Background()
-		fs, err := NewS3FS(ctx, ObjectStorageArguments{Name: "s3", Endpoint: "disk", Bucket: t.TempDir(), MaxConnsPerHost: tc.conns}, CacheConfig{
-			DiskPath: ptrTo(t.TempDir()), DiskCapacity: ptrTo[toml.ByteSize](64 << 20),
-			MemoryCapacity: ptrTo[toml.ByteSize](0),
-		}, nil, false, false)
-		require.NoError(t, err)
-		data := make([]byte, 300<<10)
-		require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(data)), Data: data}}, Policy: SkipDiskCache | SkipMemoryCache}))
-		d := fs.diskCache
-		d.objectSplit = objectSplitConfig{parts: 1}
-		d.prefetched.store(d.objectKey("object"), int64(len(data)))
-		require.Equal(t, tc.limit, fs.server.backgroundMax, "conns %d", tc.conns)
-		got, err := readFullObjectOf(fs, 100, 10)
-		require.NoError(t, err)
-		require.Equal(t, data[100:110], got)
-		require.True(t, d.cache.Contains(d.wholePath("object", int64(len(data)))), "conns %d", tc.conns)
-		fs.Close(ctx)
-	}
-}
-
-// More concurrent split downloads than the server has room for all cache their objects:
-// each part holds room only while it reads, and none stays held.
-func TestS3FSObjectSplitDownloadsShareFewConnections(t *testing.T) {
-	const (
-		objects = 6
-		size    = 300<<10 + 17
-	)
-	fs, _, _ := newPrefetchRangeFS(t, 0, 1)
-	fs.diskCache.objectSplit = objectSplitConfig{parts: 2, min: 128 << 10}
-	limitRoom(t, fs.server, 2, 1)
-	ctx := context.Background()
-	contents := make([][]byte, objects)
-	for i := range objects {
-		name := fmt.Sprintf("object-%d", i)
-		contents[i] = make([]byte, size)
-		for j := range contents[i] {
-			contents[i][j] = byte(i + j*13)
-		}
-		require.NoError(t, fs.Write(ctx, IOVector{FilePath: name, Entries: []IOEntry{{Size: size, Data: contents[i]}}, Policy: SkipDiskCache | SkipMemoryCache}))
-		fs.diskCache.prefetched.store(fs.diskCache.objectKey(name), size)
-	}
-	errs := make(chan error, objects)
-	for i := range objects {
-		go func() {
-			vec := &IOVector{FilePath: fmt.Sprintf("object-%d", i), Policy: SkipMemoryCache, Entries: []IOEntry{{Offset: 250 << 10, Size: 10}}}
-			err := fs.Read(ctx, vec)
-			if err == nil && !slices.Equal(contents[i][250<<10:250<<10+10], vec.Entries[0].Data) {
-				err = errors.New("wrong bytes")
-			}
-			vec.Release()
-			errs <- err
-		}()
-	}
-	for range objects {
-		select {
-		case err := <-errs:
-			require.NoError(t, err)
-		case <-time.After(diskCacheLifecycleTestTimeout):
-			t.Fatal("a read did not return")
-		}
-	}
-	require.Eventually(t, func() bool { return heldRoom(fs.server) == 0 }, 5*time.Second, time.Millisecond)
 }
 
 // A read of bytes in a part of a split download that waits for room joins the download and
@@ -1432,32 +822,10 @@ func TestS3FSReadOfPartWaitingForConnectionJoinsIt(t *testing.T) {
 	require.Equal(t, 2, total, "the object is read once, in two parts")
 }
 
-// A read that joins bytes at copy time takes a download whose part holding them has not
-// begun, as one that begins now.
-func TestJoinableTakesPartNotBegun(t *testing.T) {
-	fs, _, _ := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 128 << 10}, 300<<10)
-	d := fs.diskCache
-	diskPath := d.objectKey("object")
-	p := addFlight(d, diskPath, 0, 8)
-	defer p.finish(nil)
-	f := &d.prefetchObjects
-	o := newObjectDownload("", []int64{0, 4, 8})
-	o.begin(0)
-	p.started(o)
-	covering := func(lo, hi int64) *cacheFill {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		return d.prefetchObjects.joinableLocked(diskPath, false, lo, hi, true)
-	}
-	require.NotNil(t, covering(1, 2), "the first part has begun")
-	require.NotNil(t, covering(5, 6), "the second part has not begun")
-	o.begin(1)
-	require.NotNil(t, covering(5, 6))
-}
-
 // A read whose entry write finds the publisher queue full waits for room: it returns once
 // room frees, with its entry cached, or once its context ends, with its entry not cached.
-// The control is the read whose write finds room, which returns at once.
+// The control is the read whose write finds room, which returns at once. An asynchronous
+// update whose context ended before it is submitted fails and caches nothing.
 func TestS3FSReadEntryWriteWaitsForPublisherRoom(t *testing.T) {
 	for _, ev := range []string{"room freed", "context ends"} {
 		t.Run(ev, func(t *testing.T) {
@@ -1479,6 +847,10 @@ func TestS3FSReadEntryWriteWaitsForPublisherRoom(t *testing.T) {
 				return res{b, err}
 			}
 			ctx := context.Background()
+			canceled, cancelNow := context.WithCancel(ctx)
+			cancelNow()
+			require.ErrorIs(t, d.Update(canceled, &IOVector{FilePath: "object",
+				Entries: []IOEntry{{Offset: 400, Size: 10, Data: data[400:410]}}}, true), context.Canceled)
 			require.Equal(t, res{data[100:110], nil}, read(ctx, 100))
 			select {
 			case <-syncStarted:
@@ -1515,7 +887,7 @@ func TestS3FSReadEntryWriteWaitsForPublisherRoom(t *testing.T) {
 			defer cancelFlush()
 			d.Flush(flushCtx)
 			require.NoError(t, flushCtx.Err())
-			for off, cached := range map[int64]bool{100: true, 200: true, 300: ev == "room freed"} {
+			for off, cached := range map[int64]bool{100: true, 200: true, 300: ev == "room freed", 400: false} {
 				vec := &IOVector{FilePath: "object", Entries: []IOEntry{{Offset: off, Size: 10}}}
 				require.NoError(t, d.Read(ctx, vec))
 				require.Equal(t, cached, vec.Entries[0].done, off)
@@ -1763,10 +1135,11 @@ type jpRead struct {
 }
 
 // jpStall holds a range read after it delivered after bytes until release is closed, or
-// ends it there, short, once short is set.
+// ends it there, short, once short is set, or with an error once fail is set.
 type jpStall struct {
 	after   int64
 	short   atomic.Bool
+	fail    atomic.Bool
 	release chan struct{}
 	sent    atomic.Int64
 }
@@ -1840,13 +1213,16 @@ type jpReader struct {
 func (g *jpReader) Read(p []byte) (int, error) {
 	sent := g.st.sent.Load()
 	if sent >= g.st.after {
-		if g.st.short.Load() {
-			return 0, io.EOF
-		}
 		select {
 		case <-g.st.release:
 		case <-g.done:
 			return 0, g.ctx.Err()
+		}
+		if g.st.short.Load() {
+			return 0, io.EOF
+		}
+		if g.st.fail.Load() {
+			return 0, errors.New("injected source failure")
 		}
 	} else if rest := g.st.after - sent; int64(len(p)) > rest {
 		p = p[:rest]
@@ -1890,11 +1266,17 @@ type jpResult struct {
 // jpColumnRead reads r of the object at filePath as a column read under a deadline of
 // timeout, in the background.
 func jpColumnRead(fs *S3FS, filePath string, r PrefetchRange, timeout time.Duration) <-chan jpResult {
+	return jpReadOf(fs, filePath, ColumnPrefetch, r, timeout)
+}
+
+// jpReadOf reads r of the object at filePath with policy under a deadline of timeout, in
+// the background.
+func jpReadOf(fs *S3FS, filePath string, policy Policy, r PrefetchRange, timeout time.Duration) <-chan jpResult {
 	done := make(chan jpResult, 1)
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
-		vec := &IOVector{FilePath: filePath, Policy: ColumnPrefetch | SkipFullFilePreloads | SkipMemoryCache,
+		vec := &IOVector{FilePath: filePath, Policy: policy | SkipFullFilePreloads | SkipMemoryCache,
 			Entries: []IOEntry{{Offset: r.Offset, Size: r.Size}}}
 		if err := fs.Read(ctx, vec); err != nil {
 			done <- jpResult{err: err}
@@ -1929,86 +1311,141 @@ func jpBystander(t *testing.T, fs *S3FS, other []byte) {
 }
 
 // (a) A read of bytes a running background fill of the whole object writes late, behind
-// a slow download, joins the fill: the object is read once. Control: a read of bytes the
-// fill has written is served by them at once.
+// a slow download, joins the fill: the object is read once. So does a file-backed range
+// read through prefetch ranges while the download has no byte yet. Control: a read of
+// bytes the fill has written is served by them at once.
 func TestJoinProbeReadJoinsSlowRunningWholeFill(t *testing.T) {
 	const size = 4 << 20
-	fs, s, data, other := jpFS(t, size)
-	key := fs.pathToKey("object")
-	st := newJPStall(512 << 10)
-	releaseStall := sync.OnceFunc(func() { close(st.release) })
-	defer releaseStall()
-	var once sync.Once
-	s.stall = func(r jpRead) *jpStall {
-		var got *jpStall
-		if r.key == key && r.start == 0 {
-			once.Do(func() { got = st })
-		}
-		return got
+	for _, tc := range []struct {
+		name   string
+		unit   int64
+		after  int64
+		policy Policy
+		r      PrefetchRange
+	}{
+		{"column read", 0, 512 << 10, ColumnPrefetch, PrefetchRange{Offset: 3 << 20, Size: 1 << 10}},
+		{"file-backed range read before the first byte", 1 << 20, 0, 0, PrefetchRange{Offset: 3 << 20, Size: 64 << 10}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, s, data, other := jpUnitFS(t, tc.unit, size)
+			if tc.unit > 0 {
+				fs.diskCache.memoryPrefetchMax = 256 << 10
+			}
+			key := fs.pathToKey("object")
+			st := newJPStall(tc.after)
+			releaseStall := sync.OnceFunc(func() { close(st.release) })
+			defer releaseStall()
+			var once sync.Once
+			s.stall = func(r jpRead) *jpStall {
+				var got *jpStall
+				if r.key == key && r.start == 0 {
+					once.Do(func() { got = st })
+				}
+				return got
+			}
+			require.NoError(t, fs.PrefetchObject(context.Background(), ObjectPrefetch{FilePath: "object", Size: size}))
+			require.Eventually(t, func() bool { return len(s.readsOf(key)) == 1 && st.sent.Load() >= st.after },
+				5*time.Second, time.Millisecond)
+			// The download's rate so far is its bytes over this wait.
+			time.Sleep(200 * time.Millisecond)
+
+			if tc.after > 0 {
+				control := PrefetchRange{Offset: 1000, Size: 1 << 10}
+				got := jpWait(t, jpColumnRead(fs, "object", control, 2*time.Second), 3*time.Second, "the control read")
+				require.NoError(t, got.err)
+				require.Equal(t, data[control.Offset:control.Offset+control.Size], got.data)
+				require.Len(t, s.readsOf(key), 1, "the control read is served by the written bytes")
+			}
+
+			done := jpReadOf(fs, "object", tc.policy, tc.r, 10*time.Second)
+			require.Never(t, func() bool { return len(done) > 0 }, 200*time.Millisecond, time.Millisecond,
+				"the read waits for the fill it joined")
+			require.Len(t, s.readsOf(key), 1, "the read does not read the bytes again")
+			jpBystander(t, fs, other)
+			releaseStall()
+			got := jpWait(t, done, 5*time.Second, "the joined read")
+			require.NoError(t, got.err)
+			require.Equal(t, data[tc.r.Offset:tc.r.Offset+tc.r.Size], got.data)
+			probeWaitIdle(t, fs)
+			require.Equal(t, 1, s.overlapping(key, tc.r.Offset, tc.r.Offset+tc.r.Size), "the bytes are read once")
+		})
 	}
-	require.NoError(t, fs.PrefetchObject(context.Background(), ObjectPrefetch{FilePath: "object", Size: size}))
-	require.Eventually(t, func() bool { return st.sent.Load() >= st.after }, 5*time.Second, time.Millisecond)
-	// The download's rate so far is its bytes over this wait.
-	time.Sleep(200 * time.Millisecond)
-
-	control := PrefetchRange{Offset: 1000, Size: 1 << 10}
-	got := jpWait(t, jpColumnRead(fs, "object", control, 2*time.Second), 3*time.Second, "the control read")
-	require.NoError(t, got.err)
-	require.Equal(t, data[control.Offset:control.Offset+control.Size], got.data)
-	require.Len(t, s.readsOf(key), 1, "the control read is served by the written bytes")
-
-	r := PrefetchRange{Offset: 3 << 20, Size: 1 << 10}
-	done := jpColumnRead(fs, "object", r, 10*time.Second)
-	require.Never(t, func() bool { return len(done) > 0 }, 200*time.Millisecond, time.Millisecond,
-		"the read waits for the fill it joined")
-	require.Len(t, s.readsOf(key), 1, "the read does not read the bytes again")
-	jpBystander(t, fs, other)
-	releaseStall()
-	got = jpWait(t, done, 5*time.Second, "the joined read")
-	require.NoError(t, got.err)
-	require.Equal(t, data[r.Offset:r.Offset+r.Size], got.data)
-	probeWaitIdle(t, fs)
-	require.Equal(t, 1, s.overlapping(key, r.Offset, r.Offset+r.Size), "the bytes are read once")
 }
 
-// (a) A read of bytes a running file-backed background fill of a range writes late joins
-// it. Control: a read of bytes outside the fill reads them itself, at once.
+// (a) A read of bytes a running background fill of a range writes late, file or memory
+// backed, joins it, as a column read or an exact read of the whole range; a read skipping
+// disk-cache reads reads its bytes itself. Control: a read of bytes the fill has written is
+// served by them at once, and a read of bytes outside the fill reads them itself, at once.
+// Once the fill ends, its range serves later reads.
 func TestJoinProbeReadJoinsSlowRunningRangeFileFill(t *testing.T) {
-	fs, s, data, other := jpFS(t, 6<<20)
-	fs.diskCache.memoryPrefetchMax = 64 << 10
-	key := fs.pathToKey("object")
 	fill := PrefetchRange{Offset: 0, Size: 4 << 20}
-	st := newJPStall(512 << 10)
-	releaseStall := sync.OnceFunc(func() { close(st.release) })
-	defer releaseStall()
-	s.stall = func(r jpRead) *jpStall {
-		if r.key == key && r.start == fill.Offset && r.end == fill.Offset+fill.Size {
-			return st
-		}
-		return nil
+	late := PrefetchRange{Offset: 3584 << 10, Size: 1 << 10}
+	for _, tc := range []struct {
+		name   string
+		memory bool
+		policy Policy
+		r      PrefetchRange
+		joins  bool
+	}{
+		{"file/column", false, ColumnPrefetch, late, true},
+		{"memory/column", true, ColumnPrefetch, late, true},
+		{"file/exact whole range", false, ExactColumnsRead, fill, true},
+		{"file/exact skipping disk-cache reads", false, ExactColumnsRead | SkipDiskCacheReads | SkipDiskCacheWrites, late, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, s, data, other := jpFS(t, 6<<20)
+			if !tc.memory {
+				fs.diskCache.memoryPrefetchMax = 64 << 10
+			}
+			key := fs.pathToKey("object")
+			st := newJPStall(512 << 10)
+			releaseStall := sync.OnceFunc(func() { close(st.release) })
+			defer releaseStall()
+			s.stall = func(r jpRead) *jpStall {
+				if r.key == key && r.start == fill.Offset && r.end == fill.Offset+fill.Size {
+					return st
+				}
+				return nil
+			}
+			require.NoError(t, fs.PrefetchObject(context.Background(), ObjectPrefetch{FilePath: "object", Size: fill.Size,
+				Ranges: []PrefetchRange{fill}, Scan: &PrefetchScan{}}))
+			require.Eventually(t, func() bool { return st.sent.Load() >= st.after }, 5*time.Second, time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
+			f := &fs.diskCache.prefetchObjects
+			f.mu.Lock()
+			for _, fl := range f.m[fs.diskCache.objectKey("object")] {
+				require.Equal(t, tc.memory, fl.joinableDownload().memory)
+			}
+			f.mu.Unlock()
+
+			for _, control := range []PrefetchRange{{Offset: 1000, Size: 1 << 10}, {Offset: 5 << 20, Size: 1 << 10}} {
+				got := jpWait(t, jpColumnRead(fs, "object", control, 2*time.Second), 3*time.Second, "the control read")
+				require.NoError(t, got.err)
+				require.Equal(t, data[control.Offset:control.Offset+control.Size], got.data)
+				require.Equal(t, 1, s.overlapping(key, control.Offset, control.Offset+control.Size))
+			}
+
+			done := jpReadOf(fs, "object", tc.policy, tc.r, 10*time.Second)
+			if tc.joins {
+				require.Never(t, func() bool { return len(done) > 0 }, 200*time.Millisecond, time.Millisecond,
+					"the read waits for the fill it joined")
+				jpBystander(t, fs, other)
+				releaseStall()
+			}
+			got := jpWait(t, done, 5*time.Second, "the read")
+			require.NoError(t, got.err)
+			require.Equal(t, data[tc.r.Offset:tc.r.Offset+tc.r.Size], got.data)
+			releaseStall()
+			probeWaitIdle(t, fs)
+			reads := map[bool]int{true: 1, false: 2}[tc.joins]
+			require.Equal(t, reads, s.overlapping(key, tc.r.Offset, tc.r.Offset+tc.r.Size), "the bytes are read once by the fill")
+			later := PrefetchRange{Offset: 2 << 20, Size: 1 << 10}
+			got = jpWait(t, jpColumnRead(fs, "object", later, 2*time.Second), 3*time.Second, "the later read")
+			require.NoError(t, got.err)
+			require.Equal(t, data[later.Offset:later.Offset+later.Size], got.data)
+			require.Equal(t, 1, s.overlapping(key, later.Offset, later.Offset+later.Size), "the cached range serves it")
+		})
 	}
-	require.NoError(t, fs.PrefetchObject(context.Background(), ObjectPrefetch{FilePath: "object", Size: fill.Size,
-		Ranges: []PrefetchRange{fill}, Scan: &PrefetchScan{}}))
-	require.Eventually(t, func() bool { return st.sent.Load() >= st.after }, 5*time.Second, time.Millisecond)
-	time.Sleep(200 * time.Millisecond)
-
-	control := PrefetchRange{Offset: 5 << 20, Size: 1 << 10}
-	got := jpWait(t, jpColumnRead(fs, "object", control, 2*time.Second), 3*time.Second, "the control read")
-	require.NoError(t, got.err)
-	require.Equal(t, data[control.Offset:control.Offset+control.Size], got.data)
-	require.Equal(t, 1, s.overlapping(key, control.Offset, control.Offset+control.Size))
-
-	r := PrefetchRange{Offset: 3584 << 10, Size: 1 << 10}
-	done := jpColumnRead(fs, "object", r, 10*time.Second)
-	require.Never(t, func() bool { return len(done) > 0 }, 200*time.Millisecond, time.Millisecond,
-		"the read waits for the fill it joined")
-	jpBystander(t, fs, other)
-	releaseStall()
-	got = jpWait(t, done, 5*time.Second, "the joined read")
-	require.NoError(t, got.err)
-	require.Equal(t, data[r.Offset:r.Offset+r.Size], got.data)
-	probeWaitIdle(t, fs)
-	require.Equal(t, 1, s.overlapping(key, r.Offset, r.Offset+r.Size), "the bytes are read once")
 }
 
 // (b) A read of bytes two running fills and a gap between them hold joins both fills and
@@ -2079,21 +1516,7 @@ func TestJoinProbePrefetchRangeReadSplitsBlockAtFill(t *testing.T) {
 	require.Eventually(t, func() bool { return len(s.readsOf(key)) == 1 }, 5*time.Second, time.Millisecond)
 
 	read := func(r PrefetchRange, timeout time.Duration) <-chan jpResult {
-		done := make(chan jpResult, 1)
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			defer cancel()
-			vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache,
-				Entries: []IOEntry{{Offset: r.Offset, Size: r.Size}}}
-			if err := fs.Read(ctx, vec); err != nil {
-				done <- jpResult{err: err}
-				return
-			}
-			got := slices.Clone(vec.Entries[0].Data)
-			vec.Release()
-			done <- jpResult{data: got}
-		}()
-		return done
+		return jpReadOf(fs, "object", 0, r, timeout)
 	}
 	control := PrefetchRange{Offset: 4*unit + 100, Size: 100}
 	got := jpWait(t, read(control, 2*time.Second), 3*time.Second, "the control read")
@@ -2116,16 +1539,21 @@ func TestJoinProbePrefetchRangeReadSplitsBlockAtFill(t *testing.T) {
 	require.Equal(t, 1, s.overlapping(key, fill.Offset+fill.Size, r.Offset+r.Size), "the bytes after the fill are read once")
 }
 
-// (c) A joined fill that ends short of its range leaves the read to read its own bytes:
-// it returns them. Control: the same read with the fill not short is served by the fill.
+// (c) A joined fill that ends short of its range leaves the read to read exactly its own
+// bytes: it returns them. A joined fill whose source fails after a prefix fails the read
+// with the source's error. Control: the same read with the fill not short is served by the
+// fill.
 func TestJoinProbeJoinedFillEndsShort(t *testing.T) {
-	for _, short := range []bool{false, true} {
-		name := map[bool]string{false: "control", true: "short"}[short]
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		after       int64
+		short, fail bool
+	}{{name: "control"}, {name: "short", short: true}, {name: "failed after a prefix", after: 512, fail: true}} {
+		t.Run(tc.name, func(t *testing.T) {
 			fs, s, data, other := jpFS(t, 300<<10)
 			key := fs.pathToKey("object")
 			fill := PrefetchRange{Offset: 40 << 10, Size: 1 << 10}
-			st := newJPStall(0)
+			st := newJPStall(tc.after)
 			releaseStall := sync.OnceFunc(func() { close(st.release) })
 			defer releaseStall()
 			var once sync.Once
@@ -2138,21 +1566,29 @@ func TestJoinProbeJoinedFillEndsShort(t *testing.T) {
 			}
 			require.NoError(t, fs.PrefetchObject(context.Background(), ObjectPrefetch{FilePath: "object", Size: fill.Size,
 				Ranges: []PrefetchRange{fill}, Scan: &PrefetchScan{}}))
-			require.Eventually(t, func() bool { return len(s.readsOf(key)) == 1 }, 5*time.Second, time.Millisecond)
+			require.Eventually(t, func() bool { return st.sent.Load() >= tc.after && len(s.readsOf(key)) == 1 },
+				5*time.Second, time.Millisecond)
 			done := jpColumnRead(fs, "object", fill, 10*time.Second)
 			require.Never(t, func() bool { return len(done) > 0 }, 100*time.Millisecond, time.Millisecond,
 				"the read waits for the fill it joined")
 			require.Len(t, s.readsOf(key), 1)
 			jpBystander(t, fs, other)
-			st.short.Store(short)
+			st.short.Store(tc.short)
+			st.fail.Store(tc.fail)
 			releaseStall()
 			got := jpWait(t, done, 5*time.Second, "the joined read")
+			probeWaitIdle(t, fs)
+			if tc.fail {
+				require.ErrorContains(t, got.err, "injected source failure")
+				return
+			}
 			require.NoError(t, got.err)
 			require.Equal(t, data[fill.Offset:fill.Offset+fill.Size], got.data)
-			probeWaitIdle(t, fs)
-			if !short {
-				require.Len(t, s.readsOf(key), 1, "the fill serves the read")
+			want := []jpRead{{key: key, start: fill.Offset, end: fill.Offset + fill.Size}}
+			if tc.short {
+				want = append(want, want[0])
 			}
+			require.Equal(t, want, s.readsOf(key), "the fill serves the read, or it reads its own bytes")
 		})
 	}
 }
@@ -2197,11 +1633,13 @@ func TestJoinProbeJoinedFillDeleted(t *testing.T) {
 }
 
 // (d) A read that joins a waiting background fill makes it foreground: it runs while every
-// background fill is held, before an earlier waiting background fill. Control: that
-// earlier fill runs only once the background fills are free.
+// background fill and all background room are held, before an earlier waiting background
+// fill. Control: that earlier fill runs only once the background fills are free.
 func TestJoinProbeJoinedWaitingFillRunsFirst(t *testing.T) {
 	fs, s, data, _ := jpFS(t, 300<<10)
 	releaseBusy := probeBusy(t, fs)
+	freeRoom := occupy(t, fs.server, backgroundRequest, fs.server.backgroundMax-1)
+	defer freeRoom()
 	key, otherKey := fs.pathToKey("object"), fs.pathToKey("other")
 	ctx := context.Background()
 	early := PrefetchRange{Offset: 0, Size: 1 << 10}
@@ -2219,6 +1657,7 @@ func TestJoinProbeJoinedWaitingFillRunsFirst(t *testing.T) {
 	require.Len(t, s.readsOf(key), 1, "the joined fill serves the read")
 	require.True(t, probeQueued(fs, "other"), "the earlier background fill still waits")
 	require.Empty(t, s.readsOf(otherKey))
+	freeRoom()
 	releaseBusy()
 	probeWaitIdle(t, fs)
 	require.Len(t, s.readsOf(otherKey), 1)
@@ -2228,7 +1667,78 @@ func TestJoinProbeJoinedWaitingFillRunsFirst(t *testing.T) {
 // of the disk cache, which reads its bytes itself; a running fill into the disk cache, held,
 // is not joined by a read of the index-file cache. Control: each held fill still ends with
 // its object cached.
+// A prefetch of the object into one cache after or during a prefetch into the other, held
+// at its download or at its publication, fills its own cache: each cache is filled, and
+// the object is read once for each.
 func TestJoinProbeCachesNeverJoinEachOther(t *testing.T) {
+	type sequence struct{ first, second, hold string }
+	var sequences []sequence
+	for _, sq := range []sequence{
+		{"disk object", "index object", "download"},
+		{"index object", "disk object", "download"},
+		{"disk file", "index object", "publication"},
+		{"disk object", "index object", "publication"},
+	} {
+		sequences = append(sequences, sq, sequence{sq.first, sq.second, sq.hold + " overlapped"})
+	}
+	sequences = append(sequences, sequence{"disk file", "index file", "none"})
+	for _, sq := range sequences {
+		t.Run(sq.first+" then "+sq.second+"/"+sq.hold, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				fs, storage, data := newIndexObjectFS(t, true)
+				hold, overlap := strings.CutSuffix(sq.hold, " overlapped")
+				key := fs.pathToKey("object")
+				g := newBlackBoxStorage(fs.server.raw, func(string, int64) bool { return hold == "download" })
+				fs.server.raw = g
+				held := make(chan struct{})
+				release := sync.OnceFunc(func() { close(g.gate); close(held) })
+				defer release()
+				publishing := make(chan struct{})
+				var first atomic.Bool
+				fs.diskCache.hooks.beforeFilePublication = func() {
+					if hold == "publication" && first.CompareAndSwap(false, true) {
+						close(publishing)
+						<-held
+					}
+				}
+				prefetch := func(kind string) error {
+					ctx := context.Background()
+					if strings.HasPrefix(kind, "index") {
+						ctx = WithFileServicePolicy(ctx, IndexFileObject)
+					}
+					if strings.HasSuffix(kind, "file") {
+						return fs.PrefetchFile(ctx, "object")
+					}
+					return fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: int64(len(data))})
+				}
+				firstDone := make(chan error, 1)
+				go func() { firstDone <- prefetch(sq.first) }()
+				switch hold {
+				case "download":
+					require.Eventually(t, func() bool { cur, _, _ := g.counts(key); return cur == 1 }, 5*time.Second, time.Millisecond)
+				case "publication":
+					<-publishing
+				}
+				if !overlap {
+					release()
+					require.NoError(t, <-firstDone)
+					waitPrefetcherIdle(t, fs)
+					flushPublishers(fs)
+				}
+				require.NoError(t, prefetch(sq.second))
+				if overlap {
+					synctest.Wait()
+					release()
+					require.NoError(t, <-firstDone)
+				}
+				waitPrefetcherIdle(t, fs)
+				flushPublishers(fs)
+				require.True(t, fs.diskCache.cache.Contains(fs.diskCache.wholePath("object", int64(len(data)))))
+				require.True(t, fs.indexObjectHeld("object"))
+				require.EqualValues(t, 2, storage.reads.Load())
+			})
+		})
+	}
 	for _, held := range []string{"index", "disk"} {
 		t.Run(held, func(t *testing.T) {
 			fs, _, data := newIndexObjectFS(t, true)
@@ -2293,40 +1803,6 @@ func probeRead(fs *S3FS, r PrefetchRange) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	return readColumnRange(ctx, fs, r)
-}
-
-// A column read of a range whose fill waits, while every background fill and all
-// background room are held, joins the fill and is served by it: the object is read once.
-// Control: a read of another range is read on its own.
-func TestFillProbeReadJoinsWaitingFillWhileBackgroundRoomHeld(t *testing.T) {
-	fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
-	releaseBusy := probeBusy(t, fs)
-	key := fs.pathToKey("object")
-	g := newBlackBoxStorage(fs.server.raw, func(string, int64) bool { return false })
-	fs.server.raw = g
-	freeRoom := occupy(t, fs.server, backgroundRequest, fs.server.backgroundMax-1)
-	defer freeRoom()
-	r := PrefetchRange{Offset: 40 << 10, Size: 1 << 10}
-	require.NoError(t, fs.PrefetchObject(context.Background(), ObjectPrefetch{FilePath: "object", Size: r.Size,
-		Ranges: []PrefetchRange{r}, Scan: &PrefetchScan{}}))
-	require.True(t, probeQueued(fs, "object"))
-
-	got, err := probeRead(fs, r)
-	require.NoError(t, err)
-	require.Equal(t, data[r.Offset:r.Offset+r.Size], got)
-	require.False(t, probeQueued(fs, "object"), "the read promoted the fill")
-	freeRoom()
-	releaseBusy()
-	probeWaitIdle(t, fs)
-	_, _, total := g.counts(key)
-	require.Equal(t, 1, total, "the read is served by the fill it joined")
-
-	control := PrefetchRange{Offset: 100 << 10, Size: 1 << 10}
-	got, err = probeRead(fs, control)
-	require.NoError(t, err)
-	require.Equal(t, data[control.Offset:control.Offset+control.Size], got)
-	_, _, total = g.counts(key)
-	require.Equal(t, 2, total)
 }
 
 // A prefetch of bytes a running fill does not hold gets a fill of its own at once, read
@@ -2486,6 +1962,7 @@ func (s *startRecorder) offsets() []int64 {
 // most half of it, the others running file-backed at once, and a foreground read gets a
 // buffer and returns while they hold theirs.
 // A read that joins a running background fill moves its buffer to the foreground charge.
+// Every range is read once.
 func TestFillProbeFlightBytesWithinBudget(t *testing.T) {
 	fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
 	buf := flightBufSize(1 << 10)
@@ -2553,6 +2030,8 @@ func TestFillProbeFlightBytesWithinBudget(t *testing.T) {
 	bytes, background = probeFlightBytes(fs)
 	require.Zero(t, bytes)
 	require.Zero(t, background)
+	_, _, total := g.counts(key)
+	require.Equal(t, len(ranges)+1, total, "each range and the bystander are read once")
 }
 
 // A read that joins a waiting fill of a whole object large enough to split starts its
@@ -2575,91 +2054,153 @@ func TestFillProbeSplitStartsAtJoinedReadBlock(t *testing.T) {
 
 // The fills of one object into the index-file cache and the disk cache are apart: a read
 // of the disk cache joins only the disk cache's fill, and each cache is filled once.
+// Control: the index-file cache's fill of another object.
 func TestFillProbeIndexAndDiskFillsIndependent(t *testing.T) {
-	fs, storage, data := newIndexObjectFS(t, true)
-	releaseBusy := probeBusy(t, fs)
-	ctx := context.Background()
-	req := ObjectPrefetch{FilePath: "object", Size: int64(len(data))}
-	require.NoError(t, fs.PrefetchObject(WithFileServicePolicy(ctx, IndexFileObject), req))
-	require.NoError(t, fs.PrefetchObject(ctx, req))
-	vec := &IOVector{FilePath: "object", Policy: SkipMemoryCache, Entries: []IOEntry{{Offset: 100, Size: 10}}}
-	require.NoError(t, fs.Read(ctx, vec))
-	require.Equal(t, data[100:110], vec.Entries[0].Data)
-	vec.Release()
-	require.True(t, probeQueued(fs, "object"), "the index-file cache's fill still waits")
-	require.False(t, fs.indexObjectHeld("object"))
-	releaseBusy()
-	probeWaitIdle(t, fs)
-	require.True(t, fs.indexObjectHeld("object"))
-	require.True(t, fs.diskCache.cache.Contains(fs.diskCache.wholePath("object", int64(len(data)))))
-	require.EqualValues(t, 2, storage.reads.Load(), "each cache is filled once")
+	for _, indexPath := range []string{"object", "another-object"} {
+		t.Run(indexPath, func(t *testing.T) {
+			fs, storage, data := newIndexObjectFS(t, true)
+			ctx := context.Background()
+			require.NoError(t, fs.Write(ctx, IOVector{FilePath: "another-object", Policy: SkipAllCache,
+				Entries: []IOEntry{{Size: int64(len(data)), Data: data}}}))
+			releaseBusy := probeBusy(t, fs)
+			require.NoError(t, fs.PrefetchObject(WithFileServicePolicy(ctx, IndexFileObject),
+				ObjectPrefetch{FilePath: indexPath, Size: int64(len(data))}))
+			require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: int64(len(data))}))
+			vec := &IOVector{FilePath: "object", Policy: SkipMemoryCache, Entries: []IOEntry{{Offset: 100, Size: 10}}}
+			require.NoError(t, fs.Read(ctx, vec))
+			require.Equal(t, data[100:110], vec.Entries[0].Data)
+			vec.Release()
+			require.True(t, probeQueued(fs, indexPath), "the index-file cache's fill still waits")
+			require.False(t, fs.indexObjectHeld(indexPath))
+			releaseBusy()
+			probeWaitIdle(t, fs)
+			require.True(t, fs.indexObjectHeld(indexPath))
+			require.True(t, fs.diskCache.cache.Contains(fs.diskCache.wholePath("object", int64(len(data)))))
+			require.EqualValues(t, 2, storage.reads.Load(), "each cache is filled once")
+		})
+	}
 }
 
-// A delete of the object, or the closing of the file service, reaches its fills in each
-// state: waiting, joined by a read and waiting for room, and running. Afterwards no
-// fill, buffer or room is held, and the joined read returns.
+// A delete of the object, or the closing of the file service, reaches its fills, memory or
+// file backed ranges or a whole object, in each state: waiting, joined by a read and
+// waiting for room (memory ranges), waiting for background room, and running beside a waiting
+// sibling. Afterwards no
+// fill, buffer or room is held, the joined read returns, no fill reads object storage
+// later, and after a delete nothing of the object is cached and a read of the object
+// written again gets its new bytes. A delete reaches a waiting fill through the path
+// qualified by the service.
 func TestFillProbeDeleteAndCloseReachEveryState(t *testing.T) {
 	for _, event := range []string{"delete", "close"} {
-		for _, state := range []string{"waiting", "promoted", "running"} {
-			t.Run(event+"/"+state, func(t *testing.T) {
-				fs, _, _ := newPrefetchRangeFS(t, 0, 300<<10)
-				ctx := context.Background()
-				r := PrefetchRange{Offset: 40 << 10, Size: 1 << 10}
-				key := fs.pathToKey("object")
-				g := newBlackBoxStorage(fs.server.raw, func(k string, _ int64) bool { return state == "running" && k == key })
-				fs.server.raw = g
-				defer sync.OnceFunc(func() { close(g.gate) })()
-				joined := make(chan error, 1)
-				freeBuffer := func() {}
-				switch state {
-				case "waiting":
-					probeBusy(t, fs)
-				case "promoted":
-					probeBusy(t, fs)
+		for _, kind := range []string{"range", "file range", "whole"} {
+			for _, state := range []string{"waiting", "promoted", "room", "running"} {
+				if kind != "range" && state == "promoted" {
+					continue
 				}
-				baseRoom := heldRoom(fs.server)
-				baseBytes, _ := probeFlightBytes(fs)
-				require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: r.Size,
-					Ranges: []PrefetchRange{r}, Scan: &PrefetchScan{}}))
-				switch state {
-				case "waiting":
-					require.True(t, probeQueued(fs, "object"))
-				case "promoted":
-					freeBuffer = fillRoom(t, fs.server)
-					go func() {
-						_, err := readColumnRange(ctx, fs, r)
-						joined <- err
-					}()
-					require.Eventually(t, func() bool { return probeJoinedRunning(fs, "object") }, 2*time.Second, time.Millisecond)
-				case "running":
-					require.Eventually(t, func() bool { cur, _, _ := g.counts(key); return cur == 1 }, 5*time.Second, time.Millisecond)
-				}
-				if event == "delete" {
-					// The delete drops the fills before its own request waits for room.
-					deleted := make(chan error, 1)
-					go func() { deleted <- fs.Delete(ctx, "object") }()
-					require.Eventually(t, func() bool { return !probeUnderWay(fs, "object") }, 2*time.Second, time.Millisecond)
-					freeBuffer()
-					require.NoError(t, <-deleted)
-				} else {
-					fs.Close(ctx)
-				}
-				freeBuffer()
-				if state == "promoted" {
-					select {
-					case <-joined:
-					case <-time.After(2 * time.Second):
-						t.Fatal("the joined read did not return")
+				t.Run(event+"/"+kind+"/"+state, func(t *testing.T) {
+					fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
+					ctx := context.Background()
+					r := PrefetchRange{Offset: 40 << 10, Size: 1 << 10}
+					req := ObjectPrefetch{FilePath: "object", Size: int64(len(data)), Scan: &PrefetchScan{}}
+					if kind != "whole" {
+						req.Ranges = columnRanges(3, 40<<10, 1<<10)
+						req.Size = 3 << 10
 					}
-				}
-				require.Eventually(t, func() bool {
-					return !probeQueued(fs, "object") && !probeUnderWay(fs, "object")
-				}, 2*time.Second, time.Millisecond)
-				require.Eventually(t, func() bool {
-					bytes, _ := probeFlightBytes(fs)
-					return heldRoom(fs.server) <= baseRoom && bytes <= baseBytes
-				}, 2*time.Second, time.Millisecond, "the fill holds no room and no buffer")
-			})
+					if kind == "file range" {
+						fs.diskCache.memoryPrefetchMax = 1
+					}
+					key := fs.pathToKey("object")
+					g := newBlackBoxStorage(fs.server.raw, func(k string, _ int64) bool { return state == "running" && k == key })
+					fs.server.raw = g
+					releaseGate := sync.OnceFunc(func() { close(g.gate) })
+					defer releaseGate()
+					joined := make(chan error, 1)
+					freeRoom := func() {}
+					switch state {
+					case "waiting", "promoted":
+						probeBusy(t, fs)
+					case "running":
+						fs.diskCache.setFillsMax(2)
+					}
+					baseRoom := heldRoom(fs.server)
+					baseBytes, _ := probeFlightBytes(fs)
+					if state == "room" {
+						freeRoom = occupy(t, fs.server, backgroundRequest, fs.server.backgroundMax)
+					}
+					require.NoError(t, fs.PrefetchObject(ctx, req))
+					opens := 0
+					switch state {
+					case "waiting":
+						require.True(t, probeQueued(fs, "object"))
+					case "promoted":
+						freeRoom = fillRoom(t, fs.server)
+						go func() {
+							_, err := readColumnRange(ctx, fs, r)
+							joined <- err
+						}()
+						require.Eventually(t, func() bool { return probeJoinedRunning(fs, "object") }, 2*time.Second, time.Millisecond)
+					case "room":
+						require.Eventually(t, func() bool { _, waiting := fs.server.counts(); return waiting[backgroundRequest] > 0 },
+							2*time.Second, time.Millisecond)
+					case "running":
+						opens = 1
+						if kind != "whole" {
+							opens = 2
+						}
+						require.Eventually(t, func() bool { cur, _, _ := g.counts(key); return cur == opens }, 5*time.Second, time.Millisecond)
+					}
+					if event == "delete" {
+						path := "object"
+						if state == "waiting" {
+							path = JoinPath(fs.Name(), path)
+						}
+						// The delete drops the fills before its own request waits for room.
+						deleted := make(chan error, 1)
+						go func() { deleted <- fs.Delete(ctx, path) }()
+						require.Eventually(t, func() bool { return !probeUnderWay(fs, "object") }, 2*time.Second, time.Millisecond)
+						freeRoom()
+						require.NoError(t, <-deleted)
+					} else {
+						fs.Close(ctx)
+					}
+					freeRoom()
+					if state == "promoted" {
+						select {
+						case <-joined:
+						case <-time.After(2 * time.Second):
+							t.Fatal("the joined read did not return")
+						}
+					}
+					require.Eventually(t, func() bool {
+						return !probeQueued(fs, "object") && !probeUnderWay(fs, "object")
+					}, 2*time.Second, time.Millisecond)
+					require.Eventually(t, func() bool {
+						bytes, _ := probeFlightBytes(fs)
+						return heldRoom(fs.server) <= baseRoom && bytes <= baseBytes
+					}, 2*time.Second, time.Millisecond, "the fill holds no room and no buffer")
+					_, _, total := g.counts(key)
+					if state == "promoted" {
+						// The joined read may read its own bytes.
+						opens = total
+					}
+					require.Equal(t, opens, total)
+					releaseGate()
+					require.Never(t, func() bool { _, _, total := g.counts(key); return total > opens }, 50*time.Millisecond,
+						time.Millisecond, "no fill reads object storage later")
+					if event == "close" {
+						return
+					}
+					require.Empty(t, fs.diskCache.objectFiles("object"))
+					rewritten := slices.Clone(data)
+					for i := range rewritten {
+						rewritten[i] ^= 0xff
+					}
+					require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Policy: SkipAllCache,
+						Entries: []IOEntry{{Size: int64(len(rewritten)), Data: rewritten}}}))
+					got, err := readColumnRange(ctx, fs, r)
+					require.NoError(t, err)
+					require.Equal(t, rewritten[r.Offset:r.Offset+r.Size], got)
+				})
+			}
 		}
 	}
 }
@@ -2850,20 +2391,6 @@ func waitFillsIdle(t *testing.T, d *DiskCache) {
 	}, 10*time.Second, time.Millisecond)
 }
 
-// prefetchRanges queues the fills of ranges of the object, read through open when it is
-// set, and waits until they end.
-func prefetchRanges(fs *S3FS, ranges []PrefetchRange, open func(ctx context.Context, start, end int64) (io.ReadCloser, error)) {
-	if open != nil {
-		fs.server.raw = openerStorage{ObjectStorage: fs.server.raw, open: open}
-	}
-	var size int64
-	for _, r := range ranges {
-		size += r.Size
-	}
-	_ = fs.PrefetchObject(context.Background(), ObjectPrefetch{FilePath: "object", Size: size, Ranges: ranges})
-	waitFillsEnd(fs.diskCache, "object")
-}
-
 // waitObjectsEnd waits until no fill of the object at filePath runs.
 func waitObjectsEnd(d *DiskCache, filePath string) { waitRegistered(d, filePath, false) }
 
@@ -3000,22 +2527,26 @@ func TestWholeObjectOfUnknownSizePublishedAtFoundSize(t *testing.T) {
 }
 
 // A prefetch of an object whose size no prefetch told learns it from object storage when
-// a cached range starts at the object's start, and downloads only what is not cached.
+// a cached range starts at the object's start, and downloads only what is not cached; a
+// failed stat leaves it to download the object as one of unknown size.
 func TestPrefetchOfWarmWholeObjectLearnsItsSize(t *testing.T) {
+	startCached := func(t *testing.T, fs *S3FS, data []byte) {
+		require.NoError(t, fs.diskCache.Update(context.Background(), &IOVector{FilePath: "object",
+			Entries: []IOEntry{{Offset: 0, Size: 100, Data: data[:100]}}}, false))
+	}
 	for _, tc := range []struct {
-		name     string
-		cached   func(*testing.T, *S3FS, []byte)
-		stats    int64
-		download bool
+		name      string
+		cached    func(*testing.T, *S3FS, []byte)
+		stats     int64
+		download  bool
+		statFails bool
 	}{
 		{name: "whole object cached", stats: 1, cached: func(t *testing.T, fs *S3FS, _ []byte) {
 			require.NoError(t, fs.PrefetchFile(context.Background(), "object"))
 			flushPublishers(fs)
 		}},
-		{name: "start of the object cached", stats: 1, download: true, cached: func(t *testing.T, fs *S3FS, data []byte) {
-			require.NoError(t, fs.diskCache.Update(context.Background(), &IOVector{FilePath: "object",
-				Entries: []IOEntry{{Offset: 0, Size: 100, Data: data[:100]}}}, false))
-		}},
+		{name: "start of the object cached", stats: 1, download: true, cached: startCached},
+		{name: "stat fails", stats: 1, download: true, statFails: true, cached: startCached},
 		{name: "nothing from the start cached", download: true, cached: func(t *testing.T, fs *S3FS, data []byte) {
 			require.NoError(t, fs.diskCache.Update(context.Background(), &IOVector{FilePath: "object",
 				Entries: []IOEntry{{Offset: 100, Size: 100, Data: data[100:200]}}}, false))
@@ -3028,6 +2559,9 @@ func TestPrefetchOfWarmWholeObjectLearnsItsSize(t *testing.T) {
 			// The sizes known in the process are lost, as at a restart.
 			d.prefetched = prefetchedObjects{}
 			stats := &statCountingStorage{ObjectStorage: storage}
+			if tc.statFails {
+				stats.ObjectStorage = failingStatStorage{storage}
+			}
 			fs.server.raw = stats
 			reads := storage.reads.Load()
 
@@ -3042,19 +2576,6 @@ func TestPrefetchOfWarmWholeObjectLearnsItsSize(t *testing.T) {
 			require.True(t, d.cache.Contains(d.wholePath("object", int64(len(data)))))
 		})
 	}
-}
-
-// A failed stat of the object leaves the fill to download it as an object of unknown
-// size.
-func TestPrefetchOfWarmObjectWithFailedStatDownloads(t *testing.T) {
-	fs, storage, data := newPrefetchRangeFS(t, 0, 300<<10)
-	require.NoError(t, fs.diskCache.Update(context.Background(), &IOVector{FilePath: "object",
-		Entries: []IOEntry{{Offset: 0, Size: 100, Data: data[:100]}}}, false))
-	fs.server.raw = failingStatStorage{storage}
-	require.NoError(t, fs.PrefetchFile(context.Background(), "object"))
-	flushPublishers(fs)
-	require.Equal(t, int64(1), storage.reads.Load())
-	require.True(t, fs.diskCache.cache.Contains(fs.diskCache.wholePath("object", int64(len(data)))))
 }
 
 type failingStatStorage struct{ ObjectStorage }
@@ -3121,23 +2642,9 @@ func TestWholeObjectDeleteAndEvictionAsOneRange(t *testing.T) {
 	})
 }
 
-// A range of an object cached from its start that no whole-object fill published does not
-// count as its whole object.
-func TestRangeFromObjectStartIsNotTrackedAsWholeObject(t *testing.T) {
-	ctx := context.Background()
-	cache := newLifecycleTestDiskCache(t)
-	data := rangeTestData(100)
-	require.NoError(t, cache.Update(ctx, &IOVector{FilePath: "obj",
-		Entries: []IOEntry{{Offset: 0, Size: 100, Data: data}}}, false))
-	path := cache.wholePath("obj", 100)
-	require.True(t, cache.cache.Contains(path))
-	cache.preloads.mu.Lock()
-	defer cache.preloads.mu.Unlock()
-	require.NotContains(t, cache.preloads.served, path)
-}
-
 // Cache files named as whole objects by an earlier version are removed at startup, from
-// the disk cache and the index-file cache; range files stay.
+// the disk cache and the index-file cache; range files stay, also those of an object named
+// "full", and no whole object is named as an old one.
 func TestStartupRemovesOldWholeFiles(t *testing.T) {
 	ctx := context.Background()
 	for _, dirEntries := range []bool{false, true} {
@@ -3159,6 +2666,7 @@ func TestStartupRemovesOldWholeFiles(t *testing.T) {
 				write("fullfoo"+cacheFileSuffix, "whole"),
 			}
 			kept := write(filepath.Join(diskCacheShard("obj"), "0-3obj"+cacheFileSuffix), "abc")
+			keptFull := write(filepath.Join(diskCacheShard("fullobj"), "0-3fullobj"+cacheFileSuffix), "abc")
 
 			cache, err := newDiskCache(ctx, dir, fscache.ConstCapacity(1<<20), nil, false, nil, "", "",
 				diskCacheOptions{dirEntries: dirEntries})
@@ -3168,8 +2676,11 @@ func TestStartupRemovesOldWholeFiles(t *testing.T) {
 				require.NoFileExists(t, path)
 				require.False(t, cache.cache.Contains(path))
 			}
-			require.FileExists(t, kept)
-			require.True(t, cache.cache.Contains(kept))
+			for _, path := range []string{kept, keptFull} {
+				require.FileExists(t, path)
+				require.True(t, cache.cache.Contains(path))
+			}
+			require.False(t, cache.isOldWholeFile(cache.wholePath("full", 3)))
 			if !dirEntries {
 				done, got := readObjectEntry(t, cache, "obj", 1, 2)
 				require.True(t, done)
@@ -3177,23 +2688,6 @@ func TestStartupRemovesOldWholeFiles(t *testing.T) {
 			}
 		})
 	}
-}
-
-// Only a path named "full" and an object path, in the cache's directory or a shard, is
-// an old whole file.
-func TestIsOldWholeFile(t *testing.T) {
-	cache := newLifecycleTestDiskCache(t)
-	for rel, want := range map[string]bool{
-		filepath.Join(diskCacheShard("obj"), "fullobj"+cacheFileSuffix):            true,
-		filepath.Join(diskCacheShard("dir/obj"), "fulldir", "obj"+cacheFileSuffix): true,
-		"fullfoo" + cacheFileSuffix:                                            true,
-		filepath.Join(diskCacheShard("obj"), "0-3obj"+cacheFileSuffix):         false,
-		filepath.Join(diskCacheShard("fullobj"), "0-3fullobj"+cacheFileSuffix): false,
-		filepath.Join(diskCacheShard("obj"), "fullobj"+cacheFileTempSuffix):    false,
-	} {
-		require.Equal(t, want, cache.isOldWholeFile(filepath.Join(cache.path, rel)), rel)
-	}
-	require.False(t, strings.HasPrefix(filepath.Base(cache.wholePath("full", 3)), "full"))
 }
 
 // Fix-missing is accepted and ignored: no object is restored from the disk cache.
@@ -3216,60 +2710,6 @@ func TestFixMissingIsIgnored(t *testing.T) {
 	require.True(t, moerr.IsMoErrCode(err, moerr.ErrFileNotFound), "%v", err)
 	<-fs.(*S3FS).diskCache.load.done
 	require.NoFileExists(t, old)
-}
-
-// A range read whose prefetch run would be a FilePrefetchObject joins a whole-object
-// download stalled on its first byte: it waits for the download, reads no range of its
-// own, and gets its bytes once the download goes on.
-func TestDiskCacheTransitionFileRunJoinsSlowWholeDownload(t *testing.T) {
-	const size = 8 << 20
-	fs, _, data := newPrefetchRangeFS(t, 1<<20, size)
-	fs.diskCache.memoryPrefetchMax = 256 << 10
-
-	key := fs.pathToKey("object")
-	// The whole-object download stalls on its first byte.
-	g := newBlackBoxStorage(fs.server.raw, func(k string, offset int64) bool { return k == key && offset == 0 })
-	fs.server.raw = g
-	release := sync.OnceFunc(func() { close(g.gate) })
-	defer release()
-
-	ctx := context.Background()
-	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: size, Scan: &PrefetchScan{}}))
-	diskPath := fs.diskCache.objectKey("object")
-	require.Eventually(t, func() bool {
-		cur, _, _ := g.counts(key)
-		return cur == 1 && fs.diskCache.download(diskPath) != nil
-	}, 5*time.Second, time.Millisecond)
-
-	readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	off := int64(6 << 20)
-	type result struct {
-		data []byte
-		err  error
-	}
-	done := make(chan result, 1)
-	go func() {
-		vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache,
-			Entries: []IOEntry{{Offset: off, Size: 64 << 10}}}
-		err := fs.Read(readCtx, vec)
-		var got []byte
-		if err == nil {
-			got = slices.Clone(vec.Entries[0].Data)
-		}
-		vec.Release()
-		done <- result{got, err}
-	}()
-	require.Never(t, func() bool { return len(done) > 0 }, 200*time.Millisecond, time.Millisecond,
-		"the read waits for the stalled download it joined")
-	_, _, total := g.counts(key)
-	require.Equal(t, 1, total, "the read reads no range of its own")
-	release()
-	r := <-done
-	require.NoError(t, r.err)
-	require.Equal(t, data[off:off+64<<10], r.data)
-	_, _, total = g.counts(key)
-	require.Equal(t, 1, total)
 }
 
 // ProbeStallStorage returns readers of whole reads that send their first n bytes, then wait
@@ -3310,67 +2750,6 @@ func (s *probeStallStorage) Read(ctx context.Context, key string, min, max *int6
 	return &probeStallReader{ctx: ctx, r: r, left: s.n}, nil
 }
 
-// A whole-object download its read no longer waits for, whose source stalls, stops
-// And frees its connection, its publication, update slot and the download.
-func TestDiskCacheTransitionAbandonedStalledDownloadFreesResources(t *testing.T) {
-	shortIdle(t, 50*time.Millisecond)
-	fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
-	fs.server.raw = &probeStallStorage{ObjectStorage: fs.server.raw, n: 64 << 10}
-	got, err := readFullObjectOf(fs, 10, 10)
-	require.NoError(t, err)
-	require.Equal(t, data[10:20], got)
-	d := fs.diskCache
-	diskPath := d.objectKey("object")
-	require.Eventually(t, func() bool {
-		d.pub.mu.Lock()
-		pending := d.pub.mu.pending
-		d.pub.mu.Unlock()
-		return heldRoom(fs.server) == 0 && d.download(diskPath) == nil &&
-			pending == 0 && fillsRunning(fs.server) == 0
-	}, 5*time.Second, time.Millisecond)
-	require.Empty(t, d.objectFiles("object"))
-}
-
-// An entry read before a delete, whose async publication is queued when the object is
-// deleted, is removed by the delete; a later read after a rewrite gets the new bytes.
-func TestDiskCacheTransitionAsyncEntryPublicationAfterDeleteRewrite(t *testing.T) {
-	fs, _, data := newPrefetchRangeFS(t, 0, 64<<10)
-	d := fs.diskCache
-	ctx := context.Background()
-	hold, held := make(chan struct{}), make(chan struct{})
-	var once sync.Once
-	d.hooks.beforeFilePublication = func() {
-		once.Do(func() {
-			close(held)
-			<-hold
-		})
-	}
-	vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache | ExactRead,
-		Entries: []IOEntry{{Offset: 100, Size: 10}}}
-	require.NoError(t, fs.Read(ctx, vec))
-	require.Equal(t, data[100:110], vec.Entries[0].Data)
-	vec.Release()
-	<-held
-	// The delete waits for the publication queued before it.
-	deleted := make(chan error, 1)
-	go func() { deleted <- fs.Delete(ctx, "object") }()
-	require.Never(t, func() bool { return len(deleted) > 0 }, 20*time.Millisecond, time.Millisecond)
-	close(hold)
-	require.NoError(t, <-deleted)
-	v2 := make([]byte, len(data))
-	for i := range v2 {
-		v2[i] = ^data[i]
-	}
-	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(v2)), Data: v2}},
-		Policy: SkipDiskCache | SkipMemoryCache}))
-	d.Flush(ctx)
-	vec = &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache | ExactRead,
-		Entries: []IOEntry{{Offset: 100, Size: 10}}}
-	require.NoError(t, fs.Read(ctx, vec))
-	require.Equal(t, v2[100:110], vec.Entries[0].Data, "no stale bytes after delete and rewrite")
-	vec.Release()
-}
-
 // A disk-cache read under way when the cache closes keeps no file open past it.
 func TestDiskCacheTransitionReadDuringCloseKeepsNoOpenFile(t *testing.T) {
 	fs, _, data := newPrefetchRangeFS(t, 0, 64<<10)
@@ -3395,72 +2774,61 @@ func TestDiskCacheTransitionReadDuringCloseKeepsNoOpenFile(t *testing.T) {
 	require.Zero(t, kept, "a file kept open after Close is never closed")
 }
 
-// prefetchFileRange prefetches the bytes [start, end) of the object as a
-// FilePrefetchObject.
-func prefetchFileRange(ctx context.Context, fs *S3FS, start, end int64) error {
-	fs.diskCache.memoryPrefetchMax = 64 << 10
-	prefetchRanges(fs, []PrefetchRange{{Offset: start, Size: end - start}}, nil)
-	return ctx.Err()
-}
-
-// A read of bytes a FilePrefetchObject has written is served from its download, while
-// the download still runs.
-func TestFilePrefetchServesReadsWhileItDownloads(t *testing.T) {
-	fs, _, data := newPrefetchRangeFS(t, 0, 256<<10)
-	storage := &stallingStorage{ObjectStorage: fs.server.raw, after: 64 << 10, stalled: make(chan struct{}), release: make(chan struct{})}
-	fs.server.raw = storage
-	ctx := context.Background()
-	done := make(chan error, 1)
-	go func() {
-		err := prefetchFileRange(ctx, fs, 1000, 200<<10)
-		done <- err
-	}()
-	<-storage.stalled
-
-	vec := &IOVector{FilePath: "object", Policy: ColumnPrefetch | SkipFullFilePreloads | SkipMemoryCache,
-		Entries: []IOEntry{{Offset: 1100, Size: 100}}}
-	require.NoError(t, fs.Read(ctx, vec))
-	require.Equal(t, data[1100:1200], vec.Entries[0].Data)
-	vec.Release()
-	require.Equal(t, int64(1), storage.reads.Load(), "the read is served from the download")
-	close(storage.release)
-	require.NoError(t, <-done)
-	_, cached := fs.diskCache.ranges.covering(fs.diskCache.objectKey("object"), 1000, 200<<10-1000)
-	require.True(t, cached)
-}
-
-// A delete of an object cancels its FilePrefetchObject under way, which caches nothing: a
-// read after the object is recreated returns the new object.
-func TestDeleteCancelsFilePrefetch(t *testing.T) {
-	fs, _, data := newPrefetchRangeFS(t, 0, 256<<10)
-	storage := &stallingStorage{ObjectStorage: fs.server.raw, after: 4096, stalled: make(chan struct{}), release: make(chan struct{})}
-	fs.server.raw = storage
-	ctx := context.Background()
-	done := make(chan error, 1)
-	go func() {
-		err := prefetchFileRange(ctx, fs, 0, 200<<10)
-		done <- err
-	}()
-	<-storage.stalled
-
-	require.NoError(t, fs.Delete(ctx, "object"))
-	require.True(t, storage.canceled.Load(), "the delete cancels the download")
-	close(storage.release)
-	<-done
-	recreated := slices.Clone(data)
-	for i := range recreated {
-		recreated[i] ^= 0xff
-	}
-	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(recreated)), Data: recreated}}, Policy: SkipAllCache}))
-	_, cached := fs.diskCache.ranges.covering(fs.diskCache.objectKey("object"), 0, 200<<10)
-	require.False(t, cached)
-	require.Equal(t, recreated[100:110], readRangeOf(t, fs, ColumnPrefetch, 100, 10))
-}
-
 // A range prefetch of at least the split size, memory- or file-backed, reads its range in
 // one request and caches it as one range. Control: a whole object of the same size,
 // prefetched first, splits into its parts.
+// The whole-object download of a read or a prefetch of an object of at least the split
+// size whose size is known reads its 64KiB-aligned parts, each its own request even with
+// room for one, and caches the whole object, never asking object storage for its size; a
+// smaller object or one of unknown size downloads in one open-ended request.
 func TestRangeFillProbeOneRequestWholeObjectSplits(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		size          int
+		min           int64
+		unknown, room bool
+		prefetch      bool
+		starts        []int64
+	}{
+		{name: "split", size: 300<<10 + 17, min: 128 << 10, starts: []int64{0, 192 << 10}},
+		{name: "room for one", size: 300 << 10, min: 128 << 10, room: true, starts: []int64{0, 192 << 10}},
+		{name: "prefetch tells the size", size: 300 << 10, min: 128 << 10, unknown: true, prefetch: true, starts: []int64{0, 192 << 10}},
+		{name: "small", size: 300 << 10, min: 1 << 20},
+		{name: "unknown size", size: 300 << 10, min: 128 << 10, unknown: true},
+	} {
+		t.Run("whole/"+tc.name, func(t *testing.T) {
+			fs, storage, data := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: tc.min}, tc.size)
+			d := fs.diskCache
+			if tc.unknown {
+				d.prefetched = prefetchedObjects{}
+			}
+			if tc.room {
+				limitRoom(t, fs.server, 1, 1)
+			}
+			stats := &statCountingStorage{ObjectStorage: fs.server.raw}
+			fs.server.raw = stats
+			if tc.prefetch {
+				fs.prefetchObject(context.Background(), ObjectPrefetch{FilePath: "object", Size: int64(tc.size)})
+			} else {
+				got, err := readFullObjectOf(fs, 250<<10, 10)
+				require.NoError(t, err)
+				require.Equal(t, data[250<<10:250<<10+10], got)
+			}
+			flushPublishers(fs)
+			reads := int64(max(1, len(tc.starts)))
+			require.Equal(t, reads, storage.reads.Load())
+			storage.mu.Lock()
+			require.ElementsMatch(t, tc.starts, storage.starts)
+			storage.mu.Unlock()
+			require.Zero(t, stats.stats.Load())
+			require.Zero(t, heldRoom(fs.server), "its requests free their room")
+			require.True(t, d.cache.Contains(d.wholePath("object", int64(tc.size))))
+			got, err := readFullObjectOf(fs, 0, int64(tc.size))
+			require.NoError(t, err)
+			require.Equal(t, data, got)
+			require.Equal(t, reads, storage.reads.Load(), "the cached whole object serves later reads")
+		})
+	}
 	const size = 1 << 20
 	for _, backing := range []string{"memory", "file"} {
 		t.Run(backing, func(t *testing.T) {
@@ -3500,4 +2868,34 @@ func TestRangeFillProbeOneRequestWholeObjectSplits(t *testing.T) {
 			require.Len(t, starts.offsets(), 3, "the read is served from the cache")
 		})
 	}
+}
+
+// The automatic prefetch unit is the bandwidth-delay product rounded up to a power of two
+// within its bounds; a read of no bytes or no time leaves the cost model unchanged.
+func TestAutoPrefetchUnit(t *testing.T) {
+	require.Equal(t, int64(64<<10), autoPrefetchUnit(0))
+	require.Equal(t, int64(64<<10), autoPrefetchUnit(1000))
+	require.Equal(t, int64(4<<20), autoPrefetchUnit(25e-3*100*(1<<20)))
+	require.Equal(t, int64(2<<20), autoPrefetchUnit(2<<20))
+	require.Equal(t, int64(8<<20), autoPrefetchUnit(100e-3*2000*(1<<20)))
+	require.Equal(t, int64(16<<20), prefetchRangeConfig{on: true, fixed: 16 << 20}.unit())
+	require.Equal(t, int64(0), prefetchRangeConfig{fixed: 16 << 20}.unit())
+
+	m := newRangeReadCostModel(0.02, 100<<20)
+	m.observe(0, time.Second)
+	m.observe(1<<20, 0)
+	require.Equal(t, rangeReadCost{latency: 0.02, bytesPerS: 100 << 20}, m.get())
+}
+
+// A flight larger than the largest kept size gets a buffer of its own size, which is not
+// kept; a buffer of a capacity not a kept size is not kept either.
+func TestFlightBufBeyondKeptSizes(t *testing.T) {
+	n := int64(1)<<flightBufMaxShift + 1
+	require.Equal(t, n, flightBufSize(n))
+	b := getFlightBuf(n)
+	require.Equal(t, n, int64(len(b)))
+	require.Equal(t, n, int64(cap(b)))
+	putFlightBuf(b)
+	putFlightBuf(make([]byte, 3))
+	require.Equal(t, int64(1)<<flightBufMinShift, int64(cap(getFlightBuf(3))))
 }
