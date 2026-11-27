@@ -239,7 +239,7 @@ func newDiskCache(
 		object := ret.ranges.objectOfFile(path)
 		return func() {
 			ret.pub.queue(object, queuedJob{"evict", path}, func() error {
-				err := ret.removeEvictedFile(path, size)
+				err := ret.removeEvictedFile(path, object, size)
 				if err != nil {
 					logutil.Error("delete disk cache file",
 						zap.Any("error", err),
@@ -260,9 +260,11 @@ func newDiskCache(
 		capacityBytes.Set(float64(capacityFunc()))
 	}
 	ret.cache = lrucache.NewWithPrepareEvict(capacityFunc, postSet, nil, prepareEvict, postEvict)
-	if opts.dirEntries {
-		ret.cache.SetEvictable(func(path string) bool { return !ret.dirHeld(path) })
-	}
+	// Eviction passes over stale ranges and held entry directories.
+	ret.cache.SetEvictable(func(path string) bool {
+		_, stale := ret.ranges.stale.Load(path)
+		return !stale && (!opts.dirEntries || !ret.dirHeld(path))
+	})
 	ret.files.limit = opts.openFilesMax
 	ret.pub.init(ret)
 	ret.initWriteFailureState()
@@ -600,6 +602,9 @@ func (d *DiskCache) Read(
 	openPath := func(diskPath string) (opened openedDiskCacheFile, newlyOpened bool, ok bool) {
 		if opened, ok = openedFiles[diskPath]; ok {
 			return opened, false, true
+		}
+		if _, stale := d.ranges.stale.Load(diskPath); stale {
+			return openedDiskCacheFile{}, false, false
 		}
 		if opened, ok = d.files.open(ctx, diskPath); !ok {
 			if d.cache.Contains(diskPath) {
@@ -1328,9 +1333,10 @@ func (d *DiskCache) pathForIOEntry(path string, entry IOEntry) string {
 	)
 }
 
-// removeEvictedFile removes, on the publisher, the file of size bytes at path, evicted,
-// unless path was indexed again.
-func (d *DiskCache) removeEvictedFile(path string, size int64) error {
+// removeEvictedFile removes, on the publisher, the file of size bytes at path of object,
+// evicted, unless path was indexed again. A file it cannot remove is put back in the
+// cache, stale.
+func (d *DiskCache) removeEvictedFile(path, object string, size int64) error {
 	if d.cache.Contains(path) {
 		return nil
 	}
@@ -1339,13 +1345,15 @@ func (d *DiskCache) removeEvictedFile(path string, size int64) error {
 	}
 	err := os.Remove(path)
 	d.files.changed(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
+	if err != nil && !os.IsNotExist(err) {
+		d.ranges.retire(path, object)
+		d.cache.Set(context.Background(), path, struct{}{}, size)
 		return err
 	}
-	metric.FSDiskCacheEvictCounter.Add(1)
+	d.ranges.stale.Delete(path)
+	if err == nil {
+		metric.FSDiskCacheEvictCounter.Add(1)
+	}
 	return nil
 }
 
@@ -1469,24 +1477,30 @@ func (d *DiskCache) deletePath(ctx context.Context, path string) error {
 	return d.pub.remove(ctx, key, func() error { return d.removeRanges(key) })
 }
 
-// removeRanges removes the cached ranges of the object with key, each one whatever the
-// others return, and returns their errors joined. A range whose file is not removed stays
-// indexed.
+// removeRanges removes the cached ranges of the object with key, stale or not, each one
+// whatever the others return, and returns their errors joined. A range whose file is not
+// removed stays in the cache, stale.
 func (d *DiskCache) removeRanges(key string) error {
 	ctx := context.Background()
 	var errs []error
+	paths := d.ranges.staleOf(key)
 	for _, r := range d.ranges.of(key) {
-		err := os.Remove(r.diskPath)
-		d.files.changed(r.diskPath)
+		paths = append(paths, r.diskPath)
+	}
+	for _, path := range paths {
+		err := os.Remove(path)
+		d.files.changed(path)
 		if err != nil && !os.IsNotExist(err) {
+			d.ranges.retire(path, key)
 			errs = append(errs, err)
 			continue
 		}
-		if d.cache.Contains(r.diskPath) {
-			d.preloads.deleted(r.diskPath)
+		if d.cache.Contains(path) {
+			d.preloads.deleted(path)
 		}
-		d.ranges.remove(r.diskPath)
-		d.cache.Delete(ctx, r.diskPath)
+		d.ranges.remove(path)
+		d.ranges.stale.Delete(path)
+		d.cache.Delete(ctx, path)
 	}
 	return errors.Join(errs...)
 }
@@ -1532,6 +1546,9 @@ type cachedRanges struct {
 	mu       sync.Mutex        // held by add and remove
 	byObject sync.Map          // object key -> *rangeSnapshot
 	objectOf map[string]string // diskPath -> object key, under mu
+	// stale holds, by diskPath, the object keys of the range files that could not be
+	// removed: they stay in the cache for their bytes and are not indexed or read.
+	stale sync.Map
 }
 
 // rangeSnapshot is the cached ranges of an object, sorted by offset. reach[i] is the index
@@ -1658,6 +1675,9 @@ func (c *cachedRanges) add(root, diskPath string) {
 	if _, ok := c.objectOf[diskPath]; ok {
 		return
 	}
+	if _, ok := c.stale.Load(diskPath); ok {
+		return
+	}
 	if c.objectOf == nil {
 		c.objectOf = make(map[string]string)
 	}
@@ -1673,7 +1693,29 @@ func (c *cachedRanges) objectOfFile(diskPath string) string {
 	if key, ok := c.objectOf[diskPath]; ok {
 		return key
 	}
+	if key, ok := c.stale.Load(diskPath); ok {
+		return key.(string)
+	}
 	return diskPath
+}
+
+// retire makes the range file at diskPath of the object with key stale until it is
+// removed from stale.
+func (c *cachedRanges) retire(diskPath, key string) {
+	c.stale.Store(diskPath, key)
+	c.remove(diskPath)
+}
+
+// staleOf returns the stale range files of the object with key.
+func (c *cachedRanges) staleOf(key string) []string {
+	var out []string
+	c.stale.Range(func(path, k any) bool {
+		if k.(string) == key {
+			out = append(out, path.(string))
+		}
+		return true
+	})
+	return out
 }
 
 // remove forgets the range file at diskPath.

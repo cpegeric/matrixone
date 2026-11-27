@@ -666,6 +666,9 @@ type diskFillTarget struct {
 // held reports whether the file at diskPath is indexed and on disk. Otherwise the file
 // written is renamed over what is there, and replaces its index entry.
 func (t diskFillTarget) held(ctx context.Context) bool {
+	if _, stale := t.d.ranges.stale.Load(t.diskPath); stale {
+		return false
+	}
 	if _, ok := t.d.cache.Get(ctx, t.diskPath); ok {
 		if _, err := os.Stat(t.diskPath); err == nil {
 			return true
@@ -701,6 +704,7 @@ func (t diskFillTarget) index(ctx context.Context, size int64) {
 	logutil.Debug("disk cache file written",
 		zap.Any("path", t.diskPath),
 	)
+	t.d.ranges.stale.Delete(t.diskPath)
 	if !t.d.cache.Replace(ctx, t.diskPath, struct{}{}, size) {
 		t.d.cache.Set(ctx, t.diskPath, struct{}{}, size)
 	}

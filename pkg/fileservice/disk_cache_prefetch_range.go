@@ -1091,7 +1091,7 @@ func (d *DiskCache) readCachedRange(ctx context.Context, key string, r cachedRan
 
 // dropCachedRange has the publisher remove the cached range at diskPath of the object with
 // key, whose file f is short or unreadable, while f is still its file. A range whose file
-// is not removed stays indexed.
+// is not removed stays in the cache, stale.
 func (d *DiskCache) dropCachedRange(key, diskPath string, f *os.File) {
 	info, err := f.Stat()
 	if err != nil {
@@ -1104,6 +1104,7 @@ func (d *DiskCache) dropCachedRange(key, diskPath string, f *os.File) {
 		err := os.Remove(diskPath)
 		d.files.changed(diskPath)
 		if err != nil && !os.IsNotExist(err) {
+			d.ranges.retire(diskPath, key)
 			return err
 		}
 		d.cache.Delete(context.Background(), diskPath)

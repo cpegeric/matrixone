@@ -1548,7 +1548,57 @@ func TestDeleteDuringFillReadsNewVersion(t *testing.T) {
 	}
 }
 
-// A range whose file a delete cannot remove stays indexed, and a later delete removes it.
+// A range whose file cannot be removed, by a delete or by an eviction, stays in the cache
+// and no read uses it: once the object is rewritten, a read of the range and one of bytes
+// within it return the new version, and a later delete removes the file. The control
+// removes the file at once.
+func TestUnremovableRangeIsNotRead(t *testing.T) {
+	for _, c := range []string{"delete", "eviction", "control"} {
+		t.Run(c, func(t *testing.T) {
+			ctx := context.Background()
+			fs, _, v1 := newPrefetchRangeFS(t, 0, 64<<10)
+			d := fs.diskCache
+			<-d.load.done
+			path := cacheRange(t, fs, 100, 10)
+			if c != "control" {
+				// A non-empty directory in place of the file cannot be removed as a file.
+				require.NoError(t, os.Remove(path))
+				require.NoError(t, os.Mkdir(path, 0755))
+				require.NoError(t, os.WriteFile(filepath.Join(path, "child"), []byte("x"), 0644))
+			}
+			if c == "eviction" {
+				d.cache.Delete(ctx, path)
+				d.Flush(ctx)
+				require.True(t, d.cache.Contains(path), "the range stays in the cache")
+			}
+			if err := fs.Delete(ctx, "object"); c == "control" {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+				require.True(t, d.cache.Contains(path), "the range stays in the cache")
+				// The file not removed holds the bytes of the old version.
+				require.NoError(t, os.RemoveAll(path))
+				require.NoError(t, os.WriteFile(path, v1[100:110], 0644))
+			}
+			v2 := slices.Clone(v1)
+			for i := range v2 {
+				v2[i]++
+			}
+			require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(v2)), Data: v2}},
+				Policy: SkipDiskCache | SkipMemoryCache}))
+			require.Equal(t, v2[102:108], readRangeOf(t, fs, 0, 102, 6))
+			require.Equal(t, v2[100:110], readRangeOf(t, fs, 0, 100, 10))
+			require.NoError(t, fs.Delete(ctx, "object"))
+			d.Flush(ctx)
+			require.False(t, d.cache.Contains(path))
+			_, err := os.Stat(path)
+			require.True(t, os.IsNotExist(err), "%v", err)
+		})
+	}
+}
+
+// A range whose file a delete cannot remove stays in the cache, stale, and a later delete
+// removes it.
 func TestDeleteKeepsUnremovableRangeIndexed(t *testing.T) {
 	ctx := context.Background()
 	fs, _, _ := newPrefetchRangeFS(t, 0, 64<<10)
@@ -1567,7 +1617,9 @@ func TestDeleteKeepsUnremovableRangeIndexed(t *testing.T) {
 	child := filepath.Join(path, "child")
 	require.NoError(t, os.WriteFile(child, []byte("x"), 0644))
 	require.Error(t, fs.Delete(ctx, "object"))
-	require.Equal(t, ranges, d.ranges.of(key))
+	require.Empty(t, d.ranges.of(key))
+	_, stale := d.ranges.stale.Load(path)
+	require.True(t, stale)
 	require.True(t, d.cache.Contains(path))
 	require.NoError(t, os.Remove(child))
 	require.NoError(t, fs.Delete(ctx, "object"))
