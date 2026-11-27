@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -484,148 +485,6 @@ func TestDiskCacheDeletePathsRejectsInvalidListAtomically(t *testing.T) {
 	require.Equal(t, []byte("foo"), vector.Entries[0].Data)
 }
 
-func TestDiskCacheEvictDefersPathBeingUpdated(t *testing.T) {
-	dir := t.TempDir()
-	ctx := context.Background()
-	cache, err := NewDiskCache(ctx, dir, fscache.ConstCapacity(1<<20), nil, false, nil, "")
-	require.NoError(t, err)
-	defer cache.Close(ctx)
-
-	err = cache.SetFile(ctx, "foo", func(context.Context) (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader([]byte("foo"))), nil
-	})
-	require.NoError(t, err)
-
-	diskPath := cache.wholePath("foo", 3)
-	doneUpdate := cache.startUpdate(diskPath)
-	cache.cache.Delete(ctx, diskPath)
-
-	_, err = os.Stat(diskPath)
-	require.NoError(t, err)
-	require.False(t, cache.cache.Contains(diskPath))
-
-	doneUpdate()
-	_, err = os.Stat(diskPath)
-	require.ErrorIs(t, err, os.ErrNotExist)
-}
-
-func TestDiskCacheUpdateCleanupRemovesUnindexedFile(t *testing.T) {
-	dir := t.TempDir()
-	ctx := context.Background()
-	cache, err := NewDiskCache(ctx, dir, fscache.ConstCapacity(1<<20), nil, false, nil, "")
-	require.NoError(t, err)
-	defer cache.Close(ctx)
-
-	err = cache.SetFile(ctx, "foo", func(context.Context) (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader([]byte("foo"))), nil
-	})
-	require.NoError(t, err)
-
-	diskPath := cache.wholePath("foo", 3)
-	doneUpdate := cache.startUpdateWithCleanup(diskPath, func() error {
-		return cache.removeUnindexedFile(diskPath)
-	})
-	cache.cache.Delete(ctx, diskPath)
-	require.NoError(t, doneUpdate())
-
-	_, err = os.Stat(diskPath)
-	require.True(t, os.IsNotExist(err))
-	require.False(t, cache.cache.Contains(diskPath))
-}
-
-func TestDiskCacheReadSkipsFullFileWhileUpdating(t *testing.T) {
-	dir := t.TempDir()
-	ctx := context.Background()
-	cache, err := NewDiskCache(ctx, dir, fscache.ConstCapacity(1<<20), nil, false, nil, "")
-	require.NoError(t, err)
-	defer cache.Close(ctx)
-
-	diskPath := cache.wholePath("foo", 3)
-	doneUpdate := cache.startUpdate(diskPath)
-	defer doneUpdate()
-
-	readVector := &IOVector{
-		FilePath: "foo",
-		Entries: []IOEntry{
-			{
-				Offset: 1,
-				Size:   2,
-			},
-		},
-	}
-
-	done := make(chan error, 1)
-	go func() {
-		done <- cache.Read(ctx, readVector)
-	}()
-
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("disk cache read should not wait for an in-progress full-file update")
-	}
-	require.False(t, readVector.Entries[0].done)
-	readVector.Release()
-}
-
-func TestDiskCacheReadWaitsForFullFileUpdateWithinShortWait(t *testing.T) {
-	dir := t.TempDir()
-	ctx := context.Background()
-	cache, err := NewDiskCache(ctx, dir, fscache.ConstCapacity(1<<20), nil, false, nil, "")
-	require.NoError(t, err)
-	defer cache.Close(ctx)
-
-	err = cache.SetFile(ctx, "foo", func(context.Context) (io.ReadCloser, error) {
-		return io.NopCloser(bytes.NewReader([]byte("abcdef"))), nil
-	})
-	require.NoError(t, err)
-
-	diskPath := cache.wholePath("foo", 6)
-	doneUpdate := cache.startUpdate(diskPath)
-	released := false
-	release := func() {
-		if !released {
-			doneUpdate()
-			released = true
-		}
-	}
-	defer release()
-
-	readCtx := WithEventLogger(ctx)
-	readVector := &IOVector{
-		FilePath: "foo",
-		Entries: []IOEntry{
-			{
-				Offset: 1,
-				Size:   3,
-			},
-		},
-	}
-	defer readVector.Release()
-
-	done := make(chan error, 1)
-	go func() {
-		done <- cache.Read(readCtx, readVector)
-	}()
-
-	require.Eventually(t, func() bool {
-		return countLoggedEvents(readCtx, str_disk_cache_wait_update_complete_begin) >= 2
-	}, time.Second, time.Millisecond)
-
-	release()
-
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("disk cache read should finish after the full-file update completes")
-	}
-	require.True(t, readVector.Entries[0].done)
-	require.Equal(t, []byte("bcd"), readVector.Entries[0].Data)
-	require.Equal(t, cache, readVector.Entries[0].fromCache)
-}
-
 func TestDiskCacheStaleRepairReplacesCacheEntrySize(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
@@ -675,6 +534,7 @@ func TestDiskCacheRemovesFileEvictedDuringWrite(t *testing.T) {
 
 	fooPath := cache.wholePath("foo", 8192)
 	require.False(t, cache.cache.Contains(fooPath))
+	cache.Flush(ctx)
 	_, err = os.Stat(fooPath)
 	require.True(t, os.IsNotExist(err))
 }
@@ -706,6 +566,7 @@ func TestDiskCacheDirSize(t *testing.T) {
 			},
 		}, false)
 		assert.Nil(t, err)
+		cache.Flush(ctx)
 		size := dirSize(dir)
 		assert.LessOrEqual(t, size, capacity)
 	}
@@ -1011,7 +872,7 @@ func TestDiskCacheBadWrite(t *testing.T) {
 			// bad reader
 			return nil, io.ErrUnexpectedEOF
 		},
-		false, notWholeFill, nil, nil, readMark{},
+		false, notWholeFill, nil, diskFillTarget{d: cache, diskPath: filepath.Join(dir, "foo")}, readMark{},
 	)
 	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
 	if written {
@@ -1087,7 +948,7 @@ func TestDiskCacheSetFromFile(t *testing.T) {
 		func(ctx context.Context) (io.ReadCloser, error) {
 			return os.Open(path)
 		},
-		false, notWholeFill, nil, nil, readMark{},
+		false, notWholeFill, nil, diskFillTarget{d: cache, diskPath: cache.wholePath("foo", 3)}, readMark{},
 	)
 	require.Nil(t, err)
 	require.True(t, written)
@@ -1155,7 +1016,7 @@ func TestDiskCacheQuotaExceeded(t *testing.T) {
 		func(ctx context.Context) (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader([]byte("foo"))), errorStr("disk quota exceeded")
 		},
-		false, notWholeFill, nil, nil, readMark{},
+		false, notWholeFill, nil, diskFillTarget{d: cache, diskPath: cache.wholePath("bar", 3)}, readMark{},
 	)
 
 }
@@ -1767,18 +1628,18 @@ func TestDiskCacheReadKeepsFileOpen(t *testing.T) {
 	got, ok := readTestEntry(t, ctx, cache, "foo", 10)
 	require.True(t, ok)
 	require.Equal(t, data, got)
-	cache.paths.L.Lock()
-	kept := cache.paths.openFiles.m[diskPath]
-	cache.paths.L.Unlock()
+	cache.files.mu.Lock()
+	kept := cache.files.m[diskPath]
+	cache.files.mu.Unlock()
 	require.NotNil(t, kept, "the read keeps its file open")
 	require.Zero(t, kept.refs)
 
 	got, ok = readTestEntry(t, ctx, cache, "foo", 10)
 	require.True(t, ok)
 	require.Equal(t, data, got)
-	cache.paths.L.Lock()
-	defer cache.paths.L.Unlock()
-	require.Same(t, kept, cache.paths.openFiles.m[diskPath], "the next read reads the kept file")
+	cache.files.mu.Lock()
+	defer cache.files.mu.Unlock()
+	require.Same(t, kept, cache.files.m[diskPath], "the next read reads the kept file")
 	require.Zero(t, kept.refs)
 }
 
@@ -1794,9 +1655,9 @@ func TestDiskCacheKeptFileClosedOnDeleteAndClose(t *testing.T) {
 		require.True(t, ok)
 	}
 	keptOf := func(p string) *openCacheFile {
-		cache.paths.L.Lock()
-		defer cache.paths.L.Unlock()
-		return cache.paths.openFiles.m[cache.pathForIOEntry(p, IOEntry{Offset: 0, Size: 3})]
+		cache.files.mu.Lock()
+		defer cache.files.mu.Unlock()
+		return cache.files.m[cache.pathForIOEntry(p, IOEntry{Offset: 0, Size: 3})]
 	}
 	foo, bar := keptOf("foo"), keptOf("bar")
 	require.NotNil(t, foo)
@@ -1815,7 +1676,8 @@ func TestDiskCacheKeptFileClosedOnDeleteAndClose(t *testing.T) {
 }
 
 // Past the most files kept, the least recently taken file no read holds is closed for a
-// new one; with every file held, a new file is not kept.
+// new one; with every file held, a new file is not kept. A file opened before a change of
+// its path is not kept.
 func TestOpenFilePoolLimit(t *testing.T) {
 	dir := t.TempDir()
 	open := func(name string) *os.File {
@@ -1823,35 +1685,41 @@ func TestOpenFilePoolLimit(t *testing.T) {
 		require.NoError(t, err)
 		return f
 	}
+	closed := func(f *os.File) bool {
+		_, err := f.Stat()
+		return errors.Is(err, os.ErrClosed)
+	}
 	o := openFilePool{limit: 2}
-	a, closeA := o.keepLocked("a", open("a"))
-	require.Nil(t, closeA)
-	b, _ := o.keepLocked("b", open("b"))
-	o.releaseLocked(a)
-	o.releaseLocked(b)
-	require.NotNil(t, o.takeLocked("a"))
-	o.releaseLocked(a)
+	a := o.keep("a", o.seq("a"), open("a"))
+	b := o.keep("b", o.seq("b"), open("b"))
+	o.release(a)
+	o.release(b)
+	require.NotNil(t, o.take("a"))
+	o.release(a)
 
-	c, closeFile := o.keepLocked("c", open("c"))
+	c := o.keep("c", o.seq("c"), open("c"))
 	require.NotNil(t, c)
-	require.Same(t, b.file, closeFile, "the least recently taken file is closed")
-	require.NoError(t, closeFile.Close())
+	require.True(t, closed(b.file), "the least recently taken file is closed")
 	require.Nil(t, o.m["b"])
 
-	require.NotNil(t, o.takeLocked("a"))
+	require.NotNil(t, o.take("a"))
 	d := open("d")
 	defer d.Close()
-	kept, closeFile := o.keepLocked("d", d)
-	require.Nil(t, kept, "with every file held, none is kept")
-	require.Nil(t, closeFile)
+	require.Nil(t, o.keep("d", o.seq("d"), d), "with every file held, none is kept")
+
+	seq := o.seq("e")
+	o.changed("e")
+	e := open("e")
+	defer e.Close()
+	o.release(c)
+	require.Nil(t, o.keep("e", seq, e), "a file opened before its path changed is not kept")
 
 	// A dropped file a read holds is closed when the read releases it.
-	require.Nil(t, o.releaseLocked(c))
-	dropped := o.dropAllLocked()
-	require.Equal(t, []*os.File{c.file}, dropped)
-	require.NoError(t, c.file.Close())
-	require.Same(t, a.file, o.releaseLocked(a))
-	require.NoError(t, a.file.Close())
+	o.closeAll()
+	require.True(t, closed(c.file))
+	require.False(t, closed(a.file))
+	o.release(a)
+	require.True(t, closed(a.file))
 }
 
 // Reads of an entry at once share its kept file and read its bytes while its object is
@@ -1908,9 +1776,9 @@ func TestDiskCacheMissingPathForgottenOnWrite(t *testing.T) {
 	diskPath := cache.pathForIOEntry("foo", IOEntry{Offset: 0, Size: 3})
 	_, ok := readTestEntry(t, ctx, cache, "foo", 3)
 	require.False(t, ok)
-	cache.paths.L.Lock()
-	require.True(t, cache.paths.openFiles.missingLocked(diskPath))
-	cache.paths.L.Unlock()
+	cache.files.mu.Lock()
+	require.Contains(t, cache.files.missing, diskPath)
+	cache.files.mu.Unlock()
 
 	require.NoError(t, cache.Update(ctx, &IOVector{FilePath: "foo", Entries: []IOEntry{{Offset: 0, Size: 3, Data: []byte("abc")}}}, false))
 	got, ok := readTestEntry(t, ctx, cache, "foo", 3)
@@ -1926,8 +1794,8 @@ func TestDiskOpenFilesMaxConfig(t *testing.T) {
 	limit := 3
 	config.DiskOpenFilesMax = &limit
 	caches := newTestFileServiceCaches(t, config)
-	require.Equal(t, 3, caches.disk.paths.openFiles.limit)
-	require.Equal(t, 3, caches.index.disk.paths.openFiles.limit)
+	require.Equal(t, 3, caches.disk.files.limit)
+	require.Equal(t, 3, caches.index.disk.files.limit)
 }
 
 // disk-open-files-max 0 keeps no file open and notes no path missing: every read opens the
@@ -1944,34 +1812,10 @@ func TestDiskOpenFilesMaxZeroDisablesPool(t *testing.T) {
 	got, ok := readTestEntry(t, ctx, cache, "foo", 3)
 	require.True(t, ok)
 	require.Equal(t, []byte("abc"), got)
-	cache.paths.L.Lock()
-	defer cache.paths.L.Unlock()
-	require.Empty(t, cache.paths.openFiles.m)
-	require.Empty(t, cache.paths.openFiles.missing)
-}
-
-func (d *DiskCache) startUpdate(path string) func() {
-	o, _ := d.paths.acquire(context.Background(), path, nil)
-	return func() { _ = o.release() }
-}
-
-func (d *DiskCache) startUpdateWithCleanup(path string, cleanup func() error) func() error {
-	o, _ := d.paths.acquire(context.Background(), path, cleanup)
-	return o.release
-}
-
-func (d *DiskCache) startUpdateContext(ctx context.Context, path string) (func(), error) {
-	o, err := d.paths.acquire(ctx, path, nil)
-	if err != nil {
-		return nil, err
-	}
-	return func() { _ = o.release() }, nil
-}
-
-func (d *DiskCache) isUpdating(path string) bool {
-	d.paths.L.Lock()
-	defer d.paths.L.Unlock()
-	return d.paths.owners[path] != nil
+	cache.files.mu.Lock()
+	defer cache.files.mu.Unlock()
+	require.Empty(t, cache.files.m)
+	require.Empty(t, cache.files.missing)
 }
 
 func TestIndexEvictionWithRenameFailureOverCapacity(t *testing.T) {
@@ -2005,25 +1849,15 @@ func TestIndexEvictionWithRenameFailureOverCapacity(t *testing.T) {
 				t.Cleanup(func() { require.NoError(t, os.Chmod(parent, 0o755)) })
 			}
 
-			attempts := 0
-			var restoreErr error
-			c.disk.hooks.beforeEvictionStart = func(path string) {
-				if path != entry {
-					return
-				}
-				attempts++
-				if tc.readOnly && attempts == 3 {
-					// Release the forced failure after observing that eviction retries
-					// the same path with no change in capacity or permissions.
-					restoreErr = os.Chmod(parent, 0o755)
-				}
-			}
-			t.Cleanup(func() { c.disk.hooks.beforeEvictionStart = nil })
 			require.Positive(t, c.disk.cache.Used())
 			capacity.Store(0)
 			c.disk.Evict(ctx, nil)
-			require.NoError(t, restoreErr)
-			require.Equal(t, 1, attempts, "eviction should finish after one attempt at the same path")
+			flushCtx, cancel := context.WithTimeout(ctx, diskCacheLifecycleTestTimeout)
+			defer cancel()
+			c.disk.Flush(flushCtx)
+			require.NoError(t, flushCtx.Err(), "the eviction of an entry it cannot remove ends")
+			require.Equal(t, tc.readOnly, c.disk.cache.Contains(entry), "an entry not removed stays indexed")
+			require.Equal(t, tc.readOnly, c.disk.dirHeld(entry), "and is not evicted again until the next tick")
 		})
 	}
 }
@@ -2158,11 +1992,11 @@ func TestIndexObjectReadRejectsEmptyRange(t *testing.T) {
 
 func TestRangeIndexSurvivesOlderEviction(t *testing.T) {
 	for _, tc := range []struct {
-		name                  string
-		reindexDuringEviction bool
+		name               string
+		readDuringEviction bool
 	}{
-		{name: "evict_without_reindex"},
-		{name: "evict_after_read_reindexes", reindexDuringEviction: true},
+		{name: "evict_without_read"},
+		{name: "evict_with_read", readDuringEviction: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -2179,21 +2013,16 @@ func TestRangeIndexSurvivesOlderEviction(t *testing.T) {
 			require.True(t, d.cache.Contains(path))
 			require.FileExists(t, path)
 
-			d.hooks.beforeEvictionStart = func(evicted string) {
-				if evicted != path || !tc.reindexDuringEviction {
-					return
-				}
-				require.False(t, d.cache.Contains(path), "old cache index record was removed")
+			d.cache.ForceEvict(ctx, d.cache.Used())
+			if tc.readDuringEviction {
 				vector := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads, Entries: []IOEntry{r.entry()}}
-				defer vector.Release()
 				require.NoError(t, d.Read(ctx, vector))
 				if vector.Entries[0].done {
 					require.Equal(t, data[r.Offset:r.Offset+r.Size], vector.Entries[0].Data)
 				}
-				t.Logf("read reindexed old file: %t", d.cache.Contains(path))
+				vector.Release()
 			}
-			t.Cleanup(func() { d.hooks.beforeEvictionStart = nil })
-			d.cache.ForceEvict(ctx, d.cache.Used())
+			d.Flush(ctx)
 			if !d.cache.Contains(path) {
 				// A completed eviction need not keep the range. Refill it to
 				// establish the same warm postcondition as a successful reindex.

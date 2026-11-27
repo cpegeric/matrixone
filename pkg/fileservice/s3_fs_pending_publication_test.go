@@ -264,7 +264,6 @@ func TestS3FSDefaultPolicyReadWhileFullObjectPublicationPending(t *testing.T) {
 			require.Equal(t, int64(len(data)), storage.bytes.Load()-leaderBytes)
 			require.False(t, fs.ioMerger.IsMerging(fs.readMergeKey(leader)))
 			diskPath := fs.diskCache.wholePath(object, int64(len(data)))
-			require.True(t, fs.diskCache.isUpdating(diskPath))
 			require.NoFileExists(t, diskPath)
 			require.False(t, fs.diskCache.cache.Contains(diskPath))
 
@@ -292,9 +291,11 @@ func TestS3FSDefaultPolicyReadWhileFullObjectPublicationPending(t *testing.T) {
 			before := storage.bytes.Load()
 			opensBefore := storage.opens.Load()
 			if mode == "cancel-between-entries" || mode == "error-between-entries" {
-				// A follower whose bytes no download covers reads them as bounded ranges.
+				// A follower whose bytes no download covers, preloading no whole object,
+				// reads them as bounded ranges.
 				key := fs.diskCache.objectKey(object)
 				fs.diskCache.finishDownload(fs.diskCache.download(key), fs.diskCache.wholeFill(key, false))
+				follower.Policy |= SkipFullFilePreloads
 				readCtx, stop := context.WithCancel(context.Background())
 				defer stop()
 				secondRead := make(chan struct{})
@@ -369,7 +370,6 @@ func TestS3FSDefaultPolicyReadWhileFullObjectPublicationPending(t *testing.T) {
 				fs.FlushCache(ctx)
 				return ctx.Err()
 			}))
-			require.False(t, fs.diskCache.isUpdating(diskPath))
 			if mode == "publication-failure" {
 				require.NoFileExists(t, diskPath)
 				require.False(t, fs.diskCache.cache.Contains(diskPath))
@@ -383,7 +383,6 @@ func TestS3FSDefaultPolicyReadWhileFullObjectPublicationPending(t *testing.T) {
 					fs.FlushCache(ctx)
 					return ctx.Err()
 				}))
-				require.False(t, fs.diskCache.isUpdating(diskPath))
 			}
 			require.FileExists(t, diskPath)
 			cached, err := os.ReadFile(diskPath)

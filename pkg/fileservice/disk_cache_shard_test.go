@@ -185,6 +185,7 @@ func TestDiskCacheLegacyLayoutFilesAreAgedOut(t *testing.T) {
 	}
 	setFile("foo")
 	setFile("bar")
+	cache.Flush(ctx)
 
 	// New files displace the never-read legacy files first, which removes them
 	// from disk.

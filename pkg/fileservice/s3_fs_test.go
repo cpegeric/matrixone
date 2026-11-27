@@ -971,7 +971,6 @@ func TestS3PrefetchFileDoesNotWaitForAsyncDiskFinalize(t *testing.T) {
 	diskPath := fs.diskCache.wholePath("foo/bar", 11)
 	_, err = os.Stat(diskPath)
 	require.ErrorIs(t, err, os.ErrNotExist)
-	require.True(t, fs.diskCache.isUpdating(diskPath))
 
 	unblock()
 	flushCtx, cancel := context.WithTimeout(ctx, diskCacheLifecycleTestTimeout)
@@ -1033,7 +1032,6 @@ func TestS3FSWriteDiskCacheFinalizeMode(t *testing.T) {
 			}
 
 			diskPath := fs.diskCache.wholePath("foo/bar", 11)
-			require.True(t, fs.diskCache.isUpdating(diskPath))
 			select {
 			case err := <-writeDone:
 				require.NoError(t, err)
@@ -1299,17 +1297,6 @@ func TestS3FSRangeReadSkipsFullObjectDiskCacheUpdate(t *testing.T) {
 	})
 	assert.Nil(t, err)
 
-	updatingPath := fs.diskCache.objectKey("foo/bar")
-	doneUpdate := fs.diskCache.startUpdate(updatingPath)
-	released := false
-	release := func() {
-		if !released {
-			doneUpdate()
-			released = true
-		}
-	}
-	defer release()
-
 	fullObjectVec := &IOVector{
 		FilePath: "foo/bar",
 		Entries: []IOEntry{
@@ -1358,12 +1345,10 @@ func TestS3FSRangeReadSkipsFullObjectDiskCacheUpdate(t *testing.T) {
 	case result := <-readDone:
 		assert.Nil(t, result.err)
 		assert.Equal(t, data[123:130], result.data)
-		assert.True(t, fs.diskCache.isUpdating(updatingPath))
 	case <-time.After(2 * time.Second):
 		releaseMerge()
-		release()
 		result := <-readDone
-		t.Fatalf("range read waited for full-object disk cache update or io merge: %v", result.err)
+		t.Fatalf("range read waited for full-object io merge: %v", result.err)
 	}
 }
 
@@ -1455,7 +1440,6 @@ func TestS3FSRangeReadSkipsFullObjectIOMergeBeforeDiskCacheUpdate(t *testing.T) 
 		assert.Nil(t, result.err)
 		assert.Equal(t, data[123:130], result.data)
 		assert.True(t, fs.ioMerger.IsMerging(fs.readMergeKey(fullObjectVec)))
-		assert.False(t, fs.diskCache.isUpdating(fs.diskCache.objectKey("foo/bar")))
 		read, ok := recorder.lastRead()
 		assert.True(t, ok)
 		if assert.NotNil(t, read.min) {
@@ -2227,7 +2211,6 @@ func TestS3FSReadFullObjectToDiskCacheStreamingDoesNotWaitForAsyncFinalize(t *te
 	// The streaming helper fills Data but leaves done unchanged for its caller,
 	// matching the existing full-object streaming contract.
 	require.False(t, vector.Entries[0].done)
-	require.True(t, cache.isUpdating(cache.objectKey("foo/bar")))
 
 	unblock()
 	flushCtx, cancel := context.WithTimeout(ctx, diskCacheLifecycleTestTimeout)
@@ -2299,7 +2282,6 @@ func TestS3FSReadIOMergerReleaseMatchesDiskFinalizeMode(t *testing.T) {
 				t.Fatalf("full-object read waited for disk finalization: %v", <-readDone)
 			}
 			require.False(t, fs.ioMerger.IsMerging(mergeKey))
-			require.True(t, fs.diskCache.isUpdating(fs.diskCache.objectKey("foo/bar")))
 
 			unblock()
 			require.Equal(t, []byte("ello"), vector.Entries[0].Data)
@@ -2380,7 +2362,6 @@ func TestS3FSRangeFollowerDoesNotWaitForAsyncDiskFinalize(t *testing.T) {
 	require.Equal(t, []byte("ello"), follower.Entries[0].Data)
 	require.Equal(t, int64(2), pcSet.FileService.S3.Get.Load())
 	diskPath := fs.diskCache.pathForIOEntry("foo/bar", follower.Entries[0])
-	require.True(t, fs.diskCache.isUpdating(diskPath))
 
 	unblock()
 	// Flush waits for the async finalizer to publish the cache file.  Keep a
@@ -2392,10 +2373,6 @@ func TestS3FSRangeFollowerDoesNotWaitForAsyncDiskFinalize(t *testing.T) {
 	defer cancel()
 	fs.FlushCache(flushCtx)
 	require.NoError(t, flushCtx.Err())
-	require.Eventually(t, func() bool {
-		return !fs.diskCache.isUpdating(diskPath)
-	}, diskCacheLifecycleTestTimeout, time.Millisecond,
-		"async range finalizer did not release its update reservation")
 	require.FileExists(t, diskPath)
 }
 
@@ -2490,7 +2467,6 @@ func TestS3FSReadFullObjectToDiskCacheStreamingReturnsOnceCaptured(t *testing.T)
 
 	require.NoError(t, waitResult(t, done))
 	require.Equal(t, []byte("ell"), vector.Entries[0].Data)
-	require.True(t, cache.isUpdating(cache.objectKey("foo/bar")))
 
 	close(release)
 	flushCtx, cancel := context.WithTimeout(ctx, diskCacheLifecycleTestTimeout)
@@ -4060,9 +4036,9 @@ func TestS3FSCacheUpdatesPreserveRetryOrder(t *testing.T) {
 	}
 }
 
-// Exercise both real disk-cache fallback paths while another fill owns the file.
+// Exercise the disk-cache fallback when the fill a read joined stops.
 func TestS3FSSparseDiskFallbackErrors(t *testing.T) {
-	for _, mode := range []string{"fill stopped", "fill admission skipped"} {
+	for _, mode := range []string{"fill stopped"} {
 		for _, tc := range []struct {
 			name                    string
 			first, second           int64
@@ -4088,41 +4064,24 @@ func TestS3FSSparseDiskFallbackErrors(t *testing.T) {
 			{name: "stream first", first: 9 << 20, second: 25 << 20, stream: true, secondErr: rangeStatusError{}, opens: 2, closes: 1},
 			{name: "writer first", first: 9 << 20, second: 25 << 20, writer: true, secondErr: rangeStatusError{}, opens: 2, closes: 1},
 		} {
-			// Streaming requests do not enter the full-file streaming fill path.
-			if mode == "fill admission skipped" && (tc.stream || tc.writer) {
-				continue
-			}
 			t.Run(mode+"/"+tc.name, func(t *testing.T) {
 				ctx, cancel := context.WithCancel(WithEventLogger(t.Context()))
 				defer cancel()
-				var disk *DiskCache
-				if mode == "fill stopped" {
-					// The download ends with no bytes once the read joined it.
-					var pw *io.PipeWriter
-					disk, pw, _ = downloading(t)
-					download := disk.download(disk.objectKey("obj"))
-					go func() {
-						for ctx.Err() == nil {
-							download.mu.Lock()
-							joined := len(download.waiters) > 0
-							download.mu.Unlock()
-							if joined {
-								_ = pw.Close()
-								return
-							}
-							time.Sleep(time.Millisecond)
+				// The download ends with no bytes once the read joined it.
+				disk, pw, _ := downloading(t)
+				download := disk.download(disk.objectKey("obj"))
+				go func() {
+					for ctx.Err() == nil {
+						download.mu.Lock()
+						joined := len(download.waiters) > 0
+						download.mu.Unlock()
+						if joined {
+							_ = pw.Close()
+							return
 						}
-					}()
-				} else {
-					var err error
-					disk, err = NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1<<20), nil, false, nil, "")
-					require.NoError(t, err)
-					t.Cleanup(func() { disk.Close(context.Background()) })
-					path := disk.objectKey("obj")
-					owner, ok := disk.paths.tryAcquire(path, nil)
-					require.True(t, ok)
-					t.Cleanup(func() { _ = owner.release() })
-				}
+						time.Sleep(time.Millisecond)
+					}
+				}()
 				fs, err := NewS3FS(ctx, ObjectStorageArguments{Name: "sparse", Endpoint: "disk", Bucket: t.TempDir()}, CacheConfig{}, nil, true, false)
 				require.NoError(t, err)
 				disk.prefetchRange, disk.memoryPrefetchMax = prefetchRangeConfig{}, 0
@@ -4223,7 +4182,7 @@ func TestS3FSSparseDiskFallbackErrors(t *testing.T) {
 					require.True(t, ok, "%v", err)
 					require.Equal(t, 416, status)
 				}
-				require.Equal(t, mode == "fill stopped", vector.fillStopped)
+				require.True(t, vector.fillStopped)
 				require.Equal(t, wantOpens, opens)
 				require.Equal(t, wantCloses, closes)
 				wantOffsets := []int64{tc.first}
@@ -4234,9 +4193,6 @@ func TestS3FSSparseDiskFallbackErrors(t *testing.T) {
 					wantOffsets = tc.offsets
 				}
 				require.Equal(t, wantOffsets, offsets)
-				if mode == "fill admission skipped" {
-					require.Equal(t, 1, storage.setFileEvents)
-				}
 				if err == nil {
 					// A read that got all its ranges updates its caller's cache.
 					require.EqualValues(t, 1, cache.updates.Load())
@@ -4810,25 +4766,12 @@ func TestFileRangeReadUsesCachePublishedWhileAdmitted(t *testing.T) {
 			}()
 			defer func() { cancel(); unblock(); <-readDone; vector.Release() }()
 			if tc.overlap {
-				path := fs.diskCache.objectKey("object")
-				objects := &fs.diskCache.prefetchObjects
-				require.Eventually(t, func() bool {
-					objects.mu.Lock()
-					defer objects.mu.Unlock()
-					for _, object := range objects.m[path] {
-						file, ok := object.(*filePrefetchObject)
-						if !ok {
-							continue
-						}
-						file.mu.Lock()
-						foregroundAttached := file.readStarted || file.holds > 1
-						file.mu.Unlock()
-						if foregroundAttached {
-							return true
-						}
-					}
-					return false
-				}, 3*time.Second, time.Millisecond, "foreground read should reach range admission while the background range owns the path")
+				// The read joins the background range, so it does not end before it.
+				select {
+				case <-readDone:
+					t.Fatal("the foreground read ended before the background range it joins")
+				case <-time.After(100 * time.Millisecond):
+				}
 				unblock()
 			}
 			select {
@@ -5076,6 +5019,7 @@ func TestDeleteInvalidatesCachedEntryForNestedPath(t *testing.T) {
 
 			write(1)
 			require.Equal(t, byte(1), read())
+			flushPublishers(fs)
 			reads := storage.reads.Load()
 			require.Equal(t, byte(1), read())
 			require.Equal(t, reads, storage.reads.Load(), "the entry is read from the disk cache")
@@ -5212,10 +5156,14 @@ func TestIndexPrefetchWithDirectDiskDownload(t *testing.T) {
 				publish := make(chan struct{})
 				release := sync.OnceFunc(func() { close(publish) })
 				defer release()
-				fs.diskCache.hooks.beforeFilePublication = sync.OnceFunc(func() {
-					close(publishing)
-					<-publish
-				})
+				// Only the first publication, that of the disk cache, waits.
+				var first atomic.Bool
+				fs.diskCache.hooks.beforeFilePublication = func() {
+					if first.CompareAndSwap(false, true) {
+						close(publishing)
+						<-publish
+					}
+				}
 
 				diskPrefetch := make(chan error, 1)
 				go func() { diskPrefetch <- fs.PrefetchFile(ctx, "object") }()
@@ -5674,10 +5622,14 @@ func TestIndexPrefetchAfterAsyncDiskDownload(t *testing.T) {
 				publicationEntered, publish := make(chan struct{}), make(chan struct{})
 				resumePublication := sync.OnceFunc(func() { close(publish) })
 				defer resumePublication()
-				fs.diskCache.hooks.beforeFilePublication = sync.OnceFunc(func() {
-					close(publicationEntered)
-					<-publish
-				})
+				// Only the first publication waits.
+				var first atomic.Bool
+				fs.diskCache.hooks.beforeFilePublication = func() {
+					if first.CompareAndSwap(false, true) {
+						close(publicationEntered)
+						<-publish
+					}
+				}
 
 				req := ObjectPrefetch{FilePath: "object", Size: int64(len(data))}
 				indexCtx := WithFileServicePolicy(ctx, IndexFileObject)
@@ -6144,15 +6096,24 @@ func TestDropCachedRangeKeepsRangeUntilUnlinked(t *testing.T) {
 			require.Equal(t, data[offset:offset+size], readRangeOf(t, fs, ExactRead, offset, size))
 			path := fs.diskCache.pathForIOEntry("object", IOEntry{Offset: offset, Size: size})
 			require.NoError(t, os.Truncate(path, 1))
+			drop := func() {
+				f, err := os.Open(path)
+				require.NoError(t, err)
+				fs.diskCache.dropCachedRange(fs.diskCache.objectKey("object"), path, f)
+				require.NoError(t, f.Close())
+				fs.diskCache.Flush(ctx)
+			}
 			if tc.readOnlyShard {
 				parent := filepath.Dir(path)
 				require.NoError(t, os.Chmod(parent, 0o555))
 				t.Cleanup(func() { require.NoError(t, os.Chmod(parent, 0o755)) })
-				fs.diskCache.dropCachedRange(ctx, path)
+				drop()
 				require.FileExists(t, path)
+				require.True(t, fs.diskCache.cache.Contains(path), "a range not unlinked stays indexed")
 				require.NoError(t, os.Chmod(parent, 0o755))
 			} else {
-				fs.diskCache.dropCachedRange(ctx, path)
+				drop()
+				require.False(t, fs.diskCache.cache.Contains(path))
 			}
 			require.NoError(t, fs.Delete(ctx, "object"))
 			require.NoFileExists(t, path, "a delete after a failed drop must remove the range file")
@@ -6476,8 +6437,7 @@ func TestCachedBytesAcrossRangesAndWholeObject(t *testing.T) {
 			{Offset: part, Size: part, Data: data[part : 2*part]},
 		}}, false))
 		dst := make([]byte, 32)
-		var deadline time.Time
-		require.True(t, d.readCachedBytes(ctx, "object", part-16, dst, &deadline))
+		require.True(t, d.readCachedBytes(ctx, "object", part-16, dst))
 		require.Equal(t, data[part-16:part+16], dst)
 	})
 	t.Run("whole", func(t *testing.T) {
@@ -6486,10 +6446,9 @@ func TestCachedBytesAcrossRangesAndWholeObject(t *testing.T) {
 		<-d.load.done
 		require.NoError(t, d.setFileContent(ctx, "object", data, false))
 		dst := make([]byte, 32)
-		var deadline time.Time
-		require.True(t, d.readCachedBytes(ctx, "object", part-16, dst, &deadline))
+		require.True(t, d.readCachedBytes(ctx, "object", part-16, dst))
 		require.Equal(t, data[part-16:part+16], dst)
-		require.False(t, d.readCachedBytes(ctx, "object", int64(len(data))-16, dst, &deadline), "bytes past the object's end")
+		require.False(t, d.readCachedBytes(ctx, "object", int64(len(data))-16, dst), "bytes past the object's end")
 		require.True(t, d.cache.Contains(d.wholePath("object", int64(len(data)))), "a read past its end keeps the whole object")
 	})
 }

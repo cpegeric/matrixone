@@ -50,7 +50,7 @@ type DiskCache struct {
 	cacheDataAllocator CacheDataAllocator
 	perfCounterSets    []*perfcounter.CounterSet
 
-	paths pathOwners
+	files openFilePool
 
 	cache        *lrucache.Cache[string, struct{}]
 	capacityFunc fscache.CapacityFunc
@@ -112,9 +112,6 @@ type diskCacheHooks struct {
 	afterFilePublication  func()
 	// beforeCacheDirFileOpen runs between the files of one entry open.
 	beforeCacheDirFileOpen func()
-	// beforeEvictionStart runs between an entry leaving the index and its eviction
-	// starting.
-	beforeEvictionStart func(path string)
 }
 
 func runHook(hook func()) {
@@ -239,24 +236,17 @@ func newDiskCache(
 		capacityBytes.Set(float64(capacityFunc()))
 	}
 	prepareEvict := func(path string, _ struct{}, size int64, _ uint64) func() {
-		runPathHook(ret.hooks.beforeEvictionStart, path)
-		owner, ok := ret.paths.evict(path, size)
-		if !ok {
-			return nil
-		}
+		object := ret.ranges.objectOfFile(path)
 		return func() {
-			defer func() {
-				if err := owner.release(); err != nil {
-					logutil.Error("finish disk cache eviction",
+			ret.pub.queue(object, func() error {
+				err := ret.removeEvictedFile(path, size)
+				if err != nil {
+					logutil.Error("delete disk cache file",
 						zap.Any("error", err),
 					)
 				}
-			}()
-			if err := ret.removeEvictedFile(path, size); err != nil {
-				logutil.Error("delete disk cache file",
-					zap.Any("error", err),
-				)
-			}
+				return err
+			})
 		}
 	}
 	postEvict := func(_ context.Context, path string, _ struct{}, size int64, _ uint64) {
@@ -273,7 +263,7 @@ func newDiskCache(
 	if opts.dirEntries {
 		ret.cache.SetEvictable(func(path string) bool { return !ret.dirHeld(path) })
 	}
-	ret.paths.init(opts.openFilesMax, ret.removeEvictedFile)
+	ret.files.limit = opts.openFilesMax
 	ret.pub.init(ret)
 	ret.initWriteFailureState()
 	loadCtx, loadCancel := context.WithCancel(ctx)
@@ -313,7 +303,7 @@ func (d *DiskCache) loadFile(ctx context.Context, diskPath string, info fs.FileI
 	}
 	runPathHook(d.hooks.beforeLoadFile, diskPath)
 	if !d.indexLoadedFile(ctx, objectPath, diskPath, info) {
-		d.removeLoadedFile(ctx, diskPath, info)
+		d.removeLoadedFile(objectPath, diskPath, info)
 	}
 }
 
@@ -330,54 +320,30 @@ func (d *DiskCache) indexLoadedFile(ctx context.Context, objectPath, diskPath st
 	return true
 }
 
-// indexFoundFile indexes the file at diskPath the cache does not hold and reports true,
-// unless its object was deleted since the cache was created.
-func (d *DiskCache) indexFoundFile(ctx context.Context, diskPath string, info fs.FileInfo) bool {
-	objectPath := diskPath
-	if key, _, _, ok := parseRangeFile(d.path, diskPath, info.Size()); ok {
-		objectPath = key
-	}
-	stripe := d.deletes.stripe(objectPath)
-	stripe.RLock()
-	defer stripe.RUnlock()
-	if d.deletes.since(objectPath, 0) {
-		return false
-	}
-	d.cache.Set(ctx, diskPath, struct{}{}, fileSize(info))
-	return true
+// removeLoadedFile has the publisher remove the file at diskPath of the object at
+// objectPath, found at startup, while it is not indexed and is still the file info
+// describes.
+func (d *DiskCache) removeLoadedFile(objectPath, diskPath string, info fs.FileInfo) {
+	d.pub.queue(objectPath, func() error {
+		if !d.cache.Contains(diskPath) && sameFileAt(info, diskPath) {
+			_ = os.Remove(diskPath)
+			d.files.changed(diskPath)
+		}
+		return nil
+	})
 }
 
-// removeLoadedFile removes the file at diskPath found at startup while, under the owner of
-// the path, it is not indexed and is still the file info describes.
-func (d *DiskCache) removeLoadedFile(ctx context.Context, diskPath string, info fs.FileInfo) {
-	owner, err := d.paths.acquire(ctx, diskPath, nil)
-	if err != nil {
-		return
-	}
-	defer owner.release()
-	if d.cache.Contains(diskPath) {
-		return
-	}
-	if cur, err := os.Lstat(diskPath); err != nil || !os.SameFile(info, cur) {
-		return
-	}
-	_ = os.Remove(diskPath)
+// sameFileAt reports whether info describes the file at path.
+func sameFileAt(info fs.FileInfo, path string) bool {
+	cur, err := os.Lstat(path)
+	return err == nil && os.SameFile(info, cur)
 }
 
-// reindexRead indexes the cache file at diskPath that a read opened and the cache does
-// not hold. As in loadFile, a file of an object deleted since the cache was created is
-// neither read nor indexed: a delete during the load may have missed it. It reports
-// whether the file may be read.
-func (d *DiskCache) reindexRead(
-	ctx context.Context,
-	diskPath string,
-	objectPath string,
-	generation uint64,
-	file *os.File,
-) (readable bool, err error) {
-	stripe := d.deletes.stripe(objectPath)
-	stripe.RLock()
-	defer stripe.RUnlock()
+// reindexRead reports whether the cache file at diskPath that a read opened and the cache
+// does not hold may be read, and has the publisher index it while it is still that file.
+// As in loadFile, a file of an object deleted since the cache was created is neither read
+// nor indexed: a delete during the load may have missed it.
+func (d *DiskCache) reindexRead(ctx context.Context, diskPath, objectPath string, file *os.File) (bool, error) {
 	if d.deletes.since(objectPath, 0) {
 		return false, nil
 	}
@@ -387,16 +353,12 @@ func (d *DiskCache) reindexRead(
 	if err != nil {
 		return false, err
 	}
-	owner, ok := d.paths.reindex(diskPath, generation)
-	if !ok {
-		return true, nil
-	}
-	defer func() {
-		if doneErr := owner.release(); err == nil {
-			err = doneErr
+	d.pub.queue(objectPath, func() error {
+		if !d.cache.Contains(diskPath) && !d.deletes.since(objectPath, 0) && sameFileAt(stat, diskPath) {
+			d.cache.Set(context.Background(), diskPath, struct{}{}, fileSize(stat))
 		}
-	}()
-	d.cache.Set(ctx, diskPath, struct{}{}, fileSize(stat))
+		return nil
+	})
 	return true, nil
 }
 
@@ -616,28 +578,30 @@ func (d *DiskCache) Read(
 		return err
 	}
 
+	// The files opened are of one version of the object while no delete of it is counted
+	// since deletes.
+	deletes := d.deletes.now()
 	openedFiles := make(map[string]openedDiskCacheFile)
-	// All path waits in one Read share a single budget. Start it lazily on the
-	// first contended path so uncontended reads do not pay for a timer.
-	var waitDeadline time.Time
 	defer func() {
 		LogEvent(ctx, str_close_disk_files_begin)
-		for diskPath, opened := range openedFiles {
-			d.paths.close(diskPath, opened)
+		for _, opened := range openedFiles {
+			d.files.close(opened)
 		}
 		LogEvent(ctx, str_close_disk_files_end)
 	}()
+
+	var key string
+	objectKey := func() string {
+		if key == "" {
+			key = d.objectKey(path.File)
+		}
+		return key
+	}
 	openPath := func(diskPath string) (opened openedDiskCacheFile, newlyOpened bool, ok bool) {
 		if opened, ok = openedFiles[diskPath]; ok {
 			return opened, false, true
 		}
-		generation, ok := d.paths.startRead(ctx, diskPath, &waitDeadline)
-		if !ok {
-			return openedDiskCacheFile{}, false, false
-		}
-		opened, ok = d.paths.open(ctx, diskPath, generation)
-		if !ok {
-			d.paths.endRead(diskPath, generation)
+		if opened, ok = d.files.open(ctx, diskPath); !ok {
 			if d.cache.Contains(diskPath) {
 				d.cachedFileExists(ctx, diskPath)
 			}
@@ -646,13 +610,11 @@ func (d *DiskCache) Read(
 		openedFiles[diskPath] = opened
 		return opened, true, true
 	}
-
-	var key string
-	objectKey := func() string {
-		if key == "" {
-			key = d.objectKey(path.File)
+	closePath := func(diskPath string) {
+		if opened, ok := openedFiles[diskPath]; ok {
+			d.files.close(opened)
+			delete(openedFiles, diskPath)
 		}
-		return key
 	}
 
 	fillEntry := func(entry *IOEntry) error {
@@ -749,13 +711,15 @@ func (d *DiskCache) Read(
 					readers = append(readers, io.NewSectionReader(f.file, pos-r.offset, next-pos))
 					pos = next
 				}
+				if readers != nil && d.deletes.since(objectKey(), deletes) {
+					readers = nil
+				}
 				if readers != nil {
 					if local, err := d.readEntryFrom(ctx, entry, io.MultiReader(readers...)); err != nil {
 						if local != nil {
 							for _, r := range rs {
-								d.paths.close(r.diskPath, openedFiles[r.diskPath])
-								delete(openedFiles, r.diskPath)
-								d.dropCachedRange(ctx, r.diskPath)
+								d.dropCachedRange(objectKey(), r.diskPath, openedFiles[r.diskPath].file)
+								closePath(r.diskPath)
 							}
 						}
 						return err
@@ -785,7 +749,7 @@ func (d *DiskCache) Read(
 
 		LogEvent(ctx, str_disk_cache_update_states_begin)
 		if _, ok := d.cache.Get(ctx, diskPath); !ok {
-			readable, err := d.reindexRead(ctx, diskPath, objectKey(), opened.generation, file)
+			readable, err := d.reindexRead(ctx, diskPath, objectKey(), file)
 			if err != nil {
 				return err
 			}
@@ -803,9 +767,8 @@ func (d *DiskCache) Read(
 		// Reads of a file kept open share it, so each reads at its own offset.
 		if local, err := d.readEntryFrom(ctx, entry, io.NewSectionReader(file, readOffset, readSize)); err != nil {
 			if local != nil && fromRange {
-				d.paths.close(diskPath, opened)
-				delete(openedFiles, diskPath)
-				d.dropCachedRange(ctx, diskPath)
+				d.dropCachedRange(objectKey(), diskPath, file)
+				closePath(diskPath)
 			}
 			return err
 		}
@@ -845,7 +808,7 @@ func (d *DiskCache) Read(
 }
 
 // Update has the publisher publish the entries of vector the cache does not hold; unless
-// async is set, it waits for a busy path and for their publications.
+// async is set, it waits for their publications.
 func (d *DiskCache) Update(
 	ctx context.Context,
 	vector *IOVector,
@@ -898,12 +861,12 @@ func (d *DiskCache) Update(
 
 // writeEntry writes entry, of the object with key, to a file and has the publisher publish
 // it, unless the object was deleted after the entry was read. Unless async is set, it
-// waits for a busy path and for the publication.
+// waits for the publication.
 func (d *DiskCache) writeEntry(ctx context.Context, key, diskPath string, entry IOEntry, async bool) error {
 	mark := readMark{object: key, deletes: entry.readDeletes - 1, set: entry.readDeletes > 0}
 	_, err := d.writeFileTo(ctx, diskPath, func(context.Context) (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(entry.Data)), nil
-	}, async, notWholeFill, nil, nil, mark)
+	}, async, notWholeFill, nil, diskFillTarget{d: d, diskPath: diskPath}, mark)
 	if err != nil {
 		return d.observeWriteResult(diskPath, err)
 	}
@@ -992,18 +955,6 @@ func (d *DiskCache) createCacheTempFile(dir string) (*os.File, error) {
 	return os.CreateTemp(dir, "*"+cacheFileTempSuffix)
 }
 
-type prefetchFillKey struct{}
-
-// withPrefetchFill returns ctx under which a whole-object fill is a prefetch's.
-func withPrefetchFill(ctx context.Context) context.Context {
-	return context.WithValue(ctx, prefetchFillKey{}, true)
-}
-
-func prefetchFill(ctx context.Context) bool {
-	_, ok := ctx.Value(prefetchFillKey{}).(bool)
-	return ok
-}
-
 // readMark is the object of a file and, when set, the delete count its bytes were read
 // at: the file is not published once the object was deleted since.
 type readMark struct {
@@ -1012,10 +963,10 @@ type readMark struct {
 	set     bool
 }
 
-// writeFileTo writes the file of the object at diskPath and has the publisher of target,
-// the disk cache when nil, publish it, unless mark is set and its object was deleted
-// since. Unless async is set, it waits for a busy path, unless a prefetch's, and for the
-// publication; written reports that the file was published, or, under async, queued.
+// writeFileTo writes the file of the object at diskPath and has the publisher of target
+// publish it, unless mark is set and its object was deleted since. Unless async is set,
+// it waits for the publication; written reports that the file was published, or, under
+// async, queued.
 func (d *DiskCache) writeFileTo(
 	ctx context.Context,
 	diskPath string,
@@ -1026,9 +977,6 @@ func (d *DiskCache) writeFileTo(
 	target fillTarget,
 	mark readMark,
 ) (written bool, err error) {
-	if target == nil {
-		target = diskFillTarget{d: d, diskPath: diskPath}
-	}
 	callerCtx := ctx
 	defer func() {
 		target.cache().evictForDiskFull(callerCtx, err)
@@ -1041,7 +989,7 @@ func (d *DiskCache) writeFileTo(
 		whole = d.newWholeObject(ctx, diskPath, index)
 		defer func() { whole.endWhole(err) }()
 	}
-	if target.heldBeforeLock(ctx) {
+	if target.held(ctx) {
 		return false, nil
 	}
 	pub := &target.cache().pub
@@ -1050,8 +998,7 @@ func (d *DiskCache) writeFileTo(
 	}
 	w := fileWrite{pub: pub}
 	defer func() { d.endFileWrite(diskPath, &w, &err) }()
-	// A whole-object download registers before it holds the path; each of its parts is
-	// its own request.
+	// Each part of a whole-object download is its own request.
 	var bounds []int64
 	lead, taken := 0, false
 	if fill == storageFill {
@@ -1073,25 +1020,12 @@ func (d *DiskCache) writeFileTo(
 		}
 	}
 
-	cleanup := func() error { return d.removeUnindexedFile(diskPath) }
 	p, _ := ctx.Value(fileDownloadKey{}).(*filePrefetchObject)
-	// A prefetch's fill waits for the path a fill of the object into either cache holds,
-	// and fills its own cache after it; a read's async fill does not wait for it.
-	if async && !prefetchFill(ctx) {
-		var ok bool
-		if w.owner, ok = d.paths.tryAcquire(diskPath, cleanup); !ok {
-			return false, nil
-		}
-	} else if w.owner, err = d.paths.acquire(ctx, diskPath, cleanup); err != nil {
-		return false, err
-	}
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-
-	if held, err := target.held(ctx); err != nil {
-		return false, err
-	} else if held {
+	// The size of a whole object is known from here.
+	if target.held(ctx) {
 		return false, nil
 	}
 
@@ -1115,7 +1049,7 @@ func (d *DiskCache) writeFileTo(
 		}
 		d.startDownload(own, download, taken)
 		taken = false
-		w.owner.first(func() { d.finishDownload(download, own) })
+		w.finish = func() { d.finishDownload(download, own) }
 		own.started(download)
 		downloadStarted(ctx)
 		dst = downloadProgressWriter{w: f, download: download}
@@ -1127,8 +1061,8 @@ func (d *DiskCache) writeFileTo(
 	}
 
 	if t, ok := target.(*wholeFillTarget); ok {
-		if placed, err := t.place(ctx, n, &w, async && !prefetchFill(ctx)); !placed {
-			return false, err
+		if !t.place(ctx, n) {
+			return false, nil
 		}
 	}
 	if download != nil && fill != rangeFill {
@@ -1144,7 +1078,7 @@ func (d *DiskCache) writeFileTo(
 		object = t.dir
 	}
 
-	owner := w.owner
+	finish := w.finish
 	job := &publication{
 		diskPath: diskPath,
 		object:   object,
@@ -1152,7 +1086,11 @@ func (d *DiskCache) writeFileTo(
 			return d.publishFile(ctx, pub, diskPath, f, target, mark)
 		},
 		release: func() error {
-			return errors.Join(cleanupDiskCacheTempFile(f), owner.release())
+			err := cleanupDiskCacheTempFile(f)
+			if finish != nil {
+				finish()
+			}
+			return err
 		},
 	}
 	if !async {
@@ -1253,9 +1191,10 @@ func sourceStopped(err error) bool {
 // fileWrite is what a write of a cache file holds until it hands the file to its
 // publisher.
 type fileWrite struct {
-	pub   *publisher // the publisher the write began a publication of
-	owner *pathOwner
-	file  *os.File
+	pub  *publisher // the publisher the write began a publication of
+	file *os.File
+	// finish ends the download of the file, once the file is published or dropped.
+	finish func()
 }
 
 // endFileWrite releases what w holds, joining the errors into err.
@@ -1263,8 +1202,8 @@ func (d *DiskCache) endFileWrite(diskPath string, w *fileWrite, err *error) {
 	if w.file != nil {
 		d.mergeWriteCleanupError(diskPath, err, cleanupDiskCacheTempFile(w.file))
 	}
-	if w.owner != nil {
-		d.mergeWriteCleanupError(diskPath, err, w.owner.release())
+	if w.finish != nil {
+		w.finish()
 	}
 	if w.pub != nil {
 		w.pub.end()
@@ -1389,6 +1328,8 @@ func (d *DiskCache) pathForIOEntry(path string, entry IOEntry) string {
 	)
 }
 
+// removeEvictedFile removes, on the publisher, the file of size bytes at path, evicted,
+// unless path was indexed again.
 func (d *DiskCache) removeEvictedFile(path string, size int64) error {
 	if d.cache.Contains(path) {
 		return nil
@@ -1396,23 +1337,15 @@ func (d *DiskCache) removeEvictedFile(path string, size int64) error {
 	if d.dirEntries && strings.HasSuffix(path, cacheDirSuffix) {
 		return d.removeEvictedDir(path, size)
 	}
-	if err := d.removeCachePath(path); err != nil {
+	err := os.Remove(path)
+	d.files.changed(path)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
 	}
 	metric.FSDiskCacheEvictCounter.Add(1)
-	return nil
-}
-
-func (d *DiskCache) removeUnindexedFile(path string) error {
-	if d.cache.Contains(path) {
-		return nil
-	}
-	if err := d.removeCachePath(path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
 	return nil
 }
 
@@ -1543,8 +1476,9 @@ func (d *DiskCache) removeRanges(key string) error {
 	ctx := context.Background()
 	var errs []error
 	for _, r := range d.ranges.of(key) {
-		d.paths.endReads(r.diskPath)
-		if err := os.Remove(r.diskPath); err != nil && !os.IsNotExist(err) {
+		err := os.Remove(r.diskPath)
+		d.files.changed(r.diskPath)
+		if err != nil && !os.IsNotExist(err) {
 			errs = append(errs, err)
 			continue
 		}
@@ -1576,7 +1510,7 @@ func (d *DiskCache) Close(ctx context.Context) {
 	d.pub.seal()
 	d.closePrefetches(ctx)
 	d.pub.close(ctx)
-	d.paths.closeKept()
+	d.files.closeAll()
 	select {
 	case <-d.load.done:
 	case <-ctx.Done():
@@ -1729,6 +1663,17 @@ func (c *cachedRanges) add(root, diskPath string) {
 	}
 	c.objectOf[diskPath] = key
 	c.byObject.Store(key, c.snapshot(key).with(cachedRange{diskPath: diskPath, offset: offset, size: size}))
+}
+
+// objectOfFile returns the object key of the range file at diskPath, or diskPath when it
+// is not an indexed range file.
+func (c *cachedRanges) objectOfFile(diskPath string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if key, ok := c.objectOf[diskPath]; ok {
+		return key
+	}
+	return diskPath
 }
 
 // remove forgets the range file at diskPath.
@@ -1922,20 +1867,49 @@ type openCacheFile struct {
 	used uint64
 }
 
+// openFileStripes is the number of counts the changes of paths share by path.
+const openFileStripes = 64
+
 // openFilePool keeps, by disk path, the cache files reads opened, so the reads after
-// them do not open them again. A change of a path drops its file. It is guarded by the
-// lock of the disk cache's pathOwners.
+// them do not open them again. A change of a path, made by the publisher, drops its file.
 type openFilePool struct {
-	m map[string]*openCacheFile
+	mu sync.Mutex
+	m  map[string]*openCacheFile
 	// missing are the paths a read found no file at, until they change.
 	missing map[string]struct{}
 	takes   uint64
 	// limit, when set, is the most files kept instead of DefaultDiskOpenFilesMax; less than
 	// 0 keeps none and notes no path missing.
 	limit int
+	// changes counts the changes of the paths of each stripe: a file opened before a change
+	// of its stripe is not kept, nor is its path noted missing.
+	changes [openFileStripes]uint64
 }
 
-// takeLocked returns the file kept open for path, held for a read, or nil.
+type openedDiskCacheFile struct {
+	file *os.File
+	// kept is the file kept open for later reads, when the read holds one.
+	kept *openCacheFile
+}
+
+func (o *openFilePool) stripe(path string) *uint64 {
+	return &o.changes[maphash.String(objectDeletesSeed, path)%openFileStripes]
+}
+
+// seq returns the count of changes of the stripe of path.
+func (o *openFilePool) seq(path string) uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return *o.stripe(path)
+}
+
+// take returns the file kept open for path, held for a read, or nil.
+func (o *openFilePool) take(path string) *openCacheFile {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.takeLocked(path)
+}
+
 func (o *openFilePool) takeLocked(path string) *openCacheFile {
 	f := o.m[path]
 	if f == nil {
@@ -1947,11 +1921,20 @@ func (o *openFilePool) takeLocked(path string) *openCacheFile {
 	return f
 }
 
-// keepLocked keeps file open for path, held for the read that opened it. With no file to
-// keep, or the most files kept and all held, it keeps nothing and returns nil.
-func (o *openFilePool) keepLocked(path string, file *os.File) (kept *openCacheFile, closeFile *os.File) {
-	if o.limit < 0 || o.m[path] != nil {
-		return nil, nil
+// keep keeps file open for path, held for the read that opened it, unless the stripe of
+// path changed since its count was seq. With the most files kept and all held, it keeps
+// nothing. It returns the kept file, or nil.
+func (o *openFilePool) keep(path string, seq uint64, file *os.File) *openCacheFile {
+	var closeFile *os.File
+	defer func() {
+		if closeFile != nil {
+			_ = closeFile.Close()
+		}
+	}()
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.limit < 0 || o.m[path] != nil || *o.stripe(path) != seq {
+		return nil
 	}
 	if len(o.m) >= cmp.Or(o.limit, DefaultDiskOpenFilesMax) {
 		var lru string
@@ -1962,7 +1945,7 @@ func (o *openFilePool) keepLocked(path string, file *os.File) (kept *openCacheFi
 			}
 		}
 		if oldest == nil {
-			return nil, nil
+			return nil
 		}
 		delete(o.m, lru)
 		closeFile = oldest.file
@@ -1971,40 +1954,46 @@ func (o *openFilePool) keepLocked(path string, file *os.File) (kept *openCacheFi
 		o.m = make(map[string]*openCacheFile)
 	}
 	o.takes++
-	kept = &openCacheFile{file: file, refs: 1, used: o.takes}
+	kept := &openCacheFile{file: file, refs: 1, used: o.takes}
 	o.m[path] = kept
-	return kept, closeFile
+	return kept
 }
 
-// releaseLocked ends a read's hold of f, and returns the file to close when f was
-// dropped and no read holds it any more.
-func (o *openFilePool) releaseLocked(f *openCacheFile) *os.File {
+// release ends a read's hold of f, and closes it when it was dropped and no read holds it.
+func (o *openFilePool) release(f *openCacheFile) {
+	o.mu.Lock()
 	f.refs--
-	if f.dropped && f.refs == 0 {
-		return f.file
+	closeIt := f.dropped && f.refs == 0
+	o.mu.Unlock()
+	if closeIt {
+		_ = f.file.Close()
 	}
-	return nil
 }
 
-// missingLocked reports whether path was noted missing.
-func (o *openFilePool) missingLocked(path string) bool {
-	_, ok := o.missing[path]
-	return ok
+// drop forgets kept, the file kept open for path a read took, which path no longer
+// holds, and ends the read's hold of it.
+func (o *openFilePool) drop(path string, kept *openCacheFile) {
+	o.mu.Lock()
+	if o.m[path] == kept {
+		o.dropLocked(path)
+	}
+	o.mu.Unlock()
+	o.release(kept)
 }
 
-// noteMissingLocked notes that path has no file.
-func (o *openFilePool) noteMissingLocked(path string) {
-	if o.limit < 0 {
-		return
+// changed counts a change of path, made by the publisher once the file at path is
+// renamed in or removed, and drops its file.
+func (o *openFilePool) changed(path string) {
+	o.mu.Lock()
+	*o.stripe(path)++
+	f := o.dropLocked(path)
+	o.mu.Unlock()
+	if f != nil {
+		_ = f.Close()
 	}
-	if o.missing == nil || len(o.missing) >= diskCacheMissingPathsMax {
-		o.missing = make(map[string]struct{})
-	}
-	o.missing[path] = struct{}{}
 }
 
-// dropLocked forgets the file of path, whose path changes, and returns it to close when
-// no read holds it.
+// dropLocked forgets the file of path and returns it to close when no read holds it.
 func (o *openFilePool) dropLocked(path string) *os.File {
 	delete(o.missing, path)
 	f := o.m[path]
@@ -2019,330 +2008,17 @@ func (o *openFilePool) dropLocked(path string) *os.File {
 	return nil
 }
 
-// dropAllLocked forgets every file, and returns those no read holds to close. No file is
-// kept after it.
-func (o *openFilePool) dropAllLocked() (files []*os.File) {
-	o.missing = nil
-	o.limit = -1
-	for p := range o.m {
-		if f := o.dropLocked(p); f != nil {
-			files = append(files, f)
-		}
-	}
-	return files
-}
-
-// pathOwners serializes the changes of each cache path: one owner at a time changes a
-// path, and a read of a path starts only while it has no owner. A read is of one
-// generation of the path, which ends when an owner takes the path.
-type pathOwners struct {
-	*sync.Cond
-	owners map[string]*pathOwner
-	// reads holds the current generation of each path a read has open.
-	reads   map[string]pathReads
-	lastGen uint64
-	// openFiles are the cache files kept open for later reads.
-	openFiles openFilePool
-	// removeEvicted removes the file of a path evicted while it had an owner.
-	removeEvicted func(path string, size int64) error
-}
-
-type pathReads struct {
-	gen     uint64
-	readers int
-}
-
-// pathOwner owns a path until released.
-type pathOwner struct {
-	paths   *pathOwners
-	path    string
-	cleanup func() error
-	// evictionSize is the size of the file to remove on release, when evictionPending.
-	evictionPending bool
-	evictionSize    int64
-	once            sync.Once
-	err             error
-}
-
-type openedDiskCacheFile struct {
-	file       *os.File
-	generation uint64
-	// kept is the file kept open for later reads, when the read holds one.
-	kept *openCacheFile
-}
-
-func (p *pathOwners) init(openFilesMax int, removeEvicted func(path string, size int64) error) {
-	p.Cond = sync.NewCond(new(sync.Mutex))
-	p.owners = make(map[string]*pathOwner)
-	p.reads = make(map[string]pathReads)
-	p.openFiles.limit = openFilesMax
-	p.removeEvicted = removeEvicted
-}
-
-// waitFreeLocked waits until path has no owner, or ctx ends.
-func (p *pathOwners) waitFreeLocked(ctx context.Context, path string) error {
-	if p.owners[path] != nil {
-		stop := context.AfterFunc(ctx, func() {
-			p.L.Lock()
-			p.Broadcast()
-			p.L.Unlock()
-		})
-		defer stop()
-		for p.owners[path] != nil && ctx.Err() == nil {
-			p.Wait()
-		}
-	}
-	return ctx.Err()
-}
-
-func (p *pathOwners) ownLocked(path string, cleanup func() error) *pathOwner {
-	o := &pathOwner{paths: p, path: path, cleanup: cleanup}
-	p.owners[path] = o
-	return o
-}
-
-// acquire waits until path has no owner, or ctx ends, and owns it; cleanup runs on
-// release.
-func (p *pathOwners) acquire(ctx context.Context, path string, cleanup func() error) (*pathOwner, error) {
-	p.L.Lock()
-	defer p.L.Unlock()
-	if err := p.waitFreeLocked(ctx, path); err != nil {
-		return nil, err
-	}
-	p.endReadsLocked(path)
-	return p.ownLocked(path, cleanup), nil
-}
-
-// acquireKeeping is acquire for an owner that changes no file of path: it keeps the
-// generation of path.
-func (p *pathOwners) acquireKeeping(ctx context.Context, path string) (*pathOwner, error) {
-	p.L.Lock()
-	defer p.L.Unlock()
-	if err := p.waitFreeLocked(ctx, path); err != nil {
-		return nil, err
-	}
-	return p.ownLocked(path, nil), nil
-}
-
-// tryAcquire owns path when it has no owner.
-func (p *pathOwners) tryAcquire(path string, cleanup func() error) (*pathOwner, bool) {
-	p.L.Lock()
-	defer p.L.Unlock()
-	if p.owners[path] != nil {
-		return nil, false
-	}
-	p.endReadsLocked(path)
-	return p.ownLocked(path, cleanup), true
-}
-
-// acquireCurrent owns path when gen is its current read generation, ending the
-// generation.
-func (p *pathOwners) acquireCurrent(path string, gen uint64) (*pathOwner, bool) {
-	p.L.Lock()
-	defer p.L.Unlock()
-	if !p.currentLocked(path, gen) {
-		return nil, false
-	}
-	p.endReadsLocked(path)
-	return p.ownLocked(path, nil), true
-}
-
-// reindex owns path when gen is its current read generation, keeping the generation.
-func (p *pathOwners) reindex(path string, gen uint64) (*pathOwner, bool) {
-	p.L.Lock()
-	defer p.L.Unlock()
-	if !p.currentLocked(path, gen) {
-		return nil, false
-	}
-	return p.ownLocked(path, nil), true
-}
-
-// evict ends the generation of path and owns it, or, when path has an owner, has the
-// owner remove its file of size on release. The decision is made under the lock that
-// releases owners, so the eviction is not lost.
-func (p *pathOwners) evict(path string, size int64) (*pathOwner, bool) {
-	p.L.Lock()
-	defer p.L.Unlock()
-	p.endReadsLocked(path)
-	if o := p.owners[path]; o != nil {
-		o.evictionPending = true
-		o.evictionSize = size
-		return nil, false
-	}
-	return p.ownLocked(path, nil), true
-}
-
-// first has f run first on release.
-func (o *pathOwner) first(f func()) {
-	cleanup := o.cleanup
-	o.cleanup = func() error {
-		f()
-		if cleanup == nil {
-			return nil
-		}
-		return cleanup()
-	}
-}
-
-// releasesFirst has other released first on release.
-func (o *pathOwner) releasesFirst(other *pathOwner) {
-	cleanup := o.cleanup
-	o.cleanup = func() error {
-		err := other.release()
-		if cleanup != nil {
-			err = errors.Join(err, cleanup())
-		}
-		return err
-	}
-}
-
-// release runs the cleanup, removes the files evicted meanwhile and frees the path. Only
-// the first call takes effect.
-func (o *pathOwner) release() error {
-	o.once.Do(func() {
-		defer func() { o.err = errors.Join(o.err, o.paths.free(o)) }()
-		if o.cleanup != nil {
-			o.err = o.cleanup()
-		}
-	})
-	return o.err
-}
-
-func (p *pathOwners) free(o *pathOwner) (err error) {
-	for {
-		p.L.Lock()
-		if p.owners[o.path] != o {
-			p.L.Unlock()
-			return err
-		}
-		if !o.evictionPending {
-			delete(p.owners, o.path)
-			p.Broadcast()
-			p.L.Unlock()
-			return err
-		}
-		o.evictionPending = false
-		size := o.evictionSize
-		p.L.Unlock()
-		err = errors.Join(err, p.removeEvicted(o.path, size))
-	}
-}
-
-// startRead waits until path has no owner and starts a read of its current generation.
-// The waits of one caller share deadline, set at its first wait to shortIOWaitDuration
-// away.
-func (p *pathOwners) startRead(ctx context.Context, path string, deadline *time.Time) (gen uint64, ok bool) {
-	LogEvent(ctx, str_disk_cache_wait_update_complete_begin)
-	defer LogEvent(ctx, str_disk_cache_wait_update_complete_end)
-	p.L.Lock()
-	defer p.L.Unlock()
-	if p.owners[path] != nil {
-		if deadline.IsZero() {
-			*deadline = time.Now().Add(shortIOWaitDuration)
-		}
-		if !time.Now().Before(*deadline) {
-			return 0, false
-		}
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, *deadline)
-		defer cancel()
-	}
-	if p.waitFreeLocked(ctx, path) != nil {
-		return 0, false
-	}
-	r, ok := p.reads[path]
-	if !ok {
-		p.lastGen++
-		r.gen = p.lastGen
-	}
-	r.readers++
-	p.reads[path] = r
-	return r.gen, true
-}
-
-// endRead ends a read of generation gen of path.
-func (p *pathOwners) endRead(path string, gen uint64) {
-	p.L.Lock()
-	defer p.L.Unlock()
-	if r, ok := p.reads[path]; ok && r.gen == gen {
-		r.readers--
-		if r.readers == 0 {
-			delete(p.reads, path)
-		} else {
-			p.reads[path] = r
-		}
-	}
-}
-
-// endReads ends the generation of path and drops its kept file, whatever owner it has.
-func (p *pathOwners) endReads(path string) {
-	p.L.Lock()
-	defer p.L.Unlock()
-	p.endReadsLocked(path)
-}
-
-// endReadsLocked ends the generation of path and drops its kept file.
-func (p *pathOwners) endReadsLocked(path string) {
-	delete(p.reads, path)
-	if f := p.openFiles.dropLocked(path); f != nil {
-		_ = f.Close()
-	}
-}
-
-// currentLocked reports whether path has not changed since a read of generation gen
-// started.
-func (p *pathOwners) currentLocked(path string, gen uint64) bool {
-	r, ok := p.reads[path]
-	return ok && r.gen == gen && p.owners[path] == nil
-}
-
-// takeKept returns the file kept open for path, held for a read, or nil.
-func (p *pathOwners) takeKept(path string) *openCacheFile {
-	p.L.Lock()
-	defer p.L.Unlock()
-	return p.openFiles.takeLocked(path)
-}
-
-// dropKept forgets kept, the file kept open for path a read took, which path no longer
-// holds, and ends the read's hold of it.
-func (p *pathOwners) dropKept(path string, kept *openCacheFile) {
-	p.L.Lock()
-	if p.openFiles.m[path] == kept {
-		p.openFiles.dropLocked(path)
-	}
-	f := p.openFiles.releaseLocked(kept)
-	p.L.Unlock()
-	if f != nil {
-		_ = f.Close()
-	}
-}
-
-// keep keeps file open for later reads, held for the read of generation gen of path,
-// while path has not changed since; it returns the kept file, or nil.
-func (p *pathOwners) keep(path string, gen uint64, file *os.File) *openCacheFile {
-	var kept *openCacheFile
-	var closeFile *os.File
-	p.L.Lock()
-	if p.currentLocked(path, gen) {
-		kept, closeFile = p.openFiles.keepLocked(path, file)
-	}
-	p.L.Unlock()
-	if closeFile != nil {
-		_ = closeFile.Close()
-	}
-	return kept
-}
-
-// open opens the cache file at path for a read of generation gen: the file kept open for
-// path, or a new one, kept open for later reads. A path noted missing is not opened again
-// until it changes.
-func (p *pathOwners) open(ctx context.Context, path string, gen uint64) (openedDiskCacheFile, bool) {
-	p.L.Lock()
-	kept := p.openFiles.takeLocked(path)
-	missing := kept == nil && p.openFiles.missingLocked(path)
-	p.L.Unlock()
+// open opens the cache file at path for a read: the file kept open for path, or a new
+// one, kept open for later reads. A path noted missing is not opened again until it
+// changes.
+func (o *openFilePool) open(ctx context.Context, path string) (openedDiskCacheFile, bool) {
+	o.mu.Lock()
+	kept := o.takeLocked(path)
+	_, missing := o.missing[path]
+	seq := *o.stripe(path)
+	o.mu.Unlock()
 	if kept != nil {
-		return openedDiskCacheFile{file: kept.file, generation: gen, kept: kept}, true
+		return openedDiskCacheFile{file: kept.file, kept: kept}, true
 	}
 	if missing {
 		return openedDiskCacheFile{}, false
@@ -2352,37 +2028,41 @@ func (p *pathOwners) open(ctx context.Context, path string, gen uint64) (openedD
 	LogEvent(ctx, str_disk_cache_file_open_end)
 	if err != nil {
 		if os.IsNotExist(err) {
-			p.L.Lock()
-			if p.currentLocked(path, gen) {
-				p.openFiles.noteMissingLocked(path)
+			o.mu.Lock()
+			if o.limit >= 0 && *o.stripe(path) == seq {
+				if o.missing == nil || len(o.missing) >= diskCacheMissingPathsMax {
+					o.missing = make(map[string]struct{})
+				}
+				o.missing[path] = struct{}{}
 			}
-			p.L.Unlock()
+			o.mu.Unlock()
 		}
 		return openedDiskCacheFile{}, false
 	}
-	return openedDiskCacheFile{file: file, generation: gen, kept: p.keep(path, gen, file)}, true
+	return openedDiskCacheFile{file: file, kept: o.keep(path, seq, file)}, true
 }
 
-// close ends the read of opened at path.
-func (p *pathOwners) close(path string, opened openedDiskCacheFile) {
+// close ends the read of opened.
+func (o *openFilePool) close(opened openedDiskCacheFile) {
 	if opened.kept == nil {
 		_ = opened.file.Close()
-	} else {
-		p.L.Lock()
-		f := p.openFiles.releaseLocked(opened.kept)
-		p.L.Unlock()
-		if f != nil {
-			_ = f.Close()
-		}
+		return
 	}
-	p.endRead(path, opened.generation)
+	o.release(opened.kept)
 }
 
-// closeKept closes the files kept open.
-func (p *pathOwners) closeKept() {
-	p.L.Lock()
-	files := p.openFiles.dropAllLocked()
-	p.L.Unlock()
+// closeAll closes the files kept open; no file is kept after it.
+func (o *openFilePool) closeAll() {
+	o.mu.Lock()
+	o.missing = nil
+	o.limit = -1
+	var files []*os.File
+	for p := range o.m {
+		if f := o.dropLocked(p); f != nil {
+			files = append(files, f)
+		}
+	}
+	o.mu.Unlock()
 	for _, f := range files {
 		_ = f.Close()
 	}

@@ -517,15 +517,13 @@ func (c *IndexFileCache) Open(ctx context.Context, name string, files ...string)
 			return nil, err
 		}
 	}
-	var deadline time.Time
-	return c.disk.openDir(ctx, name, diskPath, files, &deadline)
+	return c.disk.openDir(ctx, name, diskPath, files)
 }
 
-// entryRead is a read of generation gen of an entry; done ends it. dir is the entry the
-// read opened, kept open until done so that no other entry takes its identity, or nil;
-// absent is set when there was no entry to open.
+// entryRead is a read of an entry; done ends it. dir is the entry the read opened, kept
+// open until done so that no other entry takes its identity, or nil; absent is set when
+// there was no entry to open.
 type entryRead struct {
-	gen    uint64
 	dir    os.FileInfo
 	absent bool
 	done   func()
@@ -544,29 +542,22 @@ func (c *IndexFileCache) openEntryFile(ctx context.Context, name string, file st
 		return nil, nil, err
 	}
 	d := c.disk
-	var deadline time.Time
-	generation, ok := d.paths.startRead(ctx, diskPath, &deadline)
-	if !ok {
-		if err := ctx.Err(); err != nil {
-			return nil, nil, err
-		}
-		return nil, nil, moerr.NewFileNotFoundNoCtx(name)
-	}
-	read = &entryRead{gen: generation}
-	kept := d.paths.takeKept(diskPath)
+	read = &entryRead{}
+	kept := d.files.take(diskPath)
 	// A file kept open that another cache instance on the directory removed or replaced
 	// is no longer the entry's file.
 	if kept != nil && !sameFile(kept.file, filepath.Join(diskPath, file)) {
-		d.paths.dropKept(diskPath, kept)
+		d.files.drop(diskPath, kept)
 		kept = nil
 	}
-	opened := openedDiskCacheFile{generation: generation, kept: kept}
+	opened := openedDiskCacheFile{kept: kept}
 	if kept != nil {
 		d.cache.Get(ctx, diskPath)
 		opened.file = kept.file
 	} else {
+		seq := d.files.seq(diskPath)
 		dir, dirErr := os.Open(diskPath)
-		files, err := d.openDir(ctx, name, diskPath, []string{file}, &deadline)
+		files, err := d.openDir(ctx, name, diskPath, []string{file})
 		if err != nil {
 			if dirErr == nil {
 				read.dir, _ = dir.Stat()
@@ -576,7 +567,6 @@ func (c *IndexFileCache) openEntryFile(ctx context.Context, name string, file st
 				if dirErr == nil {
 					_ = dir.Close()
 				}
-				d.paths.endRead(diskPath, generation)
 			}
 			return nil, read, err
 		}
@@ -584,9 +574,9 @@ func (c *IndexFileCache) openEntryFile(ctx context.Context, name string, file st
 			_ = dir.Close()
 		}
 		opened.file = files[0]
-		opened.kept = d.paths.keep(diskPath, generation, files[0])
+		opened.kept = d.files.keep(diskPath, seq, files[0])
 	}
-	read.done = func() { d.paths.close(diskPath, opened) }
+	read.done = func() { d.files.close(opened) }
 	return opened.file, read, nil
 }
 
@@ -679,53 +669,48 @@ func (c *IndexFileCache) Delete(ctx context.Context, name string) error {
 	}
 	c.disk.deletes.deleted(diskPath)
 	return c.disk.pub.remove(ctx, diskPath, func() error {
-		ctx := context.Background()
-		owner, err := c.disk.paths.acquire(ctx, diskPath, nil)
-		if err != nil {
-			return err
-		}
-		defer owner.release()
 		if err := c.disk.removeCacheDir(diskPath); err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		c.disk.cache.Delete(ctx, diskPath)
+		c.disk.cache.Delete(context.Background(), diskPath)
 		return nil
 	})
 }
 
-// dropBroken removes entry name while gen, the generation of the read that found it
-// broken, is its current one, and seen, when set, is still what is at file of the entry,
-// or at the entry when file is empty: another cache instance on the directory may have
-// replaced it. When missing is set, it removes it only while the entry is indexed and its
-// file missing does not exist. It is no delete of the object: a fill of it is not
+// dropBroken drops entry name while seen, when set, is still what is at file of the
+// entry, or at the entry when file is empty: another cache instance on the directory may
+// have replaced it; with seen unset, while there is no entry. When missing is set, it
+// drops it only while its file missing does not exist. The entry leaves the index at
+// once, and the publisher removes it. It is no delete of the object: a fill of it is not
 // canceled.
-func (c *IndexFileCache) dropBroken(ctx context.Context, name string, missing string, gen uint64, seen os.FileInfo, file string) {
+func (c *IndexFileCache) dropBroken(ctx context.Context, name string, missing string, seen os.FileInfo, file string) {
 	diskPath, err := c.disk.pathForDir(name)
 	if err != nil {
 		return
 	}
-	owner, ok := c.disk.paths.acquireCurrent(diskPath, gen)
-	if !ok {
-		return
-	}
-	defer owner.release()
-	if seen != nil {
-		if cur, err := os.Lstat(filepath.Join(diskPath, file)); err != nil || !os.SameFile(seen, cur) {
-			return
+	broken := func() bool {
+		if seen != nil && !sameFileAt(seen, filepath.Join(diskPath, file)) {
+			return false
 		}
-	}
-	if missing != "" {
-		if !c.disk.cache.Contains(diskPath) {
-			return
+		if _, err := os.Lstat(diskPath); seen == nil && !os.IsNotExist(err) {
+			return false
 		}
-		if _, err := os.Stat(filepath.Join(diskPath, missing)); !os.IsNotExist(err) {
-			return
+		_, err := os.Stat(filepath.Join(diskPath, missing))
+		return missing == "" || os.IsNotExist(err)
+	}
+	c.disk.pub.queue(diskPath, func() error {
+		if !broken() {
+			return nil
 		}
+		if err := c.disk.removeCacheDir(diskPath); err != nil && !os.IsNotExist(err) {
+			return nil
+		}
+		c.disk.cache.Delete(context.Background(), diskPath)
+		return nil
+	})
+	if broken() {
+		c.disk.cache.Delete(ctx, diskPath)
 	}
-	if err := c.disk.removeCacheDir(diskPath); err != nil && !os.IsNotExist(err) {
-		return
-	}
-	c.disk.cache.Delete(ctx, diskPath)
 }
 
 // dropUnopened drops entry name after read failed to open it, unless the entry is there
@@ -734,7 +719,7 @@ func (c *IndexFileCache) dropUnopened(ctx context.Context, name string, missing 
 	if read.dir == nil && !read.absent {
 		return
 	}
-	c.dropBroken(ctx, name, missing, read.gen, read.dir, "")
+	c.dropBroken(ctx, name, missing, read.dir, "")
 }
 
 type dirHolds struct {
@@ -760,13 +745,11 @@ func (d *DiskCache) indexLoadedDirs(ctx context.Context, dirs []loadedDir) {
 	slices.SortFunc(dirs, func(a, b loadedDir) int { return b.lastUse.Compare(a.lastUse) })
 	runHook(d.hooks.beforeIndexLoadedDirs)
 	for _, e := range dirs {
-		owner, _ := d.paths.acquireKeeping(context.Background(), e.path)
 		if size, err := cacheDirSize(e.path); err == nil {
 			lru.SetOldest(ctx, e.path, struct{}{}, size)
 		} else if !os.IsNotExist(err) {
 			lru.SetOldest(ctx, e.path, struct{}{}, e.size)
 		}
-		_ = owner.release()
 	}
 }
 
@@ -826,7 +809,7 @@ func (d *DiskCache) removeEvictedDir(path string, size int64) error {
 		d.cache.Set(context.Background(), path, struct{}{}, size)
 		return nil
 	}
-	trash, err := trashCacheDir(path, size)
+	trash, err := d.trashCacheDir(path, size)
 	if err != nil && !os.IsNotExist(err) {
 		if d.held.stuck == nil {
 			d.held.stuck = make(map[string]struct{})
@@ -845,8 +828,8 @@ func (d *DiskCache) removeEvictedDir(path string, size int64) error {
 	return d.removeTrash(trash, size)
 }
 
-// removeIdleDir removes an entry directory that has no holds and was last used before
-// before.
+// removeIdleDir has the publisher remove an entry directory that has no holds and was
+// last used before before.
 func (d *DiskCache) removeIdleDir(ctx context.Context, path string, before time.Time) (bool, error) {
 	d.held.mu.Lock()
 	idle, err := d.idleDirLocked(path, before)
@@ -854,31 +837,32 @@ func (d *DiskCache) removeIdleDir(ctx context.Context, path string, before time.
 	if !idle {
 		return false, err
 	}
-	owner, err := d.paths.acquire(ctx, path, nil)
-	if err != nil {
-		return false, err
-	}
-	defer owner.release()
-	// The size is read before d.held.mu: eviction takes d.held.mu under the cache's lock.
-	size := d.cacheDirBytes(path)
-	d.held.mu.Lock()
-	if idle, err = d.idleDirLocked(path, before); !idle {
-		d.held.mu.Unlock()
-		return false, err
-	}
-	trash, err := trashCacheDir(path, size)
-	d.held.mu.Unlock()
-	if err != nil {
-		if os.IsNotExist(err) {
-			return false, nil
+	var removed atomic.Bool
+	err = d.pub.remove(ctx, path, func() error {
+		// The size is read before d.held.mu: eviction takes d.held.mu under the cache's lock.
+		size := d.cacheDirBytes(path)
+		d.held.mu.Lock()
+		idle, err := d.idleDirLocked(path, before)
+		if !idle {
+			d.held.mu.Unlock()
+			return err
 		}
-		return false, err
-	}
-	d.cache.Delete(ctx, path)
-	if err := d.removeTrash(trash, size); err != nil {
-		logutil.Error("index file cache: remove entry files", zap.String("path", trash), zap.Error(err))
-	}
-	return true, nil
+		trash, err := d.trashCacheDir(path, size)
+		d.held.mu.Unlock()
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return err
+		}
+		removed.Store(true)
+		d.cache.Delete(context.Background(), path)
+		if err := d.removeTrash(trash, size); err != nil {
+			logutil.Error("index file cache: remove entry files", zap.String("path", trash), zap.Error(err))
+		}
+		return nil
+	})
+	return removed.Load(), err
 }
 
 // anyLastUse is a cutoff later than any entry's last use, even one recorded before the
@@ -1022,16 +1006,6 @@ func (d *DiskCache) putDir(ctx context.Context, diskPath string, mark uint64, fi
 // size bytes, as the entry directory diskPath, unless its entry was deleted after mark. An
 // entry already there with the files is kept.
 func (d *DiskCache) publishDir(ctx context.Context, diskPath, tmp string, mark uint64, files []IndexCacheFile, size int64) (written bool, err error) {
-	owner, err := d.paths.acquire(ctx, diskPath, func() error {
-		return d.removeUnindexedFile(diskPath)
-	})
-	if err != nil {
-		return false, err
-	}
-	defer func() {
-		d.mergeWriteCleanupError(diskPath, &err, owner.release())
-	}()
-
 	if existing, err := cacheDirSize(diskPath); err == nil {
 		if cacheDirHasFiles(diskPath, files) {
 			if _, ok := d.cache.Get(ctx, diskPath); !ok {
@@ -1068,6 +1042,7 @@ func (d *DiskCache) publishDir(ctx context.Context, diskPath, tmp string, mark u
 	var renameErr error
 	if !held {
 		renameErr = os.Rename(tmp, diskPath)
+		d.files.changed(diskPath)
 	}
 	d.trash.mu.Unlock()
 	if held {
@@ -1088,13 +1063,7 @@ func (d *DiskCache) publishDir(ctx context.Context, diskPath, tmp string, mark u
 	if _, ok := d.cache.Get(ctx, diskPath); !ok || !d.cache.Replace(ctx, diskPath, struct{}{}, size) {
 		d.cache.Set(ctx, diskPath, struct{}{}, size)
 	}
-	if !d.cache.Contains(diskPath) {
-		if err := d.removeCacheDir(diskPath); err != nil && !os.IsNotExist(err) {
-			return false, err
-		}
-		return false, nil
-	}
-	return true, nil
+	return d.cache.Contains(diskPath), nil
 }
 
 // syncPath makes the file at path durable.
@@ -1181,18 +1150,9 @@ func (d *DiskCache) moveCacheDirFile(ctx context.Context, from, to string) (int6
 	return fileSize(stat), nil
 }
 
-// openDir opens files of the entry directory diskPath; its wait for the path shares
-// deadline with the caller's.
-func (d *DiskCache) openDir(ctx context.Context, name string, diskPath string, files []string, deadline *time.Time) ([]*os.File, error) {
-	generation, ok := d.paths.startRead(ctx, diskPath, deadline)
-	if !ok {
-		if err := ctx.Err(); err != nil {
-			return nil, err
-		}
-		return nil, moerr.NewFileNotFoundNoCtx(name)
-	}
-	defer d.paths.endRead(diskPath, generation)
-
+// openDir opens files of the entry directory diskPath. An entry the cache does not hold
+// is indexed by the publisher while it is still the directory opened.
+func (d *DiskCache) openDir(ctx context.Context, name string, diskPath string, files []string) ([]*os.File, error) {
 	// Files are opened relative to one directory handle, so all of them come from the
 	// same entry even if it is evicted and published again meanwhile.
 	root, err := os.OpenRoot(diskPath)
@@ -1225,25 +1185,17 @@ func (d *DiskCache) openDir(ctx context.Context, name string, diskPath string, f
 	}
 
 	if _, ok := d.cache.Get(ctx, diskPath); !ok {
-		size, err := cacheDirSize(diskPath)
+		dir, err := root.Stat(".")
 		if err != nil {
 			closeOpened()
-			if os.IsNotExist(err) {
-				return nil, moerr.NewFileNotFoundNoCtx(name)
-			}
 			return nil, err
 		}
-		if owner, ok := d.paths.reindex(diskPath, generation); ok {
-			var reindexErr error
-			func() {
-				defer func() { reindexErr = owner.release() }()
-				d.cache.Set(ctx, diskPath, struct{}{}, size)
-			}()
-			if reindexErr != nil {
-				closeOpened()
-				return nil, reindexErr
+		d.pub.queue(diskPath, func() error {
+			if size, err := cacheDirSize(diskPath); err == nil && !d.cache.Contains(diskPath) && sameFileAt(dir, diskPath) {
+				d.cache.Set(context.Background(), diskPath, struct{}{}, size)
 			}
-		}
+			return nil
+		})
 	}
 	return opened, nil
 }
@@ -1289,18 +1241,11 @@ func cacheDirSize(path string) (int64, error) {
 	return size, nil
 }
 
-func (d *DiskCache) removeCachePath(path string) error {
-	if d.dirEntries && strings.HasSuffix(path, cacheDirSuffix) {
-		return d.removeCacheDir(path)
-	}
-	return os.Remove(path)
-}
-
 // removeCacheDir renames the entry out of its name in one step, then removes it. Once
 // renamed the entry is gone; files it fails to remove are kept as trash (see removeTrash).
 func (d *DiskCache) removeCacheDir(path string) error {
 	size := d.cacheDirBytes(path)
-	trash, err := trashCacheDir(path, size)
+	trash, err := d.trashCacheDir(path, size)
 	if err != nil {
 		return err
 	}
@@ -1314,25 +1259,23 @@ func (d *DiskCache) removeCacheDir(path string) error {
 // bytes.
 func (d *DiskCache) removeUnlistedDir(ctx context.Context, path string) {
 	runPathHook(d.hooks.beforeRemoveUnlistedDir, path)
-	owner, err := d.paths.acquire(ctx, path, nil)
-	if err != nil {
-		return
-	}
-	defer owner.release()
-	if d.cache.Contains(path) {
-		return
-	}
-	if _, err := cacheDirSize(path); !os.IsPermission(err) {
-		return
-	}
-	trash, err := trashCacheDir(path, -1)
-	if err != nil {
-		return
-	}
-	d.cache.Delete(ctx, path)
-	if err := d.removeTrash(trash, -1); err != nil {
-		logutil.Error("index file cache: remove entry files", zap.String("path", trash), zap.Error(err))
-	}
+	_ = d.pub.remove(ctx, path, func() error {
+		if d.cache.Contains(path) {
+			return nil
+		}
+		if _, err := cacheDirSize(path); !os.IsPermission(err) {
+			return nil
+		}
+		trash, err := d.trashCacheDir(path, -1)
+		if err != nil {
+			return nil
+		}
+		d.cache.Delete(context.Background(), path)
+		if err := d.removeTrash(trash, -1); err != nil {
+			logutil.Error("index file cache: remove entry files", zap.String("path", trash), zap.Error(err))
+		}
+		return nil
+	})
 }
 
 // cacheDirBytes returns the bytes of entry directory path: those it is indexed with, those
@@ -1476,13 +1419,15 @@ func (d *DiskCache) retryTrash() {
 
 // trashCacheDir renames entry directory path of size bytes, -1 when unknown, to a trash
 // name that records a known size.
-func trashCacheDir(path string, size int64) (string, error) {
+func (d *DiskCache) trashCacheDir(path string, size int64) (string, error) {
 	trash := fmt.Sprintf("%s.%d-%d", path, os.Getpid(), cacheDirTrashSeq.Add(1))
 	if size >= 0 {
 		trash += "." + strconv.FormatInt(size, 10)
 	}
 	trash += cacheDirTrashSuffix
-	return trash, os.Rename(path, trash)
+	err := os.Rename(path, trash)
+	d.files.changed(path)
+	return trash, err
 }
 
 // trashSize returns the bytes trash name records, or -1.
@@ -1626,12 +1571,8 @@ type indexFillTarget struct {
 	mark     uint64
 }
 
-func (t indexFillTarget) heldBeforeLock(context.Context) bool {
+func (t indexFillTarget) held(context.Context) bool {
 	return t.s.indexObjectHeld(t.filePath)
-}
-
-func (t indexFillTarget) held(context.Context) (bool, error) {
-	return t.s.indexObjectHeld(t.filePath), nil
 }
 
 // reserve makes no room: the index-file cache evicts when the entry is put.
@@ -1773,7 +1714,7 @@ func (s *S3FS) readIndexObject(ctx context.Context, vector *IOVector) error {
 			if statErr != nil {
 				return nil
 			}
-			s.indexFileCache.dropBroken(ctx, name, "", entry.gen, seen, IndexObjectFile)
+			s.indexFileCache.dropBroken(ctx, name, "", seen, IndexObjectFile)
 			return nil
 		}
 		e.done = true

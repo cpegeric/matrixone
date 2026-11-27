@@ -321,7 +321,6 @@ func (d *DiskCache) prefetchRead(
 		}
 	}
 	out := make([]byte, hi-lo)
-	var deadline time.Time
 	// copyBlock copies the bytes of b from the prefetch object reading them, holding it
 	// while it copies. It reports false when they are not read, with the error failing the
 	// read.
@@ -377,7 +376,7 @@ func (d *DiskCache) prefetchRead(
 		if o != nil && !o.caches() {
 			return false, nil
 		}
-		return d.readCachedBytes(ctx, filePath, b.start, dst, &deadline), nil
+		return d.readCachedBytes(ctx, filePath, b.start, dst), nil
 	}
 	for i := 0; i < len(blocks); i++ {
 		b := &blocks[i]
@@ -397,7 +396,7 @@ func (d *DiskCache) prefetchRead(
 				j++
 			}
 			dst = out[b.start-lo : blocks[j].end-lo]
-			if !d.readCachedRange(ctx, b.cached, b.start, dst, &deadline) {
+			if !d.readCachedRange(ctx, diskPath, b.cached, b.start, dst) {
 				return nil, memoryRuns, false, nil
 			}
 			i = j
@@ -608,8 +607,7 @@ func (d *DiskCache) fetchRange(
 				}
 				// A prefetch object that caches its bytes and ended without them may have
 				// left them cached in a range.
-				var deadline time.Time
-				if o.caches() && d.readCachedBytes(ctx, filePath, p.start, dst, &deadline) {
+				if o.caches() && d.readCachedBytes(ctx, filePath, p.start, dst) {
 					results[i] = pieceResult{ok: true, cached: true}
 					return
 				}
@@ -701,8 +699,7 @@ func (d *DiskCache) fetchPiece(
 		}
 		// An object that caches its bytes and ended without them may have found them
 		// cached in a range.
-		var deadline time.Time
-		if o.caches() && d.readCachedBytes(ctx, filePath, start, out, &deadline) {
+		if o.caches() && d.readCachedBytes(ctx, filePath, start, out) {
 			return out, true, true, nil
 		}
 		return nil, false, false, nil
@@ -1055,85 +1052,73 @@ func (d *DiskCache) readFromFlights(ctx context.Context, filePath string, vector
 
 // readCachedBytes reads len(dst) bytes at offset of the object at filePath from what the
 // disk cache holds of them: the smallest cached range holding them, or the cached ranges
-// holding them together. It reports whether it read them.
-func (d *DiskCache) readCachedBytes(ctx context.Context, filePath string, offset int64, dst []byte, deadline *time.Time) bool {
+// holding them together while no delete of the object is counted meanwhile. It reports
+// whether it read them.
+func (d *DiskCache) readCachedBytes(ctx context.Context, filePath string, offset int64, dst []byte) bool {
 	key, end := d.objectKey(filePath), offset+int64(len(dst))
 	if r, ok := smallestContaining(d.ranges.of(key), offset, int64(len(dst)), nil); ok && d.cache.Contains(r.diskPath) {
-		return d.readCachedRange(ctx, r, offset, dst, deadline)
+		return d.readCachedRange(ctx, key, r, offset, dst)
 	}
+	deletes := d.deletes.now()
 	if rs, ok := d.ranges.covering(key, offset, int64(len(dst))); ok {
 		for _, r := range rs {
 			lo, hi := max(offset, r.offset), min(end, r.offset+r.size)
-			if !d.cache.Contains(r.diskPath) || !d.readCachedRange(ctx, r, lo, dst[lo-offset:hi-offset], deadline) {
+			if !d.cache.Contains(r.diskPath) || !d.readCachedRange(ctx, key, r, lo, dst[lo-offset:hi-offset]) {
 				return false
 			}
 		}
-		return true
+		return !d.deletes.since(key, deletes)
 	}
 	return false
 }
 
-// readCachedRange reads len(dst) bytes at offset of the object from the cached range r. A
-// range it cannot read is dropped.
-func (d *DiskCache) readCachedRange(ctx context.Context, r cachedRange, offset int64, dst []byte, deadline *time.Time) bool {
-	generation, ok := d.paths.startRead(ctx, r.diskPath, deadline)
+// readCachedRange reads len(dst) bytes at offset of the object with key from the cached
+// range r. A range it cannot read is dropped.
+func (d *DiskCache) readCachedRange(ctx context.Context, key string, r cachedRange, offset int64, dst []byte) bool {
+	opened, ok := d.files.open(ctx, r.diskPath)
 	if !ok {
+		d.cachedFileExists(ctx, r.diskPath)
 		return false
 	}
-	opened, ok := d.paths.open(ctx, r.diskPath, generation)
-	if !ok {
-		d.paths.endRead(r.diskPath, generation)
-		d.dropCachedRange(ctx, r.diskPath)
-		return false
-	}
+	defer d.files.close(opened)
 	if _, err := opened.file.ReadAt(dst, offset-r.offset); err != nil {
-		d.paths.close(r.diskPath, opened)
-		d.dropCachedRange(ctx, r.diskPath)
+		d.dropCachedRange(key, r.diskPath, opened.file)
 		return false
 	}
-	d.paths.close(r.diskPath, opened)
 	d.cache.Get(ctx, r.diskPath)
 	return true
 }
 
-// dropCachedRange removes the cached range at diskPath, whose file is missing, short or
-// unreadable, unless the path is being changed.
-func (d *DiskCache) dropCachedRange(ctx context.Context, diskPath string) {
-	owner, ok := d.paths.tryAcquire(diskPath, nil)
-	if !ok {
+// dropCachedRange has the publisher remove the cached range at diskPath of the object with
+// key, whose file f is short or unreadable, while f is still its file. A range whose file
+// is not removed stays indexed.
+func (d *DiskCache) dropCachedRange(key, diskPath string, f *os.File) {
+	info, err := f.Stat()
+	if err != nil {
 		return
 	}
-	defer owner.release()
-	if err := os.Remove(diskPath); err != nil && !os.IsNotExist(err) {
-		return
-	}
-	d.ranges.remove(diskPath)
-	d.cache.Delete(ctx, diskPath)
+	d.pub.queue(key, func() error {
+		if !sameFileAt(info, diskPath) {
+			return nil
+		}
+		err := os.Remove(diskPath)
+		d.files.changed(diskPath)
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		d.cache.Delete(context.Background(), diskPath)
+		return nil
+	})
 }
 
 // cachedFileExists reports whether the cache file at diskPath is on disk; when it is
-// missing, its index entry is dropped (see dropMissingFile).
+// missing, its index entry is dropped.
 func (d *DiskCache) cachedFileExists(ctx context.Context, diskPath string) bool {
-	if _, err := os.Stat(diskPath); os.IsNotExist(err) {
-		d.dropMissingFile(ctx, diskPath)
-		return false
-	}
-	return true
-}
-
-// dropMissingFile drops the index entry of the cache file at diskPath while the file is
-// missing, unless another holder owns its path.
-func (d *DiskCache) dropMissingFile(ctx context.Context, diskPath string) {
-	owner, ok := d.paths.tryAcquire(diskPath, nil)
-	if !ok {
-		return
-	}
-	defer owner.release()
 	if _, err := os.Stat(diskPath); !os.IsNotExist(err) {
-		return
+		return true
 	}
-	d.ranges.remove(diskPath)
 	d.cache.Delete(ctx, diskPath)
+	return false
 }
 
 // memoryPrefetchObject is a prefetch range being read from object storage into buf.
@@ -1689,8 +1674,10 @@ func (p *filePrefetchObject) endAt(size int64) {
 	f.mu.Unlock()
 }
 
-// admitWhole registers p, a whole-object download. It reports false when the download is skipped, or with why it stopped; a delete of
-// the object or the closing of the cache stops it as a cancel does.
+// admitWhole registers p, a whole-object download. It reports false when the download is
+// skipped, as for a whole object another fill of its cache downloads or publishes, or
+// with why it stopped; a delete of the object or the closing of the cache stops it as a
+// cancel does.
 func (p *filePrefetchObject) admitWhole() (bool, error) {
 	o, err := admit(p.ctx, p)
 	if errors.Is(err, errPrefetchDeleted) || errors.Is(err, errPrefetchClosed) {
@@ -1698,6 +1685,10 @@ func (p *filePrefetchObject) admitWhole() (bool, error) {
 	}
 	if o == nil || err != nil {
 		return false, err
+	}
+	if o != prefetchObject(p) {
+		o.release()
+		return false, nil
 	}
 	p.stopOnClose = context.AfterFunc(p.closing, p.cancelRead)
 	return true, nil
@@ -1736,13 +1727,18 @@ func (p *filePrefetchObject) started(o *objectDownload) {
 	p.markReady()
 }
 
-// joinLocked returns the prefetch object holding the bytes of p that p joins instead,
-// none for a whole object.
+// joinLocked returns the prefetch object holding the bytes of p that p joins instead: for
+// a whole object, a live fill of the whole object into its cache.
 func (p *filePrefetchObject) joinLocked() prefetchObject {
-	if p.whole {
-		return nil
+	if !p.whole {
+		return p.d.prefetchObjects.holdingLocked(p.diskPath, p.index, p.start, p.end)
 	}
-	return p.d.prefetchObjects.holdingLocked(p.diskPath, p.index, p.start, p.end)
+	for _, o := range p.d.prefetchObjects.m[p.diskPath] {
+		if w, ok := o.(*filePrefetchObject); ok && w != p && w.whole && w.index == p.index && w.live() {
+			return w
+		}
+	}
+	return nil
 }
 
 // registerLocked registers p, joinable once its download is registered.
@@ -1801,14 +1797,14 @@ func (d *DiskCache) forgetFill(objectPath string, p *filePrefetchObject) {
 
 // holdingLocked returns the prefetch object of the object at objectPath, of the cache
 // index names, holding the bytes [start, end) that a FilePrefetchObject joins instead of
-// downloading them: one reads can join that caches them, or a registered
-// FilePrefetchObject a read started.
+// downloading them: one reads can join that caches them, or a registered live
+// FilePrefetchObject of a range, or of a whole object a read started.
 func (f *prefetchObjects) holdingLocked(objectPath string, index bool, start, end int64) prefetchObject {
 	if o := f.joinableLocked(objectPath, index, start, end, true); o != nil {
 		return o
 	}
 	for _, o := range f.m[objectPath] {
-		if p, ok := o.(*filePrefetchObject); ok && p.readStarted && p.index == index && p.live() && p.start <= start && end <= p.end {
+		if p, ok := o.(*filePrefetchObject); ok && (p.readStarted || !p.whole) && p.index == index && p.live() && p.start <= start && end <= p.end {
 			return p
 		}
 	}
@@ -1830,7 +1826,7 @@ func (d *DiskCache) downloadFile(ctx context.Context, filePath string, start, en
 	openReader := func(context.Context) (io.ReadCloser, error) { return &src, nil }
 	layout := func(context.Context) (int64, int64, error) { return end - start, 0, nil }
 	mark := readMark{object: d.objectKey(filePath), deletes: readDeletes - 1, set: true}
-	written, err = d.writeFileTo(ctx, diskPath, openReader, false, rangeFill, layout, nil, mark)
+	written, err = d.writeFileTo(ctx, diskPath, openReader, false, rangeFill, layout, diskFillTarget{d: d, diskPath: diskPath}, mark)
 	if err != nil {
 		if size := objectEnd.Load(); size > start {
 			// A later run of the object ends at its size.

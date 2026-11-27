@@ -92,9 +92,11 @@ type publisher struct {
 	startOnce  sync.Once
 	closeOnce  sync.Once
 	submitters sync.WaitGroup
-	// taking, holding one token, orders the taking of publications from jobs with their
-	// entry in taken.
+	// taking, holding one token, orders the taking of publications from jobs and queued
+	// with their entry in taken.
 	taking chan struct{}
+	// wake tells a worker waiting for jobs that one is queued.
+	wake chan struct{}
 
 	mu struct {
 		sync.Mutex
@@ -106,6 +108,8 @@ type publisher struct {
 		// the order they were taken; finished is closed and replaced when one is done.
 		taken    map[string][]*publication
 		finished chan struct{}
+		// queued holds the removals queued without waiting, taken before jobs.
+		queued []*publication
 	}
 }
 
@@ -151,6 +155,7 @@ func (p *publisher) init(d *DiskCache) {
 	p.mu.finished = make(chan struct{})
 	p.taking = make(chan struct{}, 1)
 	p.taking <- struct{}{}
+	p.wake = make(chan struct{}, 1)
 }
 
 func (d *DiskCache) initWriteFailureState() {
@@ -368,15 +373,20 @@ func (p *publisher) run() {
 			return
 		case <-p.taking:
 		}
-		var pub *publication
-		select {
-		case <-p.ctx.Done():
-			p.taking <- struct{}{}
-			return
-		case pub = <-p.jobs:
+		pub := p.takeQueued()
+		if pub == nil {
+			select {
+			case <-p.ctx.Done():
+				p.taking <- struct{}{}
+				return
+			case <-p.wake:
+				p.taking <- struct{}{}
+				continue
+			case pub = <-p.jobs:
+			}
+			metric.FSDiskCachePublisherQueued.Dec()
+			p.take(pub)
 		}
-		metric.FSDiskCachePublisherQueued.Dec()
-		p.take(pub)
 		p.taking <- struct{}{}
 		p.runTaken(pub)
 	}
@@ -387,6 +397,47 @@ func (p *publisher) take(pub *publication) {
 	p.mu.Lock()
 	p.mu.taken[pub.object] = append(p.mu.taken[pub.object], pub)
 	p.mu.Unlock()
+}
+
+// takeQueued takes the first removal queued, entered in the order of its object, or
+// returns nil.
+func (p *publisher) takeQueued() *publication {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.mu.queued) == 0 {
+		return nil
+	}
+	pub := p.mu.queued[0]
+	p.mu.queued = p.mu.queued[1:]
+	p.mu.taken[pub.object] = append(p.mu.taken[pub.object], pub)
+	return pub
+}
+
+// queue has a worker run remove as a removal of object, without waiting for it. Nothing
+// is queued once the publisher is closed.
+func (p *publisher) queue(object string, remove func() error) {
+	p.mu.Lock()
+	if p.mu.closed {
+		p.mu.Unlock()
+		return
+	}
+	if p.mu.pending == 0 {
+		p.mu.idle = make(chan struct{})
+	}
+	p.mu.pending++
+	p.mu.queued = append(p.mu.queued, &publication{
+		diskPath: object,
+		object:   object,
+		removal:  true,
+		publish:  func(context.Context) (bool, error) { return true, remove() },
+		release:  func() error { return nil },
+	})
+	p.mu.Unlock()
+	p.startOnce.Do(p.start)
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
 }
 
 // runTaken waits for the turn of pub, taken, and publishes it, or runs it when it is a
@@ -525,6 +576,11 @@ func (p *publisher) seal() {
 			p.submitters.Wait()
 			for {
 				<-p.taking
+				if pub := p.takeQueued(); pub != nil {
+					p.taking <- struct{}{}
+					p.runTaken(pub)
+					continue
+				}
 				select {
 				case pub := <-p.jobs:
 					metric.FSDiskCachePublisherQueued.Dec()
@@ -561,14 +617,10 @@ func (p *publisher) close(ctx context.Context) {
 
 // fillTarget is the cache a fill of the disk cache publishes the file it writes into: the
 // disk cache itself, or the index-file cache for the objects it keeps. The download, the
-// path lock, the file written and the reads of it while it is written are the disk
-// cache's either way.
+// file written and the reads of it while it is written are the disk cache's either way.
 type fillTarget interface {
-	// heldBeforeLock reports whether the target already holds the file, before the fill
-	// holds the path.
-	heldBeforeLock(ctx context.Context) bool
-	// held reports whether the target holds the file, while the fill holds the path.
-	held(ctx context.Context) (bool, error)
+	// held reports whether the target already holds the file.
+	held(ctx context.Context) bool
 	// reserve makes room for a file of size bytes about to be written.
 	reserve(ctx context.Context, size int64)
 	// noteWritten tells the target the size of a whole object written.
@@ -591,35 +643,15 @@ type diskFillTarget struct {
 	diskPath string
 }
 
-func (t diskFillTarget) heldBeforeLock(ctx context.Context) bool {
+// held reports whether the file at diskPath is indexed and on disk. Otherwise the file
+// written is renamed over what is there, and replaces its index entry.
+func (t diskFillTarget) held(ctx context.Context) bool {
 	if _, ok := t.d.cache.Get(ctx, t.diskPath); ok {
 		if _, err := os.Stat(t.diskPath); err == nil {
 			return true
 		}
 	}
 	return false
-}
-
-func (t diskFillTarget) held(ctx context.Context) (bool, error) {
-	if _, ok := t.d.cache.Get(ctx, t.diskPath); ok {
-		if _, err := os.Stat(t.diskPath); err == nil {
-			return true, nil
-		} else if !os.IsNotExist(err) {
-			return false, err
-		}
-		// Repair the missing physical file and replace the existing index after the
-		// rewrite so FIFO accounting uses the repaired file size.
-	}
-	if stat, err := os.Stat(t.diskPath); err == nil {
-		if t.d.indexFoundFile(ctx, t.diskPath, stat) {
-			return true, nil
-		}
-		// A file of an object deleted since the cache was created may be stale.
-		if err := os.Remove(t.diskPath); err != nil && !os.IsNotExist(err) {
-			return false, err
-		}
-	}
-	return false, nil
 }
 
 func (t diskFillTarget) reserve(ctx context.Context, size int64) {
@@ -635,26 +667,23 @@ func (t diskFillTarget) createTemp() (*os.File, error) {
 }
 
 func (t diskFillTarget) publish(ctx context.Context, tempPath string, size int64) error {
-	if err := os.Rename(tempPath, t.diskPath); err != nil {
+	err := os.Rename(tempPath, t.diskPath)
+	t.d.files.changed(t.diskPath)
+	if err != nil {
 		return err
 	}
-	return t.index(ctx, size)
+	t.index(ctx, size)
+	return nil
 }
 
 // index indexes the file published at diskPath, of size bytes.
-func (t diskFillTarget) index(ctx context.Context, size int64) error {
+func (t diskFillTarget) index(ctx context.Context, size int64) {
 	logutil.Debug("disk cache file written",
 		zap.Any("path", t.diskPath),
 	)
 	if !t.d.cache.Replace(ctx, t.diskPath, struct{}{}, size) {
 		t.d.cache.Set(ctx, t.diskPath, struct{}{}, size)
 	}
-	if !t.d.cache.Contains(t.diskPath) {
-		if err := os.Remove(t.diskPath); err != nil && !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return nil
 }
 
 // wholeFillTarget publishes a whole object into the disk cache as the range [0, size) of
@@ -699,16 +728,14 @@ func (t *wholeFillTarget) cached(ctx context.Context) bool {
 		return false
 	}
 	path := t.d.pathForIOEntry(t.filePath, IOEntry{Size: t.size})
-	if !(diskFillTarget{d: t.d, diskPath: path}).heldBeforeLock(ctx) {
+	if !(diskFillTarget{d: t.d, diskPath: path}).held(ctx) {
 		return false
 	}
 	t.d.storePrefetchedSize(t.key, t.size, t.mark)
 	return true
 }
 
-func (t *wholeFillTarget) heldBeforeLock(ctx context.Context) bool { return t.cached(ctx) }
-
-func (t *wholeFillTarget) held(ctx context.Context) (bool, error) { return t.cached(ctx), nil }
+func (t *wholeFillTarget) held(ctx context.Context) bool { return t.cached(ctx) }
 
 func (t *wholeFillTarget) reserve(ctx context.Context, size int64) {
 	t.d.cache.Evict(ctx, nil, size)
@@ -724,29 +751,13 @@ func (t *wholeFillTarget) createTemp() (*os.File, error) {
 
 func (t *wholeFillTarget) cache() *DiskCache { return t.d }
 
-// place makes the file of the fill holding w the range [0, n): it owns the range file,
-// released with w's owner, waiting for it unless try is set. It reports false when the
-// range file is not free under try, or is cached.
-func (t *wholeFillTarget) place(ctx context.Context, n int64, w *fileWrite, try bool) (bool, error) {
+// place makes the file of the fill the range [0, n). It reports false when the range file
+// is cached.
+func (t *wholeFillTarget) place(ctx context.Context, n int64) bool {
 	t.sizeAt(n)
 	t.path = t.d.pathForIOEntry(t.filePath, IOEntry{Size: n})
 	t.d.storePrefetchedSize(t.key, n, t.mark)
-	cleanup := func() error { return t.d.removeUnindexedFile(t.path) }
-	var owner *pathOwner
-	if try {
-		var ok bool
-		if owner, ok = t.d.paths.tryAcquire(t.path, cleanup); !ok {
-			return false, nil
-		}
-	} else {
-		var err error
-		if owner, err = t.d.paths.acquire(ctx, t.path, cleanup); err != nil {
-			return false, err
-		}
-	}
-	w.owner.releasesFirst(owner)
-	held, err := diskFillTarget{d: t.d, diskPath: t.path}.held(ctx)
-	return err == nil && !held, err
+	return !(diskFillTarget{d: t.d, diskPath: t.path}).held(ctx)
 }
 
 func (t *wholeFillTarget) publish(ctx context.Context, tempPath string, size int64) error {
@@ -754,10 +765,13 @@ func (t *wholeFillTarget) publish(ctx context.Context, tempPath string, size int
 		t.d.wholePublications.Store(t.path, wholePublication{key: t.key, download: t.download})
 		defer t.d.wholePublications.Delete(t.path)
 	}
-	if err := t.rename(tempPath); err != nil {
+	err := t.rename(tempPath)
+	t.d.files.changed(t.path)
+	if err != nil {
 		return err
 	}
-	return diskFillTarget{d: t.d, diskPath: t.path}.index(ctx, size)
+	diskFillTarget{d: t.d, diskPath: t.path}.index(ctx, size)
+	return nil
 }
 
 // rename moves the file at tempPath to the range file, in its directory, which stays

@@ -115,6 +115,7 @@ func evictIndexCache(c *IndexFileCache) {
 	done := make(chan int64, 1)
 	c.disk.cache.Evict(context.Background(), done, 0)
 	<-done
+	c.disk.Flush(context.Background())
 }
 
 func TestIndexFileCachePutOpen(t *testing.T) {
@@ -324,6 +325,7 @@ func TestIndexFileCacheDelete(t *testing.T) {
 
 func requireEntryDir(t *testing.T, c *IndexFileCache, name string, exists bool) {
 	t.Helper()
+	c.disk.Flush(context.Background())
 	path, err := c.disk.pathForDir(name)
 	require.NoError(t, err)
 	_, err = os.Stat(path)
@@ -861,6 +863,7 @@ func TestIndexFileCacheTwoInstancesShareDirectory(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, data, readAllFile(t, files[0]))
 	closeFiles(files)
+	c2.disk.Flush(ctx)
 	diskPath, err := c2.disk.pathForDir("e")
 	require.NoError(t, err)
 	require.True(t, c2.disk.cache.Contains(diskPath), "a hit indexes the entry in the reading instance")
@@ -1306,27 +1309,6 @@ func TestIndexFileCacheRemovalLeavesNoDirectories(t *testing.T) {
 	closeFiles(files)
 }
 
-func TestIndexFileCacheOpenDirSharesCallerDeadline(t *testing.T) {
-	originalShortWait := shortIOWaitDuration
-	shortIOWaitDuration = 10 * time.Second
-	t.Cleanup(func() { shortIOWaitDuration = originalShortWait })
-	ctx := context.Background()
-	c := newTestIndexFileCache(t, t.TempDir(), 1<<20)
-	name := "1/abcd/0/sum"
-	_, err := c.Put(ctx, name, indexCacheEntry([]byte("x")))
-	require.NoError(t, err)
-	diskPath, err := c.disk.pathForDir(name)
-	require.NoError(t, err)
-	release := c.disk.startUpdate(diskPath)
-	defer release()
-	// The caller's wait spent its deadline: the open of the entry does not wait again.
-	deadline := time.Now().Add(-time.Millisecond)
-	started := time.Now()
-	_, err = c.disk.openDir(ctx, name, diskPath, []string{"data"}, &deadline)
-	require.Error(t, err)
-	require.Less(t, time.Since(started), time.Second)
-}
-
 type readCountingStorage struct {
 	ObjectStorage
 	reads atomic.Int64
@@ -1642,15 +1624,14 @@ func TestIndexObjectFillWritesInIndexFileCache(t *testing.T) {
 func TestIndexObjectReadKeepsFileOpen(t *testing.T) {
 	fs, _, data := newIndexObjectFS(t, true)
 	d := fs.indexFileCache.disk
-	// The load of the cache owns the entries it indexes, which closes their kept files.
 	<-d.load.done
 	cacheIndexObject(t, fs, "object", data)
 	diskPath, err := d.pathForDir(IndexObjectEntry("object"))
 	require.NoError(t, err)
 	kept := func() *openCacheFile {
-		d.paths.L.Lock()
-		defer d.paths.L.Unlock()
-		return d.paths.openFiles.m[diskPath]
+		d.files.mu.Lock()
+		defer d.files.mu.Unlock()
+		return d.files.m[diskPath]
 	}
 
 	require.Equal(t, data[1000:1010], readIndexObjectRange(t, fs, IndexFileObject, 1000, 10))
@@ -2054,6 +2035,7 @@ func TestIndexObjectRepairOutlivesLoadIndexing(t *testing.T) {
 			}
 			fs.indexFileCache.dropUnopened(ctx, name, IndexObjectFile, read)
 			read.done()
+			fs.indexFileCache.disk.Flush(ctx)
 			_, cached := fs.indexObjectCached("object")
 			require.False(t, cached, "the broken entry is dropped")
 			storage.reads.Store(0)
@@ -2222,6 +2204,7 @@ func TestIndexObjectStaleOpenRepairKeepsReplacement(t *testing.T) {
 			}
 			fs.indexFileCache.dropUnopened(ctx, name, "", read)
 			read.done()
+			fs.indexFileCache.disk.Flush(ctx)
 			_, cached := fs.indexObjectCached("object")
 			require.Equal(t, replaced, cached)
 			storage.reads.Store(0)
@@ -2265,33 +2248,10 @@ func TestIndexObjectMissingFileRepairWaitsForNoPublication(t *testing.T) {
 		unlock()
 		t.Fatal("the repair waited for the publication")
 	}
+	fs.indexFileCache.disk.Flush(context.Background())
 	_, cached := fs.indexObjectCached("object")
 	require.False(t, cached, "the entry is dropped")
 	require.Equal(t, mark, fs.indexFileCache.DeleteMark())
-}
-
-// A missing entry file whose path another holder owns is not dropped, and the delete mark
-// is kept, so the holder's work is not canceled.
-func TestIndexObjectMissingFileOwnedIsKept(t *testing.T) {
-	fs, storage, data := newIndexObjectFS(t, true)
-	cacheIndexObject(t, fs, "object", data)
-	diskPath, ok := fs.indexObjectCached("object")
-	require.True(t, ok)
-	require.NoError(t, os.Remove(filepath.Join(diskPath, IndexObjectFile)))
-	d := fs.indexFileCache.disk
-	owner, ok := d.paths.tryAcquire(diskPath, nil)
-	require.True(t, ok)
-	mark := fs.indexFileCache.DeleteMark()
-	storage.reads.Store(0)
-	// The read fills no cache, so it does not wait for the holder to publish.
-	vec := &IOVector{FilePath: "object", Policy: IndexFileObject | SkipMemoryCache | SkipCacheWrites,
-		Entries: []IOEntry{{Offset: 2000, Size: 10}}}
-	require.NoError(t, fs.Read(context.Background(), vec))
-	require.Equal(t, data[2000:2010], vec.Entries[0].Data)
-	vec.Release()
-	require.True(t, d.cache.Contains(diskPath))
-	require.Equal(t, mark, fs.indexFileCache.DeleteMark())
-	require.NoError(t, owner.release())
 }
 
 // An entry whose file cannot be opened, or is missing, is dropped and read from storage,
@@ -2517,14 +2477,14 @@ func TestIndexObjectExternalRemovalIsCacheMiss(t *testing.T) {
 			fs, storage, data := newIndexObjectFS(t, true)
 			cache := fs.indexFileCache
 			if !pooled {
-				cache.disk.paths.L.Lock()
-				cache.disk.paths.openFiles.limit = -1
-				cache.disk.paths.L.Unlock()
+				cache.disk.files.mu.Lock()
+				cache.disk.files.limit = -1
+				cache.disk.files.mu.Unlock()
 			}
 			cacheIndexObject(t, fs, "object", data)
 			entryDir, cached := fs.indexObjectCached("object")
 			require.True(t, cached)
-			// Give the second cache its own path owners, as in a different process.
+			// The second cache has its own publisher, as in a different process.
 			other, err := NewIndexFileCache(ctx, cache.Path(), fscache.ConstCapacity(64<<20), "other", 0)
 			require.NoError(t, err)
 			defer other.Close(ctx)
@@ -2851,6 +2811,7 @@ func TestIndexFileCacheEvictionRenameFailureKeepsEntry(t *testing.T) {
 			} else {
 				require.Error(t, c.Delete(ctx, "a"))
 			}
+			c.disk.Flush(ctx)
 			_, statErr := os.Stat(a)
 			onDisk := statErr == nil
 			t.Logf("a on disk %v, indexed %v, trash.bytes %d, used %d, capacity %d",
@@ -3015,7 +2976,7 @@ func TestIndexFileCacheConcurrentLifecycleAgreement(t *testing.T) {
 }
 
 // The load finishes when it indexes an entry larger than the capacity that it cannot
-// rename away: the eviction that fails is not rescheduled while the load owns the path.
+// rename away: the eviction that fails is not rescheduled.
 func TestIndexFileCacheLoadFinishesWhenEvictionCannotRemove(t *testing.T) {
 	for _, by := range []string{"rename denied", "control"} {
 		t.Run(by, func(t *testing.T) {
@@ -3046,6 +3007,7 @@ func TestIndexFileCacheLoadFinishesWhenEvictionCannotRemove(t *testing.T) {
 			case <-time.After(10 * time.Second):
 				t.Fatal("the load did not finish")
 			}
+			c2.disk.Flush(ctx)
 			_, err = os.Stat(entry)
 			if by == "control" {
 				require.True(t, os.IsNotExist(err), "the oversized entry is evicted")

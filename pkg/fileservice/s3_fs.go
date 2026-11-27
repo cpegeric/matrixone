@@ -523,7 +523,7 @@ func (s *S3FS) prefetchFile(ctx context.Context, filePath string, splitAt int64)
 		layout = s.cachedObjectSize(path.File, splitAt)
 	}
 	if err := s.diskCache.fillFileTo(
-		withBackgroundRequests(withPrefetchFill(ctx)), path.File,
+		withBackgroundRequests(ctx), path.File,
 		func(ctx context.Context) (io.ReadCloser, error) {
 			return s.newReadCloser(ctx, filePath)
 		},

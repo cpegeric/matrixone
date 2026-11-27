@@ -1652,7 +1652,7 @@ func TestPrefetchObjectRefillsMissingCachedFile(t *testing.T) {
 				if removed {
 					require.NoError(t, os.Remove(diskPath))
 				}
-				fs.diskCache.paths.closeKept()
+				fs.diskCache.files.closeAll()
 
 				require.NoError(t, fs.PrefetchObject(ctx, req()))
 				waitPrefetcherIdle(t, fs)
@@ -2278,4 +2278,59 @@ func TestReadJoiningPrefetchObjectsAcrossDeleteReturnsOneVersion(t *testing.T) {
 	require.True(t, bytes.Equal(r.data, v1) || bytes.Equal(r.data, v2),
 		"the bytes of one version: first half v1 %v, second half v2 %v",
 		bytes.Equal(r.data[:half], v1[:half]), bytes.Equal(r.data[half:], v2[half:]))
+}
+
+// A read whose entry is held together by cached ranges, one opened for an earlier entry
+// of the same read and the other published after a delete and rewrite of the object
+// meanwhile, returns the bytes of one version of the object. The control, with no delete,
+// reads the entry from the cached ranges.
+func TestReadCoveringRangesAcrossDeleteReturnsOneVersion(t *testing.T) {
+	for _, rewrite := range []bool{true, false} {
+		t.Run(map[bool]string{true: "rewrite", false: "control"}[rewrite], func(t *testing.T) {
+			const half = 4 << 10
+			ctx := context.Background()
+			fs, storage, v1 := newPrefetchRangeFS(t, 0, 2*half)
+			v2 := slices.Clone(v1)
+			for i := range v2 {
+				v2[i]++
+			}
+			// The halves are cached as ranges of their own.
+			require.Equal(t, v1[:half], readRangeOf(t, fs, 0, 0, half))
+			require.Equal(t, v1[half:], readRangeOf(t, fs, 0, half, half))
+			reading, resume := make(chan struct{}), make(chan struct{})
+			vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache, Entries: []IOEntry{
+				{Offset: 0, Size: half, WriterForRead: readShareWriterFunc(func(b []byte) (int, error) {
+					close(reading)
+					<-resume
+					return len(b), nil
+				})},
+				{Offset: half / 2, Size: half},
+			}}
+			defer vec.Release()
+			done := make(chan error, 1)
+			go func() { done <- fs.Read(ctx, vec) }()
+			// The first entry is read from the first half; then the object is deleted,
+			// rewritten and its halves cached again before the second entry is read.
+			<-reading
+			if rewrite {
+				require.NoError(t, fs.Delete(ctx, "object"))
+				require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(v2)), Data: v2}},
+					Policy: SkipDiskCache | SkipMemoryCache}))
+				require.Equal(t, v2[:half], readRangeOf(t, fs, 0, 0, half))
+				require.Equal(t, v2[half:], readRangeOf(t, fs, 0, half, half))
+			}
+			reads := storage.reads.Load()
+			close(resume)
+			require.NoError(t, <-done)
+			got := vec.Entries[1].Data
+			if !rewrite {
+				require.Equal(t, v1[half/2:half/2+half], got)
+				require.Equal(t, reads, storage.reads.Load(), "the entry is read from the cached ranges")
+				return
+			}
+			require.True(t, bytes.Equal(got, v1[half/2:half/2+half]) || bytes.Equal(got, v2[half/2:half/2+half]),
+				"the bytes of one version: first part v1 %v, second part v2 %v",
+				bytes.Equal(got[:half/2], v1[half/2:half]), bytes.Equal(got[half/2:], v2[half:half/2+half]))
+		})
+	}
 }

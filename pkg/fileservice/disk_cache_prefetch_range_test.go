@@ -290,9 +290,9 @@ func TestS3FSPrefetchRangeKeepsCachedRangeOpen(t *testing.T) {
 	require.Len(t, ranges, 1)
 	require.Equal(t, data[6000:9000], readRangeOf(t, fs, 0, 6000, 3000))
 	require.Equal(t, int64(2), storage.reads.Load(), "the cached range is not read again")
-	fs.diskCache.paths.L.Lock()
-	defer fs.diskCache.paths.L.Unlock()
-	kept := fs.diskCache.paths.openFiles.m[ranges[0].diskPath]
+	fs.diskCache.files.mu.Lock()
+	defer fs.diskCache.files.mu.Unlock()
+	kept := fs.diskCache.files.m[ranges[0].diskPath]
 	require.NotNil(t, kept, "the cached range's file is kept open")
 	require.Zero(t, kept.refs)
 }
@@ -888,7 +888,7 @@ func TestDiskCacheBadRangeFileIsDropped(t *testing.T) {
 			} else {
 				require.NoError(t, os.Remove(rs[0].diskPath))
 			}
-			fs.diskCache.paths.closeKept()
+			fs.diskCache.files.closeAll()
 			require.Equal(t, data[6000:6010], readRangeOf(t, fs, SkipAllCache, 6000, 10), "control")
 			before := storage.reads.Load()
 			require.Equal(t, data[6000:6010], readRangeOf(t, fs, 0, 6000, 10))
@@ -3147,6 +3147,7 @@ func TestWholeObjectDeleteAndEvictionAsOneRange(t *testing.T) {
 		cache := newLifecycleTestDiskCache(t)
 		whole := fill(t, cache)
 		cache.cache.Delete(ctx, whole)
+		cache.Flush(ctx)
 		require.NoFileExists(t, whole)
 		require.Equal(t, []cachedRange{{diskPath: cache.pathForIOEntry("obj", IOEntry{Offset: 10, Size: 10}), offset: 10, size: 10}},
 			cache.ranges.of(cache.objectKey("obj")), "the other range stays")
@@ -3363,7 +3364,7 @@ func TestDiskCacheTransitionAbandonedStalledDownloadFreesResources(t *testing.T)
 		d.pub.mu.Lock()
 		pending := d.pub.mu.pending
 		d.pub.mu.Unlock()
-		return heldRoom(fs.server) == 0 && !d.isUpdating(diskPath) && d.download(diskPath) == nil &&
+		return heldRoom(fs.server) == 0 && d.download(diskPath) == nil &&
 			pending == 0 && len(backgroundFills) == 0
 	}, 5*time.Second, time.Millisecond)
 	require.Empty(t, d.objectFiles("object"))
@@ -3417,17 +3418,19 @@ func TestDiskCacheTransitionReadDuringCloseKeepsNoOpenFile(t *testing.T) {
 	require.NoError(t, d.Update(ctx, &IOVector{FilePath: "object", Entries: []IOEntry{{Offset: 0, Size: 100, Data: data[:100]}}}, false))
 	diskPath := d.pathForIOEntry("object", IOEntry{Offset: 0, Size: 100})
 	require.True(t, d.cache.Contains(diskPath))
-	// The read has started its read of the path when the cache closes.
-	var deadline time.Time
-	generation, ok := d.paths.startRead(ctx, diskPath, &deadline)
-	require.True(t, ok)
+	// The read has taken the count of changes of the path when the cache closes.
+	seq := d.files.seq(diskPath)
 	d.Close(ctx)
-	opened, ok := d.paths.open(ctx, diskPath, generation)
-	require.True(t, ok)
-	d.paths.close(diskPath, opened)
-	d.paths.L.Lock()
-	kept := len(d.paths.openFiles.m)
-	d.paths.L.Unlock()
+	f, err := os.Open(diskPath)
+	require.NoError(t, err)
+	if kept := d.files.keep(diskPath, seq, f); kept != nil {
+		d.files.close(openedDiskCacheFile{file: f, kept: kept})
+	} else {
+		require.NoError(t, f.Close())
+	}
+	d.files.mu.Lock()
+	kept := len(d.files.m)
+	d.files.mu.Unlock()
 	require.Zero(t, kept, "a file kept open after Close is never closed")
 }
 
