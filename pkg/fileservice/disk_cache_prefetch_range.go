@@ -997,10 +997,6 @@ func (d *DiskCache) endLocked(p *cacheFill, err error) bool {
 		d.server.endFill()
 		p.background = false
 	}
-	if p.counted {
-		p.counted = false
-		f.reads.Done()
-	}
 	if p.queued && p.running && !p.whole {
 		d.countPrefetch(p.req, err)
 	}
@@ -1009,6 +1005,10 @@ func (d *DiskCache) endLocked(p *cacheFill, err error) bool {
 	p.mu.Unlock()
 	if buffered {
 		p.retireDownload()
+	}
+	if p.counted {
+		p.counted = false
+		f.reads.Done()
 	}
 	close(p.endedCh)
 	p.markReady()
