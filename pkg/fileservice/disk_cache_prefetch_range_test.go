@@ -2913,6 +2913,13 @@ func busyFills(t *testing.T, fs *S3FS) func() {
 	return release
 }
 
+// fillsRunning returns the background fills g counts.
+func fillsRunning(g *objectStorageServer) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.fills
+}
+
 // waitFillsIdle waits until d has no fill waiting or running and no prefetch object.
 func waitFillsIdle(t *testing.T, d *DiskCache) {
 	t.Helper()
@@ -2920,7 +2927,7 @@ func waitFillsIdle(t *testing.T, d *DiskCache) {
 	require.Eventually(t, func() bool {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		return len(f.fills) == 0 && len(f.waitingFills) == 0 && f.backgroundFills == 0 && len(f.m) == 0
+		return len(f.fills) == 0 && len(f.waitingFills) == 0 && fillsRunning(d.server) == 0 && len(f.m) == 0
 	}, 10*time.Second, time.Millisecond)
 }
 
@@ -3391,7 +3398,7 @@ func TestDiskCacheTransitionAbandonedStalledDownloadFreesResources(t *testing.T)
 		pending := d.pub.mu.pending
 		d.pub.mu.Unlock()
 		return heldRoom(fs.server) == 0 && d.download(diskPath) == nil &&
-			pending == 0 && len(backgroundFills) == 0
+			pending == 0 && fillsRunning(fs.server) == 0
 	}, 5*time.Second, time.Millisecond)
 	require.Empty(t, d.objectFiles("object"))
 }

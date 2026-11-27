@@ -1896,17 +1896,13 @@ func (s *S3FS) readFullObjectToDiskCacheStreaming(
 		_ = waitSet()
 		return false, nil
 	}
-	if captured {
-		select {
-		case backgroundFills <- struct{}{}:
-			stopCancelFill()
-			go func() {
-				_ = waitSet()
-				<-backgroundFills
-			}()
-			return true, read.fillVector(ctx, s, file)
-		default:
-		}
+	if captured && s.server.takeFill(0) {
+		stopCancelFill()
+		go func() {
+			_ = waitSet()
+			s.diskCache.endFill()
+		}()
+		return true, read.fillVector(ctx, s, file)
 	}
 	if err := waitSet(); err != nil && !captured {
 		if stopped(err) {
@@ -1930,10 +1926,6 @@ func (s *S3FS) readFullObjectToDiskCacheStreaming(
 	}
 	return true, read.fillVector(ctx, s, file)
 }
-
-// backgroundFills bounds the whole-object downloads that continue after their reader
-// returned.
-var backgroundFills = make(chan struct{}, 8)
 
 type fullObjectDiskCacheReader struct {
 	vector   *IOVector

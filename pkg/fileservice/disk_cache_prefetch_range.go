@@ -1392,10 +1392,9 @@ type prefetchObjects struct {
 	fills        map[fillKey][]*queuedFill
 	queuedBytes  int64
 	fillSeq      uint64
-	// backgroundFills counts the background fills running, at most fillsMax, 0 for the
-	// server's background room.
-	backgroundFills int
-	fillsMax        int
+	// fillsMax is the most background fills of the cache run at once, 0 for the server's
+	// bound.
+	fillsMax int
 	// runWhole runs a fill of the whole object.
 	runWhole func(context.Context, *queuedFill)
 	reads    sync.WaitGroup // reads of runs and their cache writes

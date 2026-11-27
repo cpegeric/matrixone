@@ -128,8 +128,8 @@ var memoryAvailable = system.MemoryAvailableIncludingCache
 // objectStorageServer makes every request to the object storage raw, at most capacity
 // at once, and holds the memory budget of the file service. Waiting requests are
 // admitted foreground first, then background, each by a larger share, a sooner due time,
-// then arrival; background requests run at most backgroundMax at once. A running request
-// is never stopped. Memory is taken only when it fits at once: a foreground take within
+// then arrival; background requests run at most backgroundMax at once, as do background
+// fills. A running request is never stopped. Memory is taken only when it fits at once: a foreground take within
 // the budget, a background one also within half of it.
 type objectStorageServer struct {
 	raw ObjectStorage
@@ -144,6 +144,7 @@ type objectStorageServer struct {
 	capacity      int
 	backgroundMax int
 	running       [2]int
+	fills         int
 	waiting       [2]roomWaiters
 	seq           uint64
 	memoryUsed    [2]int64
@@ -317,6 +318,28 @@ func (g *objectStorageServer) grantLocked() {
 			return
 		}
 	}
+}
+
+// takeFill counts a background fill when fewer than max run, or fewer than backgroundMax
+// when max is 0, and reports whether it did.
+func (g *objectStorageServer) takeFill(max int) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if max <= 0 {
+		max = g.backgroundMax
+	}
+	if g.fills >= max {
+		return false
+	}
+	g.fills++
+	return true
+}
+
+// endFill ends a background fill counted by takeFill.
+func (g *objectStorageServer) endFill() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.fills--
 }
 
 // close ends the waits for room; running requests run on.

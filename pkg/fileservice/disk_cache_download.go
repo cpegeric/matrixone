@@ -766,14 +766,6 @@ func (d *DiskCache) finishDownload(o *objectDownload, p *filePrefetchObject) {
 	o.retire()
 }
 
-// backgroundRequests is the most background requests the server runs at once.
-func (d *DiskCache) backgroundRequests() int {
-	if d.server == nil {
-		return maxConnsPerHost / 2
-	}
-	return d.server.backgroundMax
-}
-
 // readFromDownload fills entry from the file fill of the object at diskPath, of the
 // index-file cache when index is set, holding its bytes that fileFill returns. It reports
 // whether a fill holds the bytes, and whether it filled entry.

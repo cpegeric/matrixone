@@ -489,14 +489,6 @@ func (d *DiskCache) dropLocked(q *queuedFill) {
 	d.removeWaitingLocked(q)
 }
 
-// fillsMaxLocked returns the most background fills that run at once.
-func (d *DiskCache) fillsMaxLocked() int {
-	if n := d.prefetchObjects.fillsMax; n > 0 {
-		return n
-	}
-	return d.backgroundRequests()
-}
-
 // memoryBacked reports whether a fill of n bytes is made to be held in memory: it is at
 // most memoryPrefetchMax bytes and its buffer fits the memory of the server for its class
 // now. Its buffer is taken only once its request is admitted, if it still fits.
@@ -509,7 +501,7 @@ func (d *DiskCache) memoryBacked(n int64, background bool) bool {
 }
 
 // startFillsLocked starts the waiting fills in order while the first can start: it is
-// foreground, or fewer than fillsMax background fills run. A fill whose scans all ended
+// foreground, or the server counts it as a background fill. A fill whose scans all ended
 // and no read joined is dropped instead.
 func (d *DiskCache) startFillsLocked() {
 	f := &d.prefetchObjects
@@ -520,7 +512,7 @@ func (d *DiskCache) startFillsLocked() {
 			continue
 		}
 		background := !q.isPromoted()
-		if background && f.backgroundFills >= d.fillsMaxLocked() {
+		if background && !d.server.takeFill(f.fillsMax) {
 			return
 		}
 		heap.Pop(&f.waitingFills)
@@ -542,9 +534,6 @@ func (d *DiskCache) startFillLocked(q *queuedFill, background bool, memory bool)
 	f := &d.prefetchObjects
 	closing, _ := f.openLocked()
 	q.running, q.background = true, background
-	if background {
-		f.backgroundFills++
-	}
 	ctx := withRequestOrder(withQueuedFill(context.Background(), q), requestOrder{share: q.req.share(), due: q.req.Due})
 	if q.whole {
 		f.reads.Add(1)
@@ -670,9 +659,18 @@ func (d *DiskCache) endWhole(q *queuedFill) {
 
 func (d *DiskCache) endFillLocked(q *queuedFill) {
 	if q.background {
-		d.prefetchObjects.backgroundFills--
+		d.server.endFill()
 		q.background = false
 	}
+}
+
+// endFill ends a background fill the server counted, and starts the waiting fills.
+func (d *DiskCache) endFill() {
+	d.server.endFill()
+	f := &d.prefetchObjects
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	d.startFillsLocked()
 }
 
 // promoteLocked makes q foreground: it starts before every background fill, its requests
