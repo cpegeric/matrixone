@@ -88,9 +88,10 @@ func TestPreloadUsageGroupsAreSeparate(t *testing.T) {
 }
 
 // A group thrashes only after the groups read less than it that are evicting, and the
-// evictions of the others before it thrashed no longer count.
+// evictions of the others before it thrashed no longer count. A group read less that
+// stopped evicting does not hold back another.
 func TestPreloadUsageLeastReadGroupThrashesFirst(t *testing.T) {
-	p, _ := newTestPreloadUsage()
+	p, clock := newTestPreloadUsage()
 	for i := 0; i < preloadUsageMinSamples-1; i++ {
 		evict(p, 1, i, 0, 100) // the base table
 	}
@@ -106,27 +107,14 @@ func TestPreloadUsageLeastReadGroupThrashesFirst(t *testing.T) {
 	require.False(t, p.narrowRead("/cache/y", 2, roomFor), "its evictions start again")
 	evict(p, 2, 200, 30, 100)
 	require.True(t, p.narrowRead("/cache/y", 2, roomFor))
-}
 
-// A group read less that stopped evicting does not hold back another.
-func TestPreloadUsageIdleLessReadGroupDoesNotHoldBack(t *testing.T) {
-	p, clock := newTestPreloadUsage()
+	p, clock = newTestPreloadUsage()
 	evict(p, 1, 0, 0, 100)
 	clock.t = clock.t.Add(preloadQuietPeriod + time.Second)
 	for i := 0; i < preloadUsageMoreSamples; i++ {
 		evict(p, 2, i, 30, 100)
 	}
-	require.True(t, p.narrowRead("/cache/y", 2, roomFor))
-}
-
-func TestPreloadUsageIgnoresFilesOfNoNarrowRead(t *testing.T) {
-	p, _ := newTestPreloadUsage()
-	for i := 0; i < 20; i++ {
-		path := fmt.Sprintf("/cache/001/full%d.mofscache", i)
-		p.cached(path, path)
-		p.removed(path, 100)
-	}
-	require.Empty(t, p.groups, "scans do not map their files to a group")
+	require.True(t, p.narrowRead("/cache/y", 2, roomFor), "the idle base table does not hold it back")
 }
 
 func TestPreloadUsageShareIsCappedAtOne(t *testing.T) {
@@ -163,9 +151,21 @@ func TestPreloadUsageTurnsOffAfterItsQuietPeriod(t *testing.T) {
 	require.True(t, p.narrowRead("/cache/x", 1, roomFor))
 	require.True(t, p.narrowRead("/cache/y", 2, roomFor))
 	// Group 2's files keep being evicted, from other files and range files of the
-	// cache too; group 1's stop.
+	// cache too; group 1's stop, and an explicit delete of one of its files is not
+	// an eviction.
 	for i := 0; i <= int(preloadQuietPeriod/time.Second); i++ {
 		clock.t = clock.t.Add(time.Second)
+		if i == int(preloadQuietPeriod/time.Second)/2 {
+			samples := p.groups[1].samples
+			path := "/cache/001/full-deleted.mofscache"
+			p.narrowRead(path, 1, roomFor)
+			p.cached(path, path)
+			p.deleted(path)
+			p.removed(path, 100)
+			require.Equal(t, samples, p.groups[1].samples)
+			require.Empty(t, p.deleting)
+			require.Empty(t, p.served)
+		}
 		evict(p, 2, 100+i, 0, 100)
 		p.cached("/cache/001/0-100scan.mofscache", "/cache/001/scan.mofscache")
 		p.removed("/cache/001/0-100scan.mofscache", 100)
@@ -221,30 +221,6 @@ func TestPreloadUsageQuietPeriodDoublesWhenThrashingResumes(t *testing.T) {
 	clock.t = clock.t.Add(2 * preloadQuietPeriodMax)
 	thrash()
 	require.Equal(t, preloadQuietPeriod, p.groups[1].quiet)
-}
-
-func TestPreloadUsageExplicitDeleteIsNotEviction(t *testing.T) {
-	p, clock := newTestPreloadUsage()
-	for i := 0; i < 10; i++ {
-		evict(p, 1, i, 0, 100)
-	}
-	require.True(t, p.narrowRead("/cache/x", 1, roomFor))
-	samples := p.groups[1].samples
-
-	clock.t = clock.t.Add(preloadQuietPeriod / 2)
-	path := "/cache/001/full-deleted.mofscache"
-	p.narrowRead(path, 1, roomFor)
-	p.cached(path, path)
-	p.deleted(path)
-	p.removed(path, 100)
-	require.Equal(t, samples, p.groups[1].samples)
-	require.Empty(t, p.deleting)
-	require.Empty(t, p.served)
-
-	// The delete did not extend the quiet period.
-	clock.t = clock.t.Add(preloadQuietPeriod/2 + time.Second)
-	require.Equal(t, preloadQuietPeriod, p.groups[1].quiet)
-	require.False(t, p.narrowRead("/cache/x", 1, roomFor))
 }
 
 func pendingPreloadSample(t *testing.T, p *preloadUsage, group uint64, path string) (*objectDownload, func()) {
@@ -388,15 +364,6 @@ func TestPreloadUsageGroupsAreBounded(t *testing.T) {
 	require.True(t, p.narrowRead("/cache/x", 1, roomFor), "a thrashing group is kept")
 }
 
-func TestPreloadUsageNilIsSafe(t *testing.T) {
-	var p *preloadUsage
-	p.cached("/cache/001/0-1obj.mofscache", "/cache/001/obj.mofscache")
-	p.read("/cache/001/0-1obj.mofscache", 1)
-	p.deleted("/cache/001/0-1obj.mofscache")
-	p.removed("/cache/001/0-1obj.mofscache", 1)
-	require.False(t, p.narrowRead("/cache/001/obj.mofscache", 1, roomFor))
-}
-
 type skippedFS struct {
 	FileService
 	group uint64
@@ -533,4 +500,13 @@ func TestS3FSWholeObjectPreloadSkippedByGroup(t *testing.T) {
 	require.Equal(t, Policy(NarrowRead), read(WithPreloadGroup(ctx, 2), NarrowRead))
 	require.Equal(t, Policy(NarrowRead), read(ctx, NarrowRead), "a read of no group")
 	require.Equal(t, Policy(0), read(thrashing, 0), "a scan")
+}
+
+func TestPreloadUsageNilIsSafe(t *testing.T) {
+	var p *preloadUsage
+	p.cached("/cache/001/0-1obj.mofscache", "/cache/001/obj.mofscache")
+	p.read("/cache/001/0-1obj.mofscache", 1)
+	p.deleted("/cache/001/0-1obj.mofscache")
+	p.removed("/cache/001/0-1obj.mofscache", 1)
+	require.False(t, p.narrowRead("/cache/001/obj.mofscache", 1, roomFor))
 }

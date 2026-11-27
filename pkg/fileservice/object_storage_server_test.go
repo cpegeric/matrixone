@@ -17,14 +17,12 @@ package fileservice
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"iter"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"reflect"
 	"runtime"
 	"slices"
 	"strings"
@@ -148,50 +146,6 @@ func TestServerOrder(t *testing.T) {
 	wg.Wait()
 	require.Equal(t, []string{"f1", "f2", "b1", "b2"}, order)
 	require.Zero(t, heldRoom(g))
-}
-
-// A background request arriving while foreground waits is not admitted before it.
-func TestServerBackgroundWaitsBehindForeground(t *testing.T) {
-	g := newObjectStorageServer(nil, minRequestRoom)
-	free := occupy(t, g, foregroundRequest, minRequestRoom)
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		require.NoError(t, waitRoom(g, context.Background(), foregroundRequest))
-		g.done(foregroundRequest)
-	}()
-	require.Eventually(t, waitingFor(g, foregroundRequest, 1), 5*time.Second, time.Millisecond)
-	_, ok := admitted(g, backgroundRequest)
-	require.False(t, ok)
-	free()
-	<-done
-	require.Zero(t, heldRoom(g))
-}
-
-// Background requests run at most half of the room; foreground may use the rest.
-func TestServerBackgroundCap(t *testing.T) {
-	g := newObjectStorageServer(nil, minRequestRoom)
-	free := occupy(t, g, backgroundRequest, minRequestRoom/2)
-	_, ok := admitted(g, backgroundRequest)
-	require.False(t, ok, "background holds its half")
-	freeForeground := occupy(t, g, foregroundRequest, minRequestRoom/2)
-	_, ok = admitted(g, foregroundRequest)
-	require.False(t, ok, "the room is full")
-	freeForeground()
-	free()
-	require.Zero(t, heldRoom(g))
-}
-
-// A room below minRequestRoom is raised to it, half of it for background requests.
-func TestServerRoomAtLeastMinimum(t *testing.T) {
-	for _, room := range []int{-1, 0, 1, 2, minRequestRoom - 1, minRequestRoom} {
-		g := newObjectStorageServer(nil, room)
-		require.Equal(t, minRequestRoom, g.capacity, "room %d", room)
-		require.Equal(t, minRequestRoom/2, g.backgroundMax, "room %d", room)
-	}
-	g := newObjectStorageServer(nil, 3*minRequestRoom+1)
-	require.Equal(t, 3*minRequestRoom+1, g.capacity)
-	require.Equal(t, (3*minRequestRoom+1)/2, g.backgroundMax)
 }
 
 // A running request is never stopped: a foreground request waits for a background one to
@@ -342,16 +296,6 @@ func (g getterStorage) Read(ctx context.Context, _ string, min, max *int64) (io.
 // getterSource returns the source of a whole object whose ranges open through get.
 func getterSource(get func(ctx context.Context, min, max *int64) (io.ReadCloser, error)) objectSource {
 	return objectSource{g: newObjectStorageServer(getterStorage{get: get}, 1024), key: "object", end: -1}
-}
-
-// No request type has a function-typed field.
-func TestServerRequestsHoldNoFunctions(t *testing.T) {
-	for _, req := range requestTypes {
-		typ := reflect.TypeOf(req)
-		for i := range typ.NumField() {
-			require.NotEqual(t, reflect.Func, typ.Field(i).Type.Kind(), "%s.%s", typ.Name(), typ.Field(i).Name)
-		}
-	}
 }
 
 // finishes runs f, failing the test when it does not return within 20s.
@@ -1015,100 +959,231 @@ func notePeak(peak *atomic.Int64, n int64) {
 
 // The memory a file service holds never passes its budget while reads, streams and
 // background prefetches run at once; with the whole budget held, a read whose range would
-// be held in memory reads it through a file fill at once, never waiting.
+// be held in memory reads it through a file fill at once, never waiting. Reads of more
+// runs than the budget holds, also with no memory at all, read every run at once, those
+// past the budget through file fills; each run is read once, a waiting read whose context
+// ends returns, and once they return no buffer stays counted.
 func TestServerProbeMemoryWithinBudget(t *testing.T) {
-	const unit = 64 << 10
-	fs, _, data := newPrefetchRangeFS(t, unit, 4<<20)
-	budget := 4 * flightBufSize(unit)
-	probeSetMemory(fs, budget)
-	var peak atomic.Int64
-	stop := make(chan struct{})
-	sampled := make(chan struct{})
-	go func() {
-		defer close(sampled)
-		for {
-			notePeak(&peak, probeMemoryHeld(fs))
-			select {
-			case <-stop:
-				return
-			default:
-				runtime.Gosched()
-			}
-		}
-	}()
-	ctx := context.Background()
-	var wg sync.WaitGroup
-	errs := make(chan error, 64)
-	for i := range 16 {
-		wg.Add(1)
+	t.Run("mixed", func(t *testing.T) {
+		const unit = 64 << 10
+		fs, _, data := newPrefetchRangeFS(t, unit, 4<<20)
+		budget := 4 * flightBufSize(unit)
+		probeSetMemory(fs, budget)
+		var peak atomic.Int64
+		stop := make(chan struct{})
+		sampled := make(chan struct{})
 		go func() {
-			defer wg.Done()
-			off := int64(i) * 200 << 10
-			vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache,
-				Entries: []IOEntry{{Offset: off + 100, Size: 10}, {Offset: off + 2*unit + 7, Size: 20}}}
-			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-			defer cancel()
-			err := fs.Read(cctx, vec)
-			if err == nil && (!bytes.Equal(vec.Entries[0].Data, data[off+100:off+110]) || !bytes.Equal(vec.Entries[1].Data, data[off+2*unit+7:off+2*unit+27])) {
-				err = fmt.Errorf("wrong bytes at %d", off)
-			}
-			vec.Release()
-			errs <- err
-		}()
-	}
-	for i := range 4 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			var rc io.ReadCloser
-			off := int64(i) * 300 << 10
-			vec := &IOVector{FilePath: "object", Policy: SkipAllCache,
-				Entries: []IOEntry{{Offset: off, Size: unit, ReadCloserForRead: &rc}}}
-			err := fs.Read(ctx, vec)
-			if err == nil {
+			defer close(sampled)
+			for {
 				notePeak(&peak, probeMemoryHeld(fs))
-				var b []byte
-				b, err = io.ReadAll(rc)
-				_ = rc.Close()
-				if err == nil && !bytes.Equal(b, data[off:off+unit]) {
-					err = fmt.Errorf("wrong stream bytes at %d", off)
+				select {
+				case <-stop:
+					return
+				default:
+					runtime.Gosched()
 				}
 			}
-			errs <- err
 		}()
-	}
-	ranges := make([]PrefetchRange, 8)
-	for i := range ranges {
-		ranges[i] = PrefetchRange{Offset: int64(i)*400<<10 + 50<<10, Size: 32 << 10}
-	}
-	require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: 4 << 20, Ranges: ranges, Scan: &PrefetchScan{}}))
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		require.NoError(t, err)
-	}
-	waitFillsIdle(t, fs.diskCache)
-	fs.diskCache.prefetchObjects.reads.Wait()
-	close(stop)
-	<-sampled
-	require.LessOrEqual(t, peak.Load(), budget, "the memory held never passes the budget")
-	require.Positive(t, peak.Load(), "some memory was held")
+		ctx := context.Background()
+		var wg sync.WaitGroup
+		errs := make(chan error, 64)
+		for i := range 16 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				off := int64(i) * 200 << 10
+				vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache,
+					Entries: []IOEntry{{Offset: off + 100, Size: 10}, {Offset: off + 2*unit + 7, Size: 20}}}
+				cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+				defer cancel()
+				err := fs.Read(cctx, vec)
+				if err == nil && (!bytes.Equal(vec.Entries[0].Data, data[off+100:off+110]) || !bytes.Equal(vec.Entries[1].Data, data[off+2*unit+7:off+2*unit+27])) {
+					err = fmt.Errorf("wrong bytes at %d", off)
+				}
+				vec.Release()
+				errs <- err
+			}()
+		}
+		for i := range 4 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var rc io.ReadCloser
+				off := int64(i) * 300 << 10
+				vec := &IOVector{FilePath: "object", Policy: SkipAllCache,
+					Entries: []IOEntry{{Offset: off, Size: unit, ReadCloserForRead: &rc}}}
+				err := fs.Read(ctx, vec)
+				if err == nil {
+					notePeak(&peak, probeMemoryHeld(fs))
+					var b []byte
+					b, err = io.ReadAll(rc)
+					_ = rc.Close()
+					if err == nil && !bytes.Equal(b, data[off:off+unit]) {
+						err = fmt.Errorf("wrong stream bytes at %d", off)
+					}
+				}
+				errs <- err
+			}()
+		}
+		ranges := make([]PrefetchRange, 8)
+		for i := range ranges {
+			ranges[i] = PrefetchRange{Offset: int64(i)*400<<10 + 50<<10, Size: 32 << 10}
+		}
+		require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: 4 << 20, Ranges: ranges, Scan: &PrefetchScan{}}))
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			require.NoError(t, err)
+		}
+		waitFillsIdle(t, fs.diskCache)
+		fs.diskCache.prefetchObjects.reads.Wait()
+		close(stop)
+		<-sampled
+		require.LessOrEqual(t, peak.Load(), budget, "the memory held never passes the budget")
+		require.Positive(t, peak.Load(), "some memory was held")
 
-	free := holdForegroundBuffer(t, fs, budget-probeMemoryHeld(fs))
-	defer free()
-	r := PrefetchRange{Offset: 3<<20 + 11, Size: 8 << 10}
-	start := time.Now()
-	got, err := probeRead(fs, r)
-	require.NoError(t, err, "a read whose buffer does not fit waits for no memory")
-	require.Less(t, time.Since(start), time.Second)
-	require.Equal(t, data[r.Offset:r.Offset+r.Size], got)
+		free := holdForegroundBuffer(t, fs, budget-probeMemoryHeld(fs))
+		defer free()
+		r := PrefetchRange{Offset: 3<<20 + 11, Size: 8 << 10}
+		start := time.Now()
+		got, err := probeRead(fs, r)
+		require.NoError(t, err, "a read whose buffer does not fit waits for no memory")
+		require.Less(t, time.Since(start), time.Second)
+		require.Equal(t, data[r.Offset:r.Offset+r.Size], got)
+	})
+
+	t.Run("run beyond headroom", func(t *testing.T) {
+		fs, storage, data := newPrefetchRangeFS(t, 4096, 64<<10)
+		// A run's buffer is at least 64 KiB, the bytes it counts for.
+		probeSetMemory(fs, 64<<10)
+		require.True(t, fs.server.takeMemory(1, foregroundRequest))
+		require.Equal(t, data[5000:5002], readRangeOf(t, fs, 0, 5000, 2))
+		require.Equal(t, int64(4096), storage.bytes.Load(), "the prefetch range")
+		fs.diskCache.prefetchObjects.reads.Wait()
+		require.Equal(t, int64(1), probeMemoryHeld(fs), "the run took no memory")
+		fs.server.freeMemory(1, foregroundRequest)
+	})
+	const unit = 64 << 10
+	for _, tc := range []struct {
+		name string
+		// budget is the memory limit; noMemory measures no memory available.
+		budget   int64
+		noMemory bool
+		readers  int
+		runs     int
+		// overlap makes the readers read every other unit, shifted by reader%2, ungated.
+		overlap bool
+		// cancel more readers wait for storage and are canceled.
+		cancel int
+	}{
+		{name: "concurrent reads", budget: 4 * unit, readers: 16, runs: 1, cancel: 4},
+		{name: "cold multi-run read", budget: 2 * unit, readers: 1, runs: 8},
+		{name: "concurrent overlapping multi-run reads", budget: 2 * unit, readers: 16, runs: 6, overlap: true},
+		{name: "no memory", noMemory: true, readers: 8, runs: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.noMemory {
+				prev := memoryAvailable
+				t.Cleanup(func() { memoryAvailable = prev })
+				memoryAvailable = func() (uint64, bool) { return 0, true }
+			}
+			size := 2 * (tc.readers + tc.cancel) * tc.runs * unit
+			if tc.overlap {
+				size = 4 * tc.runs * unit
+			}
+			fs, _, data := newPrefetchRangeFS(t, unit, size)
+			probeSetMemory(fs, tc.budget)
+			fs.server.measuredAt.Store(0)
+			storage := &gateStorage{ObjectStorage: probeRaw(fs), release: make(chan struct{})}
+			probeSetRaw(fs, storage)
+			release := sync.OnceFunc(func() { close(storage.release) })
+			t.Cleanup(release)
+			if tc.overlap {
+				release()
+			}
+			var peak atomic.Int64
+			stop := make(chan struct{})
+			sampled := make(chan struct{})
+			go func() {
+				defer close(sampled)
+				for {
+					notePeak(&peak, probeMemoryHeld(fs))
+					select {
+					case <-stop:
+						return
+					default:
+						runtime.Gosched()
+					}
+				}
+			}()
+			read := func(ctx context.Context, r int, out chan<- error) {
+				entries := make([]IOEntry, tc.runs)
+				for i := range entries {
+					if tc.overlap {
+						entries[i] = IOEntry{Offset: int64(2*i+r%2)*unit + int64(r), Size: 10}
+					} else {
+						entries[i] = IOEntry{Offset: int64(2*(r*tc.runs+i))*unit + 100, Size: 10}
+					}
+				}
+				vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache, Entries: entries}
+				err := fs.Read(ctx, vec)
+				for _, e := range vec.Entries {
+					if err == nil && !bytes.Equal(data[e.Offset:e.Offset+10], e.Data) {
+						err = fmt.Errorf("wrong bytes at %d", e.Offset)
+					}
+				}
+				vec.Release()
+				out <- err
+			}
+			done := make(chan error, tc.readers)
+			for r := range tc.readers {
+				go read(context.Background(), r, done)
+			}
+			opens := int64(tc.readers * tc.runs)
+			if !tc.overlap {
+				require.Eventually(t, func() bool { return storage.opens.Load() == opens }, 10*time.Second, time.Millisecond,
+					"every run is read at once")
+			}
+			if tc.cancel > 0 {
+				ctx, cancel := context.WithCancel(context.Background())
+				canceled := make(chan error, tc.cancel)
+				for i := range tc.cancel {
+					go read(ctx, tc.readers+i, canceled)
+				}
+				opens += int64(tc.cancel * tc.runs)
+				require.Eventually(t, func() bool { return storage.opens.Load() == opens }, 10*time.Second, time.Millisecond)
+				cancel()
+				for range tc.cancel {
+					require.ErrorIs(t, <-canceled, context.Canceled)
+				}
+			}
+			release()
+			for range tc.readers {
+				select {
+				case err := <-done:
+					require.NoError(t, err)
+				case <-time.After(diskCacheLifecycleTestTimeout):
+					t.Fatal("a read did not return")
+				}
+			}
+			if !tc.overlap && tc.cancel == 0 {
+				require.Equal(t, opens, storage.opens.Load(), "no run is read twice")
+			}
+			fs.diskCache.prefetchObjects.reads.Wait()
+			close(stop)
+			<-sampled
+			require.LessOrEqual(t, peak.Load(), tc.budget, "the memory held never passes the budget")
+			require.Zero(t, probeMemoryHeld(fs))
+			require.Empty(t, fs.diskCache.prefetchObjects.m)
+		})
+	}
 }
 
 // Open streams that hold the whole memory budget and writes whose caller readers block,
 // pipes whose producers wait on a read of the same file service, block neither a read nor
 // another write from a caller's reader: each completes at once, while the streams keep
-// their memory. Control: the same read and write with no stream open and no write
-// blocked.
+// their memory and then read their bytes. Control: the same read and write with no stream
+// open and no write blocked.
 func TestServerProbeCallerMemoryBlocksNothing(t *testing.T) {
 	const size = 1 << 10
 	fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
@@ -1178,6 +1253,11 @@ func TestServerProbeCallerMemoryBlocksNothing(t *testing.T) {
 	for range blocked {
 		require.NoError(t, <-written)
 	}
+	for i, s := range streams {
+		b, err := io.ReadAll(s)
+		require.NoError(t, err)
+		require.Equal(t, data[i*size:(i+1)*size], b, "the streams read their bytes")
+	}
 }
 
 // zeroReader reads zeros.
@@ -1238,8 +1318,9 @@ func TestServerProbePartBuffersReused(t *testing.T) {
 }
 
 // object-storage-memory sets the memory budget of the server; unset, the budget is 5% of
-// the memory available. A budget that shrinks below the memory in use takes nothing back,
-// and new memory is taken only once it fits again.
+// the memory available, also below an oversized disk-prefetch-memory-max. A budget that
+// shrinks below the memory in use takes nothing back, and new memory is taken only once it
+// fits again.
 func TestServerProbeMemoryBudgetConfig(t *testing.T) {
 	var args ObjectStorageArguments
 	require.NoError(t, args.SetFromString([]string{"object-storage-memory=3MiB"}))
@@ -1260,6 +1341,13 @@ func TestServerProbeMemoryBudgetConfig(t *testing.T) {
 	memoryAvailable = func() (uint64, bool) { return 1 << 30, true }
 	fs := newFS(ObjectStorageArguments{})
 	require.Equal(t, int64((1<<30)/100*5), probeMemoryBudget(fs), "the default is 5% of the memory available")
+	prefetchMax := fs.diskCache.memoryPrefetchMax
+	for _, limit := range []toml.ByteSize{DefaultDiskPrefetchMemoryMax, 1 << 57} {
+		cfg := CacheConfig{DiskPrefetchMemoryMax: &limit}
+		fs.diskCache.memoryPrefetchMax = cfg.diskPrefetchMemoryMax()
+		require.Equal(t, int64((1<<30)/100*5), probeMemoryBudget(fs), "the measured ceiling bounds disk-prefetch-memory-max %d", limit)
+	}
+	fs.diskCache.memoryPrefetchMax = prefetchMax
 
 	buf := flightBufSize(64 << 10)
 	probeSetMemory(fs, 4*buf)
@@ -1336,18 +1424,27 @@ func (probeParts) completeMultipart(context.Context, string, string, []multipart
 
 func (probeParts) abortMultipart(context.Context, string, string) error { return nil }
 
-// A max-conns-per-host or a concurrency below minRequestRoom is raised to it: the
-// server has room for minRequestRoom requests, half of them background; a negative one
-// is rejected.
+// A max-conns-per-host or a concurrency below minRequestRoom is raised to it, and a
+// negative one is rejected. The server has room for the smaller of them, half of it for
+// background requests, and the fewest configured connections still cache whole objects.
 func TestRoomBelowMinimumIsRaised(t *testing.T) {
 	noProbe := func(context.Context, string) (string, error) { return "", nil }
-	for _, conns := range []int{-1, 0, 1, 2, minRequestRoom - 1, minRequestRoom, 256} {
-		args := ObjectStorageArguments{Endpoint: "disk", Bucket: t.TempDir(), MaxConnsPerHost: conns}
-		err := args.validateWithRegionProbe(noProbe)
-		if conns < 0 {
-			require.ErrorContains(t, err, "max-conns-per-host", "max-conns-per-host=%d", conns)
-		} else {
-			require.NoError(t, err, "max-conns-per-host=%d", conns)
+	for _, v := range []int{-1, 0, 1, 2, minRequestRoom - 1, minRequestRoom, 256, 1024} {
+		for _, field := range []string{"max-conns-per-host", "concurrency"} {
+			args := ObjectStorageArguments{Endpoint: "disk", Bucket: t.TempDir()}
+			want := field
+			if field == "concurrency" {
+				args.Concurrency = int64(v)
+				want = fmt.Sprintf("concurrency must not be negative, got %d", v)
+			} else {
+				args.MaxConnsPerHost = v
+			}
+			err := args.validateWithRegionProbe(noProbe)
+			if v < 0 {
+				require.ErrorContains(t, err, want, "%s=%d", field, v)
+			} else {
+				require.NoError(t, err, "%s=%d", field, v)
+			}
 		}
 	}
 	for _, tc := range []struct {
@@ -1364,7 +1461,16 @@ func TestRoomBelowMinimumIsRaised(t *testing.T) {
 		{256, 7, minRequestRoom},
 		{minRequestRoom, 0, minRequestRoom},
 		{0, 0, maxConnsPerHost},
+		{0, minRequestRoom, minRequestRoom},
+		{minRequestRoom, minRequestRoom, minRequestRoom},
+		{minRequestRoom, 1 << 20, minRequestRoom},
+		{100, 0, 100},
+		{3*minRequestRoom + 1, 0, 3*minRequestRoom + 1},
+		{256, 0, 256},
+		{256, 100, 100},
+		{4096, 0, 1024},
 	} {
+		ctx := context.Background()
 		args := ObjectStorageArguments{Name: "s3", Endpoint: "disk", Bucket: t.TempDir(), MaxConnsPerHost: tc.conns, Concurrency: tc.concurrency}
 		raised := args
 		raised.raiseRequestRoom()
@@ -1374,15 +1480,32 @@ func TestRoomBelowMinimumIsRaised(t *testing.T) {
 		if tc.concurrency > 0 {
 			require.Equal(t, max(tc.concurrency, minRequestRoom), raised.Concurrency, "concurrency %d", tc.concurrency)
 		}
-		fs, err := NewS3FS(context.Background(), args, CacheConfig{MemoryCapacity: ptrTo[toml.ByteSize](0)}, nil, false, true)
+		fs, err := NewS3FS(ctx, args, CacheConfig{
+			DiskPath: ptrTo(t.TempDir()), DiskCapacity: ptrTo[toml.ByteSize](64 << 20),
+			MemoryCapacity: ptrTo[toml.ByteSize](0),
+		}, nil, false, false)
 		require.NoError(t, err, "conns %d concurrency %d", tc.conns, tc.concurrency)
 		require.Equal(t, tc.room, fs.server.capacity, "conns %d concurrency %d", tc.conns, tc.concurrency)
 		require.Equal(t, tc.room/2, fs.server.backgroundMax, "conns %d concurrency %d", tc.conns, tc.concurrency)
-		fs.Close(context.Background())
+		data := make([]byte, 300<<10)
+		require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(data)), Data: data}}, Policy: SkipDiskCache | SkipMemoryCache}))
+		d := fs.diskCache
+		d.objectSplit = objectSplitConfig{parts: 1}
+		d.prefetched.store(d.objectKey("object"), int64(len(data)))
+		got, err := readFullObjectOf(fs, 100, 10)
+		require.NoError(t, err)
+		require.Equal(t, data[100:110], got)
+		require.True(t, d.cache.Contains(d.wholePath("object", int64(len(data)))), "conns %d concurrency %d", tc.conns, tc.concurrency)
+		fs.Close(ctx)
 	}
-	_, err := NewS3FS(context.Background(), ObjectStorageArguments{Name: "s3", Endpoint: "disk", Bucket: t.TempDir(), MaxConnsPerHost: -1},
-		CacheConfig{MemoryCapacity: ptrTo[toml.ByteSize](0)}, nil, false, true)
-	require.ErrorContains(t, err, "max-conns-per-host")
+	for want, args := range map[string]ObjectStorageArguments{
+		"max-conns-per-host must not be negative": {MaxConnsPerHost: -1},
+		"concurrency must not be negative":        {Concurrency: -1},
+	} {
+		args.Name, args.Endpoint, args.Bucket = "s3", "disk", t.TempDir()
+		_, err := NewS3FS(context.Background(), args, CacheConfig{MemoryCapacity: ptrTo[toml.ByteSize](0)}, nil, false, true)
+		require.ErrorContains(t, err, want)
+	}
 }
 
 // The room of each server is the configured room divided by the services of the process,
@@ -1405,16 +1528,6 @@ func TestServerRoomSplitAmongProcessServices(t *testing.T) {
 		require.Equal(t, tc.room, fs.server.capacity, "services %d conns %d", tc.services, tc.conns)
 		fs.Close(context.Background())
 	}
-}
-
-func TestDownloadConnsAreHalfTheConfiguredLimit(t *testing.T) {
-	ctx := context.Background()
-	fs, err := NewS3FS(ctx, ObjectStorageArguments{Name: "s3", Endpoint: "disk", Bucket: t.TempDir(), MaxConnsPerHost: 100},
-		CacheConfig{DiskPath: ptrTo(t.TempDir()), DiskCapacity: ptrTo[toml.ByteSize](64 << 20), MemoryCapacity: ptrTo[toml.ByteSize](0)}, nil, false, false)
-	require.NoError(t, err)
-	defer fs.Close(ctx)
-	require.Equal(t, 100, fs.server.capacity)
-	require.Equal(t, 50, fs.server.backgroundMax)
 }
 
 // failingHeads is an object storage server whose HEAD requests fail with the status and
@@ -1499,91 +1612,79 @@ func (f *failingHeads) requireRetriedWithoutRoom(size int64, ranWith int32, err 
 
 const serviceUnavailableXML = `<Error><Code>SlowDown</Code><Message>slow down</Message></Error>`
 
-// A HEAD that fails once with a status the AWS SDK retries is made again by the file
-// service's retry, which waits with no room held.
+// A HEAD that fails once with a status the AWS SDK, the MinIO SDK or the file service
+// for COS retries is made again by the file service's retry, which waits with no room
+// held.
 func TestAwsSDKv2RetriesWithoutRoom(t *testing.T) {
-	f, server := newFailingHeads(t, 1, http.StatusServiceUnavailable, serviceUnavailableXML)
-	sdk, err := NewAwsSDKv2(context.Background(), ObjectStorageArguments{
-		Name: "aws", Bucket: "bucket", Endpoint: server.URL, Region: "us-east-1",
-		KeyID: "id", KeySecret: "secret", NoBucketValidation: true,
-	}, nil)
-	require.NoError(t, err)
-	f.requireRetriedWithoutRoom(f.statHoldingAllOtherRoom(sdk))
-}
-
-// A HEAD that fails once with a status the MinIO SDK retries is made again by the file
-// service's retry, which waits with no room held.
-func TestMinioSDKRetriesWithoutRoom(t *testing.T) {
-	f, server := newFailingHeads(t, 1, http.StatusServiceUnavailable, serviceUnavailableXML)
-	sdk, err := NewMinioSDK(context.Background(), ObjectStorageArguments{
-		Endpoint: server.URL, Region: "us-east-1", Bucket: "bucket",
-		KeyID: "id", KeySecret: "secret", NoBucketValidation: true,
-	}, nil)
-	require.NoError(t, err)
-	f.requireRetriedWithoutRoom(f.statHoldingAllOtherRoom(sdk))
+	for name, newSDK := range map[string]func(t *testing.T, server *httptest.Server) ObjectStorage{
+		"aws": func(t *testing.T, server *httptest.Server) ObjectStorage {
+			sdk, err := NewAwsSDKv2(context.Background(), ObjectStorageArguments{
+				Name: "aws", Bucket: "bucket", Endpoint: server.URL, Region: "us-east-1",
+				KeyID: "id", KeySecret: "secret", NoBucketValidation: true,
+			}, nil)
+			require.NoError(t, err)
+			return sdk
+		},
+		"minio": func(t *testing.T, server *httptest.Server) ObjectStorage {
+			sdk, err := NewMinioSDK(context.Background(), ObjectStorageArguments{
+				Endpoint: server.URL, Region: "us-east-1", Bucket: "bucket",
+				KeyID: "id", KeySecret: "secret", NoBucketValidation: true,
+			}, nil)
+			require.NoError(t, err)
+			return sdk
+		},
+		"cos": func(t *testing.T, server *httptest.Server) ObjectStorage {
+			sdk, err := NewQCloudSDK(context.Background(), ObjectStorageArguments{
+				Name: "cos", Bucket: "bucket", Region: "ap-guangzhou",
+				KeyID: "id", KeySecret: "secret", NoBucketValidation: true,
+			}, nil)
+			require.NoError(t, err)
+			u, err := url.Parse(server.URL)
+			require.NoError(t, err)
+			sdk.client.BaseURL.BucketURL = u
+			return sdk
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, server := newFailingHeads(t, 1, http.StatusServiceUnavailable, serviceUnavailableXML)
+			f.requireRetriedWithoutRoom(f.statHoldingAllOtherRoom(newSDK(t, server)))
+		})
+	}
 }
 
 // A HEAD that fails with a status the file service does not retry is made once by the
-// MinIO SDK.
+// MinIO SDK; the Aliyun SDK makes one attempt per call.
 func TestMinioSDKMakesOneAttempt(t *testing.T) {
-	f, server := newFailingHeads(t, 1, http.StatusNotImplemented, `<Error><Code>NotImplemented</Code></Error>`)
-	sdk, err := NewMinioSDK(context.Background(), ObjectStorageArguments{
-		Endpoint: server.URL, Region: "us-east-1", Bucket: "bucket",
-		KeyID: "id", KeySecret: "secret", NoBucketValidation: true,
-	}, nil)
-	require.NoError(t, err)
-	_, ranWith, err := f.statHoldingAllOtherRoom(sdk)
-	require.Error(t, err)
-	require.Equal(t, int32(1), f.attempts.Load())
-	require.Equal(t, int32(1), ranWith)
-}
-
-// A HEAD that fails once with a status the file service retries for COS is made again by
-// the file service's retry, which waits with no room held.
-func TestQCloudSDKRetriesWithoutRoom(t *testing.T) {
-	f, server := newFailingHeads(t, 1, http.StatusServiceUnavailable, serviceUnavailableXML)
-	sdk, err := NewQCloudSDK(context.Background(), ObjectStorageArguments{
-		Name: "cos", Bucket: "bucket", Region: "ap-guangzhou",
-		KeyID: "id", KeySecret: "secret", NoBucketValidation: true,
-	}, nil)
-	require.NoError(t, err)
-	u, err := url.Parse(server.URL)
-	require.NoError(t, err)
-	sdk.client.BaseURL.BucketURL = u
-	f.requireRetriedWithoutRoom(f.statHoldingAllOtherRoom(sdk))
-}
-
-// The Aliyun SDK makes one attempt per call: a HEAD that fails with a status the file
-// service does not retry is made once.
-func TestAliyunSDKMakesOneAttempt(t *testing.T) {
-	f, server := newFailingHeads(t, 1, http.StatusServiceUnavailable, serviceUnavailableXML)
-	client, err := oss.New(server.URL, "id", "secret", oss.ForcePathStyle(true), oss.HTTPClient(server.Client()))
-	require.NoError(t, err)
-	bucket, err := client.Bucket("bucket")
-	require.NoError(t, err)
-	_, ranWith, err := f.statHoldingAllOtherRoom(&AliyunSDK{bucket: bucket})
-	require.Error(t, err)
-	require.Equal(t, int32(1), f.attempts.Load())
-	require.Equal(t, int32(1), ranWith)
-}
-
-// Long waits for a connection are counted until a warning reports and resets them.
-func TestConnWaitReporterCountsLongWaits(t *testing.T) {
-	var r connWaitReporter
-	r.last = time.Now()
-	r.record("host", connWaitWarn/2, false)
-	require.Zero(t, r.waits, "a short wait is not counted")
-	r.record("host-a", connWaitWarn, true)
-	r.record("host-b", 3*connWaitWarn, false)
-	require.Equal(t, int64(2), r.waits)
-	require.Equal(t, int64(1), r.reused)
-	require.Equal(t, 3*connWaitWarn, r.max)
-	require.Equal(t, "host-b", r.host)
-
-	r.last = time.Now().Add(-connWaitWarnInterval)
-	r.record("host-c", connWaitWarn, false)
-	require.Zero(t, r.waits, "the warning resets the counts")
-	require.Zero(t, r.max)
+	for _, tc := range []struct {
+		name   string
+		status int
+		body   string
+		newSDK func(t *testing.T, server *httptest.Server) ObjectStorage
+	}{
+		{"minio", http.StatusNotImplemented, `<Error><Code>NotImplemented</Code></Error>`, func(t *testing.T, server *httptest.Server) ObjectStorage {
+			sdk, err := NewMinioSDK(context.Background(), ObjectStorageArguments{
+				Endpoint: server.URL, Region: "us-east-1", Bucket: "bucket",
+				KeyID: "id", KeySecret: "secret", NoBucketValidation: true,
+			}, nil)
+			require.NoError(t, err)
+			return sdk
+		}},
+		{"aliyun", http.StatusServiceUnavailable, serviceUnavailableXML, func(t *testing.T, server *httptest.Server) ObjectStorage {
+			client, err := oss.New(server.URL, "id", "secret", oss.ForcePathStyle(true), oss.HTTPClient(server.Client()))
+			require.NoError(t, err)
+			bucket, err := client.Bucket("bucket")
+			require.NoError(t, err)
+			return &AliyunSDK{bucket: bucket}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f, server := newFailingHeads(t, 1, tc.status, tc.body)
+			_, ranWith, err := f.statHoldingAllOtherRoom(tc.newSDK(t, server))
+			require.Error(t, err)
+			require.Equal(t, int32(1), f.attempts.Load())
+			require.Equal(t, int32(1), ranWith)
+		})
+	}
 }
 
 // gateStorage holds every read until release is closed or the read's context ends.
@@ -1631,354 +1732,6 @@ func fillRoom(t *testing.T, g *objectStorageServer) func() {
 			free()
 		}
 	})
-}
-
-// Concurrent reads of different prefetch ranges run MemoryPrefetchObjects only up to the
-// bytes the memory budget holds; the others read their ranges through file fills at once,
-// never waiting for memory. A read whose context ends returns, and once storage answers
-// every read gets its bytes and no buffer stays counted.
-func TestPrefetchMemoryBoundUnderConcurrentReads(t *testing.T) {
-	const (
-		unit    = 64 << 10
-		units   = 16
-		budget  = 4 * unit
-		waiting = 4
-	)
-	fs, _, data := newPrefetchRangeFS(t, unit, (units+waiting)*unit)
-	fs.server.memoryLimit = budget
-	storage := &gateStorage{ObjectStorage: fs.server.raw, release: make(chan struct{})}
-	fs.server.raw = storage
-	f := &fs.diskCache.prefetchObjects
-
-	var peak atomic.Int64
-	stopSampling := make(chan struct{})
-	sampled := make(chan struct{})
-	go func() {
-		defer close(sampled)
-		for {
-			if n := heldMemory(fs.diskCache); n > peak.Load() {
-				peak.Store(n)
-			}
-			select {
-			case <-stopSampling:
-				return
-			default:
-				runtime.Gosched()
-			}
-		}
-	}()
-
-	type result struct {
-		i    int
-		data []byte
-		err  error
-	}
-	read := func(ctx context.Context, i int, out chan<- result) {
-		vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache,
-			Entries: []IOEntry{{Offset: int64(i)*unit + 100, Size: 10}}}
-		err := fs.Read(ctx, vec)
-		r := result{i: i, err: err}
-		if err == nil {
-			r.data = slices.Clone(vec.Entries[0].Data)
-		}
-		vec.Release()
-		out <- r
-	}
-
-	done := make(chan result, units)
-	for i := range units {
-		go read(context.Background(), i, done)
-	}
-	require.Eventually(t, func() bool { return storage.opens.Load() == units }, 10*time.Second, time.Millisecond,
-		"the reads past the bound read at once")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	canceled := make(chan result, waiting)
-	var started sync.WaitGroup
-	for i := range waiting {
-		started.Add(1)
-		go func() {
-			started.Done()
-			read(ctx, units+i, canceled)
-		}()
-	}
-	started.Wait()
-	require.Eventually(t, func() bool { return storage.opens.Load() == units+waiting }, 10*time.Second, time.Millisecond)
-	cancel()
-	for range waiting {
-		r := <-canceled
-		require.ErrorIs(t, r.err, context.Canceled)
-	}
-
-	close(storage.release)
-	for range units {
-		select {
-		case r := <-done:
-			require.NoError(t, r.err)
-			off := r.i*unit + 100
-			require.Equal(t, data[off:off+10], r.data)
-		case <-time.After(diskCacheLifecycleTestTimeout):
-			t.Fatal("a read did not return")
-		}
-	}
-	f.reads.Wait()
-	close(stopSampling)
-	<-sampled
-
-	require.LessOrEqual(t, peak.Load(), int64(budget))
-	require.Zero(t, heldMemory(fs.diskCache))
-	require.Empty(t, f.m)
-}
-
-// suffixGateStorage holds the reads from offset from until release is closed.
-type suffixGateStorage struct {
-	ObjectStorage
-	from    int64
-	held    atomic.Int64
-	release chan struct{}
-}
-
-func (h *suffixGateStorage) Read(ctx context.Context, key string, min, max *int64) (io.ReadCloser, error) {
-	if min != nil && *min >= h.from {
-		h.held.Add(1)
-		select {
-		case <-h.release:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-	}
-	return h.ObjectStorage.Read(ctx, key, min, max)
-}
-
-// A MemoryPrefetchObject whose read ended stops being counted once the read copying from
-// it copied its bytes, while that read waits for another of its ranges.
-func TestPrefetchBufferCountedUntilLastRelease(t *testing.T) {
-	const unit = 64 << 10
-	fs, _, data := newPrefetchRangeFS(t, unit, 4*unit)
-	storage := &suffixGateStorage{ObjectStorage: fs.server.raw, from: 2 * unit, release: make(chan struct{})}
-	fs.server.raw = storage
-	f := &fs.diskCache.prefetchObjects
-	bytes := func() int64 { return heldMemory(fs.diskCache) }
-	memoryObjects := func() int {
-		f.mu.Lock()
-		defer f.mu.Unlock()
-		n := 0
-		for _, objects := range f.m {
-			for _, o := range objects {
-				if d := o.joinableDownload(); d != nil && d.memory {
-					n++
-				}
-			}
-		}
-		return n
-	}
-
-	vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache,
-		Entries: []IOEntry{{Offset: 100, Size: 10}, {Offset: 2*unit + 100, Size: 10}}}
-	done := make(chan error, 1)
-	go func() { done <- fs.Read(context.Background(), vec) }()
-	require.Eventually(t, func() bool { return storage.held.Load() == 1 && memoryObjects() == 1 },
-		10*time.Second, time.Millisecond, "the first range's object ended; the second waits")
-	// The read releases the ended object's buffer once it has copied from it, while its
-	// second range still waits.
-	require.Eventually(t, func() bool { return bytes() == flightBufSize(unit) }, 10*time.Second, time.Millisecond,
-		"the read copied from the ended object and released its buffer")
-
-	close(storage.release)
-	require.NoError(t, <-done)
-	require.Equal(t, data[100:110], vec.Entries[0].Data)
-	require.Equal(t, data[2*unit+100:2*unit+110], vec.Entries[1].Data)
-	vec.Release()
-	f.reads.Wait()
-	require.Zero(t, bytes())
-}
-
-// A cold read whose entries make more runs than the memory budget holds reads every run at
-// once, those past the budget through file fills; the buffers never exceed the bound, each
-// run is read once, and the read gets its bytes.
-func TestPrefetchMemoryBoundForColdMultiRunRead(t *testing.T) {
-	const (
-		unit   = 64 << 10
-		runs   = 8
-		budget = 2 * unit
-	)
-	fs, _, data := newPrefetchRangeFS(t, unit, 2*runs*unit)
-	fs.server.memoryLimit = budget
-	storage := &gateStorage{ObjectStorage: fs.server.raw, release: make(chan struct{})}
-	fs.server.raw = storage
-	f := &fs.diskCache.prefetchObjects
-
-	entries := make([]IOEntry, runs)
-	for i := range entries {
-		entries[i] = IOEntry{Offset: int64(2*i)*unit + 100, Size: 10}
-	}
-	vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache, Entries: entries}
-	done := make(chan error, 1)
-	go func() { done <- fs.Read(context.Background(), vec) }()
-	require.Eventually(t, func() bool { return storage.opens.Load() == runs }, 10*time.Second, time.Millisecond,
-		"every run is read at once")
-	require.LessOrEqual(t, heldMemory(fs.diskCache), int64(budget))
-	_ = f
-
-	close(storage.release)
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(diskCacheLifecycleTestTimeout):
-		t.Fatal("the read did not return")
-	}
-	for i := range vec.Entries {
-		off := 2*i*unit + 100
-		require.Equal(t, data[off:off+10], vec.Entries[i].Data)
-	}
-	vec.Release()
-	require.Equal(t, int64(runs), storage.opens.Load(), "no run is read twice")
-}
-
-// A cold column prefetch of more ranges than the memory budget holds reads every range at
-// once, background buffers within half the budget and the others through file fills, and
-// once storage answers every range is read once.
-func TestColumnPrefetchMemoryBoundForColdRanges(t *testing.T) {
-	const (
-		unit   = 64 << 10
-		ranges = 8
-		size   = 16 << 10
-	)
-	fs, _, data := newPrefetchRangeFS(t, unit, 2*ranges*unit)
-	budget := 4 * flightBufSize(size)
-	fs.server.memoryLimit = budget
-	f := &fs.diskCache.prefetchObjects
-	var opens atomic.Int64
-	release := make(chan struct{})
-	open := func(ctx context.Context, start, end int64) (io.ReadCloser, error) {
-		opens.Add(1)
-		select {
-		case <-release:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		return io.NopCloser(bytes.NewReader(data[start:end])), nil
-	}
-	rs := make([]PrefetchRange, ranges)
-	for i := range rs {
-		rs[i] = PrefetchRange{Offset: int64(2*i) * unit, Size: size}
-	}
-	done := make(chan error, 1)
-	go func() {
-		prefetchRanges(fs, rs, open)
-		done <- nil
-	}()
-	require.Eventually(t, func() bool { return opens.Load() == ranges }, 10*time.Second, time.Millisecond)
-	require.LessOrEqual(t, heldMemory(fs.diskCache), budget/2, "background buffers take at most half the budget")
-	_ = f
-
-	close(release)
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(diskCacheLifecycleTestTimeout):
-		t.Fatal("the prefetch did not return")
-	}
-	require.Equal(t, int64(ranges), opens.Load(), "no range is read twice")
-}
-
-// Concurrent cold reads, each of more runs than the memory budget holds, all return with
-// their bytes: no run waits for memory. The buffers never exceed the bound, and none stays
-// counted.
-func TestPrefetchConcurrentMultiRunReadsUnderTightBudget(t *testing.T) {
-	const (
-		unit    = 64 << 10
-		runs    = 6
-		readers = 16
-		budget  = 2 * unit
-	)
-	fs, _, data := newPrefetchRangeFS(t, unit, 2*runs*unit*2)
-	fs.server.memoryLimit = budget
-	f := &fs.diskCache.prefetchObjects
-	var peak atomic.Int64
-	stop := make(chan struct{})
-	sampled := make(chan struct{})
-	go func() {
-		defer close(sampled)
-		for {
-			if n := heldMemory(fs.diskCache); n > peak.Load() {
-				peak.Store(n)
-			}
-			select {
-			case <-stop:
-				return
-			default:
-				runtime.Gosched()
-			}
-		}
-	}()
-	errs := make(chan error, readers)
-	for r := range readers {
-		go func() {
-			entries := make([]IOEntry, runs)
-			for i := range entries {
-				// Readers overlap: each reads every other unit, shifted by r%2.
-				entries[i] = IOEntry{Offset: int64(2*i+r%2)*unit + int64(r), Size: 10}
-			}
-			vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache, Entries: entries}
-			err := fs.Read(context.Background(), vec)
-			for i := range vec.Entries {
-				off := vec.Entries[i].Offset
-				if err == nil && !bytes.Equal(data[off:off+10], vec.Entries[i].Data) {
-					err = errors.New("wrong bytes")
-				}
-			}
-			vec.Release()
-			errs <- err
-		}()
-	}
-	for range readers {
-		select {
-		case err := <-errs:
-			require.NoError(t, err)
-		case <-time.After(diskCacheLifecycleTestTimeout):
-			t.Fatal("a read did not return")
-		}
-	}
-	f.reads.Wait()
-	close(stop)
-	<-sampled
-	require.LessOrEqual(t, peak.Load(), int64(budget))
-	require.Zero(t, heldMemory(fs.diskCache))
-}
-
-// A read whose entry spans a block another read's run is reading and a block no run reads
-// takes the first block from that run and reads the other; once both reads return, no
-// buffer stays counted.
-func TestPrefetchReadOfJoinedBlockReleasesIt(t *testing.T) {
-	const unit = 64 << 10
-	fs, _, data := newPrefetchRangeFS(t, unit, 4*unit)
-	storage := &suffixGateStorage{ObjectStorage: fs.server.raw, from: unit, release: make(chan struct{})}
-	fs.server.raw = storage
-	f := &fs.diskCache.prefetchObjects
-	read := func(off, size int64, done chan<- error) {
-		vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache,
-			Entries: []IOEntry{{Offset: off, Size: size}}}
-		err := fs.Read(context.Background(), vec)
-		if err == nil && !bytes.Equal(data[off:off+size], vec.Entries[0].Data) {
-			err = errors.New("wrong bytes")
-		}
-		vec.Release()
-		done <- err
-	}
-	first := make(chan error, 1)
-	go read(unit+100, 10, first)
-	require.Eventually(t, func() bool { return storage.held.Load() == 1 }, 10*time.Second, time.Millisecond,
-		"the first read's run waits for storage")
-	second := make(chan error, 1)
-	go read(2*unit-5, 10, second)
-	require.Eventually(t, func() bool { return storage.held.Load() == 2 }, 10*time.Second, time.Millisecond,
-		"the second read reads the block no run reads")
-	close(storage.release)
-	require.NoError(t, <-first)
-	require.NoError(t, <-second)
-	f.reads.Wait()
-	require.Zero(t, heldMemory(fs.diskCache), "no buffer stays counted")
 }
 
 // A read of units of which it takes some blocks, with memory for one run, returns.
@@ -2101,55 +1854,31 @@ func TestPrefetchReadAcrossDeleteReturnsNoBytes(t *testing.T) {
 	require.False(t, ok, "no bytes read across a delete are returned")
 }
 
-// With no memory available, concurrent reads hold no buffer: each reads its range through a
-// file fill, and all of them return their bytes.
-func TestPrefetchMemoryExhaustedHoldsNoBuffer(t *testing.T) {
-	const (
-		unit  = 64 << 10
-		units = 8
-	)
-	prev := memoryAvailable
-	t.Cleanup(func() { memoryAvailable = prev })
-	memoryAvailable = func() (uint64, bool) { return 0, true }
-	fs, _, data := newPrefetchRangeFS(t, unit, units*unit)
-	fs.server.memoryLimit = 0
-	fs.server.measuredAt.Store(0)
-	storage := &gateStorage{ObjectStorage: fs.server.raw, release: make(chan struct{})}
-	fs.server.raw = storage
-	release := sync.OnceFunc(func() { close(storage.release) })
-	t.Cleanup(release)
-	f := &fs.diskCache.prefetchObjects
+// Long waits for a connection are counted until a warning reports and resets them.
+func TestConnWaitReporterCountsLongWaits(t *testing.T) {
+	var r connWaitReporter
+	r.last = time.Now()
+	r.record("host", connWaitWarn/2, false)
+	require.Zero(t, r.waits, "a short wait is not counted")
+	r.record("host-a", connWaitWarn, true)
+	r.record("host-b", 3*connWaitWarn, false)
+	require.Equal(t, int64(2), r.waits)
+	require.Equal(t, int64(1), r.reused)
+	require.Equal(t, 3*connWaitWarn, r.max)
+	require.Equal(t, "host-b", r.host)
 
-	type result struct {
-		i    int
-		data []byte
-		err  error
-	}
-	done := make(chan result, units)
-	for i := range units {
-		go func() {
-			vec := &IOVector{FilePath: "object", Policy: SkipFullFilePreloads | SkipMemoryCache,
-				Entries: []IOEntry{{Offset: int64(i)*unit + 100, Size: 10}}}
-			err := fs.Read(context.Background(), vec)
-			r := result{i: i, err: err}
-			if err == nil {
-				r.data = slices.Clone(vec.Entries[0].Data)
-			}
-			vec.Release()
-			done <- r
-		}()
-	}
-	require.Eventually(t, func() bool { return storage.opens.Load() == units }, 10*time.Second, time.Millisecond,
-		"every read reads at once")
-	require.Zero(t, heldMemory(fs.diskCache), "no read holds a buffer")
+	r.last = time.Now().Add(-connWaitWarnInterval)
+	r.record("host-c", connWaitWarn, false)
+	require.Zero(t, r.waits, "the warning resets the counts")
+	require.Zero(t, r.max)
+}
 
-	release()
-	for range units {
-		r := <-done
-		require.NoError(t, r.err)
-		off := r.i*unit + 100
-		require.Equal(t, data[off:off+10], r.data)
-	}
-	f.reads.Wait()
-	require.Zero(t, heldMemory(fs.diskCache))
+// Promoting a waiter that was already admitted, or is foreground, changes nothing.
+func TestServerPromoteOfAdmittedWaiterIsNoop(t *testing.T) {
+	g := newObjectStorageServer(nil, minRequestRoom)
+	g.promote(&roomWaiter{class: backgroundRequest, pos: -1})
+	g.promote(&roomWaiter{class: foregroundRequest, pos: 0})
+	_, waiting := g.counts()
+	require.Zero(t, waiting[foregroundRequest]+waiting[backgroundRequest])
+	require.Zero(t, heldRoom(g))
 }

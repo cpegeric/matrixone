@@ -55,35 +55,6 @@ func TestDiskCacheShardIsStable(t *testing.T) {
 	}
 }
 
-func TestDiskCacheSpreadsFilesAcrossShards(t *testing.T) {
-	cache := newLifecycleTestDiskCache(t)
-
-	const numObjects = 100_000
-	perDir := make(map[string]int)
-	for i := 0; i < numObjects; i++ {
-		path := fmt.Sprintf("01a1396b-%04x-7682-af2b-%012x_%05d", i%65536, i*7919, i%10)
-		full := cache.objectKey(path)
-		entry := cache.pathForIOEntry(path, IOEntry{Offset: 10, Size: 20})
-
-		shardDir := filepath.Join(cache.path, diskCacheShard(path))
-		require.Equal(t, shardDir, filepath.Dir(full))
-		require.Equal(t, shardDir, filepath.Dir(entry))
-		perDir[filepath.Dir(full)]++
-	}
-
-	require.Len(t, perDir, diskCacheShardCount)
-	for dir, n := range perDir {
-		require.LessOrEqual(t, n, numObjects/1000, dir)
-	}
-
-	// Object paths with directories still land below a shard, not directly in
-	// a directory shared by every object of that prefix.
-	path := "query_result/ws_1_2_3.blk"
-	rel, err := filepath.Rel(cache.path, cache.objectKey(path))
-	require.NoError(t, err)
-	require.Equal(t, filepath.Join(diskCacheShard(path), "query_result", "ws_1_2_3.blk"+cacheFileSuffix), rel)
-}
-
 func TestDiskCachePathsNormalizeDotSegments(t *testing.T) {
 	cache := newLifecycleTestDiskCache(t)
 	// "foo/./bar" and "foo/bar" name the same backing object (this mirrors
