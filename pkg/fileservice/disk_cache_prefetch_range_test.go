@@ -2093,7 +2093,7 @@ func TestFillProbeDeleteAndCloseReachEveryState(t *testing.T) {
 	for _, event := range []string{"delete", "close"} {
 		for _, kind := range []string{"range", "file range", "whole"} {
 			for _, state := range []string{"waiting", "promoted", "room", "running"} {
-				if kind != "range" && state == "promoted" {
+				if kind == "whole" && state == "promoted" {
 					continue
 				}
 				t.Run(event+"/"+kind+"/"+state, func(t *testing.T) {
@@ -2134,10 +2134,11 @@ func TestFillProbeDeleteAndCloseReachEveryState(t *testing.T) {
 					case "promoted":
 						freeRoom = fillRoom(t, fs.server)
 						go func() {
-							_, err := readColumnRange(ctx, fs, r)
+							_, err := readColumnRange(withReadMark(ctx), fs, r)
 							joined <- err
 						}()
-						require.Eventually(t, func() bool { return probeJoinedRunning(fs, "object") }, 2*time.Second, time.Millisecond)
+						require.Eventually(t, func() bool { return probeJoinedRunning(fs, "object", kind == "file range") },
+							2*time.Second, time.Millisecond)
 					case "room":
 						require.Eventually(t, func() bool { _, waiting := fs.server.counts(); return waiting[backgroundRequest] > 0 },
 							2*time.Second, time.Millisecond)
@@ -2177,14 +2178,10 @@ func TestFillProbeDeleteAndCloseReachEveryState(t *testing.T) {
 						bytes, _ := probeFlightBytes(fs)
 						return heldRoom(fs.server) <= baseRoom && bytes <= baseBytes
 					}, 2*time.Second, time.Millisecond, "the fill holds no room and no buffer")
-					_, _, total := g.counts(key)
-					if state == "promoted" {
-						// The joined read may read its own bytes.
-						opens = total
-					}
-					require.Equal(t, opens, total)
+					// The joined read reads the bytes of the stopped fill itself.
+					require.Equal(t, opens, g.unmarked(key))
 					releaseGate()
-					require.Never(t, func() bool { _, _, total := g.counts(key); return total > opens }, 50*time.Millisecond,
+					require.Never(t, func() bool { return g.unmarked(key) > opens }, 50*time.Millisecond,
 						time.Millisecond, "no fill reads object storage later")
 					if event == "close" {
 						return
@@ -2235,14 +2232,17 @@ func probeWaiting(fs *S3FS, filePath string) []probeFill {
 	return out
 }
 
-// probeJoinedRunning reports whether a read joined a started fill of the object at
-// filePath whose prefetch object is not registered yet.
-func probeJoinedRunning(fs *S3FS, filePath string) bool {
+// probeJoinedRunning reports whether a read joined a started fill a prefetch made of the
+// object at filePath: it holds its download, or, unless download is set, waits for it.
+func probeJoinedRunning(fs *S3FS, filePath string, download bool) bool {
 	f := &fs.diskCache.prefetchObjects
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	for _, q := range f.m[fs.diskCache.objectKey(filePath)] {
-		if q.queued && q.joiners > 0 && q.pos < 0 {
+		q.mu.Lock()
+		holds := q.holds
+		q.mu.Unlock()
+		if q.queued && q.pos < 0 && (holds > 0 || !download && q.joiners > 0) {
 			return true
 		}
 	}
@@ -2898,4 +2898,40 @@ func TestFlightBufBeyondKeptSizes(t *testing.T) {
 	putFlightBuf(b)
 	putFlightBuf(make([]byte, 3))
 	require.Equal(t, int64(1)<<flightBufMinShift, int64(cap(getFlightBuf(3))))
+}
+
+// A delete ends while fills of its object, a prefetch's and a read's, hold all the room in
+// an object storage that does not answer: it stops them before its own request waits for
+// room.
+func TestDeleteEndsWhileFillsOfItsObjectHoldAllRoom(t *testing.T) {
+	for _, kind := range []string{"memory", "file"} {
+		t.Run(kind, func(t *testing.T) {
+			fs, _, _ := newPrefetchRangeFS(t, 0, 300<<10)
+			if kind == "file" {
+				fs.diskCache.memoryPrefetchMax = 1
+			}
+			ctx := context.Background()
+			key := fs.pathToKey("object")
+			g := newBlackBoxStorage(fs.server.raw, func(k string, _ int64) bool { return k == key })
+			fs.server.raw = g
+			release := sync.OnceFunc(func() { close(g.gate) })
+			defer release()
+			limitRoom(t, fs.server, 2, 1)
+			ranges := columnRanges(2, 40<<10, 1<<10)
+			require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: 1 << 10, Ranges: ranges[:1], Scan: &PrefetchScan{}}))
+			read := make(chan error, 1)
+			go func() {
+				_, err := readColumnRange(ctx, fs, ranges[1])
+				read <- err
+			}()
+			require.Eventually(t, func() bool { cur, _, _ := g.counts(key); return cur == 2 }, 5*time.Second, time.Millisecond,
+				"the fills hold all the room")
+			require.Equal(t, 2, heldRoom(fs.server))
+			deadline, cancel := context.WithTimeout(ctx, 2*time.Second)
+			defer cancel()
+			require.NoError(t, fs.Delete(deadline, "object"))
+			release()
+			<-read
+		})
+	}
 }

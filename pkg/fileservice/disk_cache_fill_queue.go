@@ -546,15 +546,16 @@ func (s *S3FS) joinFills(ctx context.Context, vector *IOVector, src readSources)
 }
 
 // dropFills ends the waiting fills of the object at filePath into both caches and stops
-// those made by a prefetch that wait for room.
+// the running ones a prefetch made.
 func (d *DiskCache) dropFills(filePath string) {
+	key := d.objectKey(filePath)
 	f := &d.prefetchObjects
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for _, p := range slices.Clone(f.m[d.objectKey(filePath)]) {
+	for _, p := range slices.Clone(f.m[key]) {
 		if p.pos >= 0 {
 			d.endLocked(p, nil)
-		} else if p.queued && !p.whole && p.joinableDownload() == nil {
+		} else if p.queued {
 			p.stop()
 		}
 	}

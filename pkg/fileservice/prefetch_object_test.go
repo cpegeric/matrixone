@@ -113,13 +113,22 @@ type blackBoxStorage struct {
 	cur   map[string]int
 	most  map[string]int
 	total map[string]int
+	// marked counts the reads under a context of withReadMark.
+	marked map[string]int
+}
+
+type readMarkKey struct{}
+
+// withReadMark returns ctx, whose reads of object storage blackBoxStorage counts as marked.
+func withReadMark(ctx context.Context) context.Context {
+	return context.WithValue(ctx, readMarkKey{}, true)
 }
 
 // newBlackBoxStorage returns a storage holding the reads gated accepts until its gate is
 // closed.
 func newBlackBoxStorage(upstream ObjectStorage, gated func(key string, offset int64) bool) *blackBoxStorage {
 	g := &blackBoxStorage{ObjectStorage: upstream, gate: make(chan struct{}),
-		cur: map[string]int{}, most: map[string]int{}, total: map[string]int{}}
+		cur: map[string]int{}, most: map[string]int{}, total: map[string]int{}, marked: map[string]int{}}
 	g.gated = func(key string, offset int64) chan struct{} {
 		if gated(key, offset) {
 			return g.gate
@@ -137,6 +146,9 @@ func (g *blackBoxStorage) Read(ctx context.Context, key string, from, to *int64)
 	g.mu.Lock()
 	g.cur[key]++
 	g.total[key]++
+	if ctx.Value(readMarkKey{}) != nil {
+		g.marked[key]++
+	}
 	g.most[key] = max(g.most[key], g.cur[key])
 	g.mu.Unlock()
 	defer func() {
@@ -158,6 +170,13 @@ func (g *blackBoxStorage) counts(key string) (cur, most, total int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.cur[key], g.most[key], g.total[key]
+}
+
+// unmarked returns the reads of key not under a context of withReadMark.
+func (g *blackBoxStorage) unmarked(key string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.total[key] - g.marked[key]
 }
 
 func columnRanges(n int, stride, size int64) []PrefetchRange {

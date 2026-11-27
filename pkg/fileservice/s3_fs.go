@@ -2074,6 +2074,8 @@ func (s *S3FS) Delete(ctx context.Context, filePaths ...string) error {
 		}
 		keys = append(keys, s.pathToKey(path.File))
 		if s.diskCache != nil {
+			// The delete is counted before its fills stop.
+			s.diskCache.deletes.deleted(s.diskCache.objectKey(path.File))
 			s.diskCache.dropFills(path.File)
 		}
 	}
