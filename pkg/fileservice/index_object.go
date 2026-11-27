@@ -27,9 +27,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/defines"
-	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/perfcounter"
-	"go.uber.org/zap"
 )
 
 const (
@@ -178,19 +176,26 @@ func (t indexFillTarget) createTemp() (*os.File, error) {
 	return t.s.indexFileCache.disk.createCacheTempFile(t.s.indexFileCache.disk.path)
 }
 
-func (t indexFillTarget) publish(ctx context.Context, tempPath string, _ int64) error {
-	_, err := t.s.indexFileCache.PutUnlessDeleted(ctx, t.name, t.mark,
-		[]IndexCacheFile{{Name: IndexObjectFile, Path: tempPath}})
-	// The put moves the file or does not take it.
-	if rmErr := os.Remove(tempPath); rmErr != nil && !os.IsNotExist(rmErr) {
-		return rmErr
+// publish runs on the publisher of the index-file cache: it moves the file at tempPath
+// into a temporary entry directory and publishes it as the object's entry.
+func (t indexFillTarget) publish(ctx context.Context, tempPath string, size int64) error {
+	c := t.s.indexFileCache
+	diskPath, err := c.disk.pathForDir(t.name)
+	if err != nil {
+		return err
 	}
-	// A failed put is the index-file cache's, not a failed write of the disk cache.
-	if err != nil && ctx.Err() == nil {
-		logutil.Warn("fileservice: put index object into the index-file cache",
-			zap.String("path", t.filePath), zap.Error(err))
+	if t.mark > 0 && c.disk.deletes.since(diskPath, t.mark-1) {
 		return nil
 	}
+	tmp, err := c.disk.createCacheTempDir(filepath.Dir(diskPath))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+	if err := os.Rename(tempPath, filepath.Join(tmp, IndexObjectFile)); err != nil {
+		return err
+	}
+	_, err = c.disk.publishDir(ctx, diskPath, tmp, t.mark, []IndexCacheFile{{Name: IndexObjectFile}}, size)
 	return err
 }
 

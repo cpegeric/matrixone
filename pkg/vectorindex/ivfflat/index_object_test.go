@@ -54,8 +54,6 @@ func TestHoldIndexObjectsOfScan(t *testing.T) {
 	}, nil, false, false)
 	require.NoError(t, err)
 	defer fs.Close(ctx)
-	// The test opens the objects right after their reads: publish fills before a read returns.
-	fs.SetAsyncUpdate(false)
 
 	data := &blockList{blocks: []objectio.BlockInfo{objectio.EmptyBlockInfo}}
 	names := make([]string, 0, 2)
@@ -89,6 +87,8 @@ func TestHoldIndexObjectsOfScan(t *testing.T) {
 		require.NoError(t, fs.Read(readCtx, vec))
 		vec.Release()
 	}
+	// The objects are opened right after their reads: wait for their publication.
+	fs.FlushCache(ctx)
 
 	holds := holdIndexObjects(services, indexObjectNames(data))
 	require.Len(t, holds, 2)

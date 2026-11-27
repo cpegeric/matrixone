@@ -707,7 +707,6 @@ func (d *DiskCache) fetchPiece(
 // cache.
 func (f *memoryPrefetchObject) run() {
 	d := f.d
-	updateCtx := closingValues{Context: f.closing, values: context.WithoutCancel(f.ctx)}
 	defer d.prefetchObjects.reads.Done()
 	defer f.cancelRead()
 	defer context.AfterFunc(f.closing, f.cancelRead)()
@@ -722,7 +721,7 @@ func (f *memoryPrefetchObject) run() {
 	}
 	f.fail(err)
 	if err == nil && !f.skipCache {
-		err = d.Update(updateCtx, &IOVector{
+		err = d.Update(f.ctx, &IOVector{
 			FilePath: f.filePath,
 			Policy:   f.policy,
 			Entries:  []IOEntry{{Offset: f.start, Size: int64(len(content)), Data: content, readDeletes: f.readDeletes}},
@@ -730,14 +729,6 @@ func (f *memoryPrefetchObject) run() {
 	}
 	f.cacheErr = err
 }
-
-// closingValues is a context with the values of values that ends once Context does.
-type closingValues struct {
-	context.Context
-	values context.Context
-}
-
-func (c closingValues) Value(key any) any { return c.values.Value(key) }
 
 // readHeld reads the range of f from its source.
 func (f *memoryPrefetchObject) readHeld() error {
@@ -1580,9 +1571,11 @@ type filePrefetchObject struct {
 	// content is set on a fill of bytes the write path holds, which is registered with
 	// its download and ends once its file is published.
 	content bool
-	// handedOff is set once its file is handed to an async finalize: it stays registered
-	// until the file is published.
+	// handedOff is set, under the lock of the prefetch objects, once its file is handed to
+	// its publisher: it stays registered until the file is published. dropped is set once a
+	// delete of its object stops it.
 	handedOff bool
+	dropped   atomic.Bool
 
 	prefetchTarget
 }
@@ -1758,14 +1751,14 @@ func (p *filePrefetchObject) run() {
 	d := p.d
 	defer d.prefetchObjects.reads.Done()
 	defer context.AfterFunc(p.closing, p.cancelRead)()
-	_, _ = d.downloadFile(p.ctx, p.closing, p.filePath, p.start, p.end, p.src, d.endFilePrefetch(p.diskPath, p))
+	_, _ = d.downloadFile(p.ctx, p.filePath, p.start, p.end, p.src, d.endFilePrefetch(p.diskPath, p))
 }
 
 // abandon ends p, never registered.
 func (p *filePrefetchObject) abandon() { p.cancelRead() }
 
 // endFilePrefetch returns the function ending the registered FilePrefetchObject p of the
-// object at objectPath with why it cached nothing. One handed to an async finalize is
+// object at objectPath with why it cached nothing. One handed to its publisher is
 // forgotten once its file is published.
 func (d *DiskCache) endFilePrefetch(objectPath string, p *filePrefetchObject) func(error) {
 	return func(err error) {
@@ -1815,9 +1808,9 @@ func (f *prefetchObjects) holdingLocked(objectPath string, index bool, start, en
 }
 
 // downloadFile downloads under ctx, the context of a FilePrefetchObject, its bytes [start,
-// end) of the object at filePath from src, and ends it through done. It publishes nothing
-// once closing is done.
-func (d *DiskCache) downloadFile(ctx, closing context.Context, filePath string, start, end int64, src objectSource, done func(error)) (bool, error) {
+// end) of the object at filePath from src, waits for the publication of their file, and
+// ends it through done.
+func (d *DiskCache) downloadFile(ctx context.Context, filePath string, start, end int64, src objectSource, done func(error)) (bool, error) {
 	var written bool
 	var err error
 	defer func() { done(err) }()
@@ -1828,10 +1821,8 @@ func (d *DiskCache) downloadFile(ctx, closing context.Context, filePath string, 
 	src.start, src.end, src.objectEnd = start, end, &objectEnd
 	openReader := func(context.Context) (io.ReadCloser, error) { return &src, nil }
 	layout := func(context.Context) (int64, int64, error) { return end - start, 0, nil }
-	live := func() bool { return closing.Err() == nil }
-	written, err = d.publishUnlessDeleted(filePath, IOEntry{readDeletes: readDeletes}, live, func(claim func() bool) (bool, error) {
-		return d.writeFileTo(ctx, diskPath, openReader, false, claim, rangeFill, layout, nil)
-	})
+	mark := readMark{object: d.objectKey(filePath), deletes: readDeletes - 1, set: true}
+	written, err = d.writeFileTo(ctx, diskPath, openReader, false, rangeFill, layout, nil, mark)
 	if err != nil {
 		if size := objectEnd.Load(); size > start {
 			// A later run of the object ends at its size.
@@ -1840,10 +1831,7 @@ func (d *DiskCache) downloadFile(ctx, closing context.Context, filePath string, 
 		err = d.observeWriteResult(diskPath, err)
 		return false, err
 	}
-	if written {
-		err = d.observeWriteResult(diskPath, nil)
-	}
-	return written, err
+	return written, nil
 }
 
 // fileFill returns the live file fill of the object at objectPath, of the index-file cache

@@ -195,7 +195,6 @@ func newMembershipTopNBenchFixture(b *testing.B, compound bool) membershipTopNBe
 		fileservice.CacheConfig{MemoryCapacity: &capacity}, nil)
 	require.NoError(b, err)
 	b.Cleanup(func() { fs.Close(ctx) })
-	fs.SetAsyncUpdate(false)
 	mp := mpool.MustNewZero()
 	defer mpool.DeleteMPool(mp)
 	columnTypes := []types.Type{types.T_int32.ToType(), types.New(types.T_array_float32, 2, 0)}

@@ -57,7 +57,6 @@ type LocalFS struct {
 	diskCache      *DiskCache
 	indexFileCache *IndexFileCache
 	remoteCache    *RemoteCache
-	asyncUpdate    bool
 
 	perfCounterSets []*perfcounter.CounterSet
 
@@ -120,7 +119,6 @@ func newLocalFS(
 		name:            name,
 		rootPath:        rootPath,
 		dirFiles:        make(map[string]*os.File),
-		asyncUpdate:     true,
 		perfCounterSets: perfCounterSets,
 		ioMerger:        NewIOMerger(),
 		noChecksum:      noChecksum,
@@ -469,7 +467,7 @@ read_memory_cache:
 				return
 			}
 			t0 := time.Now()
-			err = l.memCache.Update(ctx, vector, l.asyncUpdate)
+			err = l.memCache.Update(ctx, vector, true)
 			metric.FSReadDurationUpdateMemoryCache.Observe(time.Since(t0).Seconds())
 		}()
 	}
@@ -511,7 +509,7 @@ read_disk_cache:
 				return
 			}
 			t0 := time.Now()
-			err = l.diskCache.Update(ctx, vector, l.asyncUpdate)
+			err = l.diskCache.Update(ctx, vector, true)
 			metric.FSReadDurationUpdateDiskCache.Observe(time.Since(t0).Seconds())
 		}()
 	}
@@ -1495,10 +1493,6 @@ func (l *LocalFS) FlushCache(ctx context.Context) {
 	if l.diskCache != nil {
 		l.diskCache.Flush(ctx)
 	}
-}
-
-func (l *LocalFS) SetAsyncUpdate(b bool) {
-	l.asyncUpdate = b
 }
 
 func (l *LocalFS) Cost() *CostAttr {

@@ -352,26 +352,6 @@ func (d *DiskCache) readDeletes() uint64 {
 	return d.deletes.now() + 1
 }
 
-// publishUnlessDeleted runs write, which caches entry once the claim it is given holds,
-// with a claim that also fails when the object at filePath was deleted after the entry
-// was read. A delete is counted after the publications claimed end, so its removal of the
-// object's cached files finds them.
-func (d *DiskCache) publishUnlessDeleted(
-	filePath string,
-	entry IOEntry,
-	claim func() bool,
-	write func(claim func() bool) (bool, error),
-) (bool, error) {
-	if entry.readDeletes == 0 {
-		return write(claim)
-	}
-	path, err := ParsePath(filePath)
-	if err != nil {
-		return write(claim)
-	}
-	return d.publishUnlessDeletedSince(d.objectKey(path.File), entry.readDeletes-1, claim, write)
-}
-
 // publishUnlessDeletedSince runs write with a claim that also fails when the object at
 // objectPath was deleted after the delete count was mark; it reports false without the
 // error of write when it was.

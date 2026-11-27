@@ -687,18 +687,19 @@ func TestServerRuleListBodyReads(t *testing.T) {
 // request of its own before it downloads, with room for one request.
 func TestServerRuleUnknownSizeFillStats(t *testing.T) {
 	fs, counting, data := newGovernedFS(t, 1, []string{"object"}, 300<<10)
-	fs.SetAsyncUpdate(false)
 	ctx := context.Background()
 	finishes(t, func() {
 		vec := &IOVector{FilePath: "object", Policy: SkipMemoryCache | SkipFullFilePreloads, Entries: []IOEntry{{Offset: 0, Size: 100}}}
 		require.NoError(t, fs.Read(ctx, vec))
 		vec.Release()
 		fs.diskCache.prefetchObjects.reads.Wait()
+		flushPublishers(fs)
 		require.True(t, fs.diskCache.ranges.startsAt0(fs.diskCache.objectKey("object")))
 		_, sized := fs.diskCache.prefetched.size(fs.diskCache.objectKey("object"))
 		require.False(t, sized)
 		stats := counting.stats.Load()
 		require.NoError(t, fs.PrefetchFile(ctx, "object"))
+		flushPublishers(fs)
 		require.Equal(t, stats+1, counting.stats.Load(), "it stats")
 	})
 	_, cached := fs.diskCache.ranges.covering(fs.diskCache.objectKey("object"), 0, int64(len(data)))

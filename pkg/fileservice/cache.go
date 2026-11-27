@@ -311,7 +311,7 @@ func (c *CacheConfig) indexFileIdleTTL() (time.Duration, error) {
 }
 
 func (c *fileServiceCaches) close(ctx context.Context) {
-	// The disk cache's asynchronous publications into the index-file cache end first.
+	// The disk cache's fills, which publish into the index-file cache, end first.
 	if c.disk != nil {
 		c.disk.Close(ctx)
 		c.disk = nil

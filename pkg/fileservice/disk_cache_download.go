@@ -801,27 +801,6 @@ func (d *DiskCache) backgroundRequests() int {
 	return d.server.backgroundMax
 }
 
-// freedSignal wakes the waiters for a resource once some is freed. It is guarded by the
-// lock of the resource.
-type freedSignal struct {
-	ch chan struct{}
-}
-
-// waitLocked returns a channel closed at the next notifyLocked.
-func (s *freedSignal) waitLocked() <-chan struct{} {
-	if s.ch == nil {
-		s.ch = make(chan struct{})
-	}
-	return s.ch
-}
-
-func (s *freedSignal) notifyLocked() {
-	if s.ch != nil {
-		close(s.ch)
-		s.ch = nil
-	}
-}
-
 // readFromDownload fills entry from the file fill of the object at diskPath, of the
 // index-file cache when index is set, holding its bytes that fileFill returns. It reports
 // whether a fill holds the bytes, and whether it filled entry.

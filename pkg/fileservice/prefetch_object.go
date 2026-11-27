@@ -118,10 +118,14 @@ func (p *filePrefetchObject) span() (int64, int64) { return p.start, p.end }
 
 func (p *filePrefetchObject) joinable() bool { return p.joinableDownload() != nil }
 
-// live reports whether p was not stopped, or its download wrote every byte.
+// live reports whether p was not stopped, or its download wrote every byte and no delete
+// of its object stopped it once it was handed to its publisher.
 func (p *filePrefetchObject) live() bool {
 	if p.ctx.Err() == nil {
 		return true
+	}
+	if p.handedOff && p.dropped.Load() {
+		return false
 	}
 	o := p.joinableDownload()
 	return o != nil && o.isComplete()
@@ -238,7 +242,10 @@ func (p *filePrefetchObject) releaseStarter() {
 	}
 }
 
-func (p *filePrefetchObject) stop() { p.cancelRead() }
+func (p *filePrefetchObject) stop() {
+	p.dropped.Store(true)
+	p.cancelRead()
+}
 
 func (p *filePrefetchObject) ended() <-chan struct{} { return p.endedCh }
 

@@ -22,6 +22,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 	"sync"
@@ -32,6 +33,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
 	"github.com/matrixorigin/matrixone/pkg/util/toml"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -65,7 +67,6 @@ func newPrefetchRangeFS(t *testing.T, unit int64, size int) (*S3FS, *countingSto
 	}, nil, false, false)
 	require.NoError(t, err)
 	fs.diskCache.prefetchRange = prefetchRangeConfig{on: unit > 0, fixed: unit}
-	fs.SetAsyncUpdate(false)
 	t.Cleanup(func() { fs.Close(ctx) })
 	data := make([]byte, size)
 	for i := range data {
@@ -83,6 +84,7 @@ func readRangeOf(t *testing.T, fs *S3FS, policy Policy, offset, size int64) []by
 		Entries: []IOEntry{{Offset: offset, Size: size}}}
 	require.NoError(t, fs.Read(context.Background(), vec))
 	waitObjectsEnd(fs.diskCache, "object")
+	flushPublishers(fs)
 	data := slices.Clone(vec.Entries[0].Data)
 	vec.Release()
 	return data
@@ -796,6 +798,7 @@ func TestS3FSRangeReadCachesItsEntriesNotItsPrefetchObject(t *testing.T) {
 			require.NoError(t, fs.Read(context.Background(), vec))
 		}
 		fs.diskCache.prefetchObjects.reads.Wait()
+		flushPublishers(fs)
 		require.Equal(t, data[5000:5010], vec.Entries[0].Data)
 		require.Equal(t, data[5010:5020], vec.Entries[1].Data)
 		vec.Release()
@@ -933,7 +936,19 @@ func readFullObjectOf(fs *S3FS, offset, size int64) ([]byte, error) {
 	err := fs.Read(context.Background(), vec)
 	data := slices.Clone(vec.Entries[0].Data)
 	vec.Release()
+	flushPublishers(fs)
 	return data, err
+}
+
+// flushPublishers waits for the publishers of the caches on disk of fs.
+func flushPublishers(fs *S3FS) {
+	ctx := context.Background()
+	if fs.diskCache != nil {
+		fs.diskCache.Flush(ctx)
+	}
+	if fs.indexFileCache != nil {
+		fs.indexFileCache.disk.Flush(ctx)
+	}
 }
 
 // The download of an object of at least the split size reads its 64KiB-aligned halves
@@ -993,18 +1008,20 @@ func TestS3FSObjectSplitNeedsKnownSize(t *testing.T) {
 	require.Zero(t, storage.stats.Load())
 }
 
-// A failed part fails the download, which publishes no whole object.
+// A failed part fails the download, which publishes no whole object; the read has its
+// bytes from the part that did not fail.
 func TestS3FSObjectSplitFailedPartPublishesNothing(t *testing.T) {
 	fs, _, data := newObjectSplitFS(t, objectSplitConfig{parts: 2, min: 128 << 10}, 300<<10)
 	failing := &failingRangeStorage{ObjectStorage: fs.server.raw}
 	failing.fail.Store(true)
 	fs.server.raw = failing
-	_, err := readFullObjectOf(fs, 10, 10)
-	require.Error(t, err)
+	got, err := readFullObjectOf(fs, 10, 10)
+	require.NoError(t, err)
+	require.Equal(t, data[10:20], got)
 	require.False(t, fs.diskCache.cache.Contains(fs.diskCache.wholePath("object", int64(len(data)))))
 
 	failing.fail.Store(false)
-	got, err := readFullObjectOf(fs, 10, 10)
+	got, err = readFullObjectOf(fs, 10, 10)
 	require.NoError(t, err)
 	require.Equal(t, data[10:20], got)
 }
@@ -1199,41 +1216,97 @@ func TestS3FSReadWaitingForConnectionEndsOnDeleteOrClose(t *testing.T) {
 	}
 }
 
-// A whole-object prefetch waiting for a slot to publish its file when its object is
-// deleted ends, downloading nothing.
-func TestS3FSPrefetchWaitingForPublicationSlotEndsOnDelete(t *testing.T) {
-	fs, storage, _ := newObjectSplitFS(t, objectSplitConfig{}, 300<<10)
-	fs.server.raw = keepOnDeleteStorage{fs.server.raw}
-	fs.SetAsyncUpdate(true)
-	d := fs.diskCache
-	a := &d.async
-	for len(a.slots) < cap(a.slots) {
-		a.slots <- struct{}{}
+// A range fill, file or memory backed, whose publication finds the publisher queue full
+// waits for room holding no room of the server, so reads go on; the fills publish once
+// room frees. A delete of the object ends the waits of its fills, and nothing of the object
+// is cached. The control is the fill that finds room in the queue, which a read does not
+// wait for.
+func TestS3FSRangeFillWaitsForPublisherRoom(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		memory bool
+		ev     string
+	}{
+		{"file/room freed", false, "room freed"},
+		{"file/delete", false, "delete"},
+		{"memory/room freed", true, "room freed"},
+		{"memory/delete", true, "delete"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ev := tc.ev
+			fs, storage, data := newPrefetchRangeFS(t, 4096, 64<<10)
+			fs.server.raw = keepOnDeleteStorage{storage}
+			d := fs.diskCache
+			if !tc.memory {
+				d.memoryPrefetchMax = 1
+			}
+			shrinkPublisher(d, 1)
+			key := d.objectKey("object")
+			registered := func() int {
+				d.prefetchObjects.mu.Lock()
+				defer d.prefetchObjects.mu.Unlock()
+				return len(d.prefetchObjects.m[key])
+			}
+			syncStarted, unblock := installBlockedDiskCacheFileSync(d)
+			t.Cleanup(unblock)
+			ctx := context.Background()
+			read := func(policy Policy, offset int64) []byte {
+				vec := &IOVector{FilePath: "object", Policy: policy | SkipFullFilePreloads | SkipMemoryCache,
+					Entries: []IOEntry{{Offset: offset, Size: 10}}}
+				require.NoError(t, fs.Read(ctx, vec))
+				b := slices.Clone(vec.Entries[0].Data)
+				vec.Release()
+				return b
+			}
+			require.Equal(t, data[0:10], read(0, 0))
+			select {
+			case <-syncStarted:
+			case <-time.After(diskCacheLifecycleTestTimeout):
+				t.Fatal("the publisher did not take the first fill")
+			}
+			require.Equal(t, data[4096:4106], read(0, 4096))
+			require.Eventually(t, func() bool { return len(d.pub.jobs) == cap(d.pub.jobs) },
+				diskCacheLifecycleTestTimeout, time.Millisecond, "the second fill is queued")
+			require.Equal(t, data[8192:8202], read(0, 8192))
+			require.Equal(t, 3, registered(), "the fills wait for their publication")
+			ended := make(chan error, 1)
+			go func() {
+				for registered() > 0 {
+					time.Sleep(time.Millisecond)
+				}
+				ended <- nil
+			}()
+			requireSubmitterWaits(t, d, ended)
+			require.Zero(t, heldRoom(fs.server), "a waiting fill holds no room")
+			require.Equal(t, data[20000:20010], read(SkipDiskCacheWrites, 20000), "a read goes on")
+
+			reads := storage.reads.Load()
+			if ev == "delete" {
+				require.NoError(t, fs.Delete(ctx, "object"))
+				select {
+				case <-ended:
+				case <-time.After(diskCacheLifecycleTestTimeout):
+					t.Fatal("the delete did not end the wait of the fill")
+				}
+			}
+			unblock()
+			waitObjectsEnd(d, "object")
+			flushCtx, cancel := context.WithTimeout(ctx, diskCacheLifecycleTestTimeout)
+			defer cancel()
+			d.Flush(flushCtx)
+			require.NoError(t, flushCtx.Err())
+			if ev == "delete" {
+				require.Empty(t, d.objectFiles("object"))
+			} else {
+				for _, off := range []int64{0, 4096, 8192} {
+					require.Equal(t, data[off+1:off+11], read(0, off+1))
+				}
+				require.Equal(t, reads, storage.reads.Load(), "the fills are cached")
+			}
+			requireNoPublications(t, d)
+			requireNoTempFiles(t, d)
+		})
 	}
-	t.Cleanup(func() {
-		a.mu.Lock()
-		for len(a.slots) > 0 {
-			<-a.slots
-		}
-		a.wakeFreedLocked()
-		a.mu.Unlock()
-	})
-	done := make(chan error, 1)
-	go func() { done <- fs.PrefetchFile(context.Background(), "object") }()
-	require.Eventually(t, func() bool {
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		return a.mu.freed.ch != nil
-	}, 10*time.Second, time.Millisecond, "the prefetch waits for a slot")
-	require.NoError(t, fs.Delete(context.Background(), "object"))
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("the prefetch of the deleted object still waits for a slot")
-	}
-	require.Zero(t, storage.reads.Load())
-	require.Empty(t, d.objectFiles("object"))
-	require.Zero(t, heldRoom(fs.server))
 }
 
 // A whole-object download of an object deleted since the mark of its context, before it
@@ -1301,7 +1374,6 @@ func TestS3FSConfiguredConnsBoundDownloads(t *testing.T) {
 			MemoryCapacity: ptrTo[toml.ByteSize](0),
 		}, nil, false, false)
 		require.NoError(t, err)
-		fs.SetAsyncUpdate(false)
 		data := make([]byte, 300<<10)
 		require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(data)), Data: data}}, Policy: SkipDiskCache | SkipMemoryCache}))
 		d := fs.diskCache
@@ -1423,61 +1495,305 @@ func TestJoinableTakesPartNotBegun(t *testing.T) {
 	require.NotNil(t, covering(5, 6))
 }
 
-// A read whose async entry write waits for a publication slot returns once its object is
-// deleted, or once a slot is freed.
-func TestS3FSReadEntryWriteWaitingForPublicationSlotEndsOnDelete(t *testing.T) {
-	for _, ev := range []string{"delete", "slot freed"} {
+// A read whose entry write finds the publisher queue full waits for room: it returns once
+// room frees, with its entry cached, or once its context ends, with its entry not cached.
+// The control is the read whose write finds room, which returns at once.
+func TestS3FSReadEntryWriteWaitsForPublisherRoom(t *testing.T) {
+	for _, ev := range []string{"room freed", "context ends"} {
 		t.Run(ev, func(t *testing.T) {
-			fs, storage, data := newPrefetchRangeFS(t, 0, 300<<10)
-			fs.server.raw = keepOnDeleteStorage{storage}
-			fs.SetAsyncUpdate(true)
-			ctx := context.Background()
-			a := &fs.diskCache.async
-			filled := 0
-			for len(a.slots) < cap(a.slots) {
-				a.slots <- struct{}{}
-				filled++
-			}
-			freeSlots := sync.OnceFunc(func() {
-				a.mu.Lock()
-				for range filled {
-					<-a.slots
-				}
-				a.wakeFreedLocked()
-				a.mu.Unlock()
-			})
-			t.Cleanup(freeSlots)
+			fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
+			d := fs.diskCache
+			shrinkPublisher(d, 1)
+			syncStarted, unblock := installBlockedDiskCacheFileSync(d)
+			t.Cleanup(unblock)
 			type res struct {
 				b   []byte
 				err error
 			}
-			done := make(chan res, 1)
-			go func() {
-				vec := &IOVector{FilePath: "object", Policy: SkipMemoryCache | SkipFullFilePreloads, Entries: []IOEntry{{Offset: 100, Size: 10}}}
+			read := func(ctx context.Context, offset int64) res {
+				vec := &IOVector{FilePath: "object", Policy: SkipMemoryCache | SkipFullFilePreloads | ExactRead,
+					Entries: []IOEntry{{Offset: offset, Size: 10}}}
 				err := fs.Read(ctx, vec)
 				b := append([]byte(nil), vec.Entries[0].Data...)
 				vec.Release()
-				done <- res{b, err}
-			}()
-			require.Eventually(t, func() bool {
-				a.mu.Lock()
-				defer a.mu.Unlock()
-				return a.mu.freed.ch != nil
-			}, 5*time.Second, time.Millisecond, "the read's entry write waits for a slot")
-			if ev == "delete" {
-				require.NoError(t, fs.Delete(ctx, "object"))
+				return res{b, err}
+			}
+			ctx := context.Background()
+			require.Equal(t, res{data[100:110], nil}, read(ctx, 100))
+			select {
+			case <-syncStarted:
+			case <-time.After(diskCacheLifecycleTestTimeout):
+				t.Fatal("the publisher did not take the first entry")
+			}
+			require.Equal(t, res{data[200:210], nil}, read(ctx, 200))
+
+			readCtx, cancel := context.WithCancel(ctx)
+			defer cancel()
+			done := make(chan res, 1)
+			go func() { done <- read(readCtx, 300) }()
+			returned := make(chan error, 1)
+			go func() { r := <-done; done <- r; returned <- r.err }()
+			requireSubmitterWaits(t, d, returned)
+			if ev == "context ends" {
+				cancel()
 			} else {
-				freeSlots()
+				unblock()
 			}
 			select {
-			case r := <-done:
-				require.NoError(t, r.err)
-				require.Equal(t, data[100:110], r.b)
-			case <-time.After(2 * time.Second):
-				t.Fatalf("%s: the read still waits for a publication slot", ev)
+			case <-returned:
+				r := <-done
+				if r.err == nil {
+					require.Equal(t, data[300:310], r.b)
+				} else {
+					require.ErrorIs(t, r.err, context.Canceled)
+				}
+			case <-time.After(diskCacheLifecycleTestTimeout):
+				t.Fatalf("%s: the read still waits for room", ev)
 			}
+			unblock()
+			flushCtx, cancelFlush := context.WithTimeout(ctx, diskCacheLifecycleTestTimeout)
+			defer cancelFlush()
+			d.Flush(flushCtx)
+			require.NoError(t, flushCtx.Err())
+			for off, cached := range map[int64]bool{100: true, 200: true, 300: ev == "room freed"} {
+				vec := &IOVector{FilePath: "object", Entries: []IOEntry{{Offset: off, Size: 10}}}
+				require.NoError(t, d.Read(ctx, vec))
+				require.Equal(t, cached, vec.Entries[0].done, off)
+				vec.Release()
+			}
+			requireNoPublications(t, d)
+			requireNoTempFiles(t, d)
 		})
 	}
+}
+
+// onPublisher reports whether the calling goroutine is a worker of a cache publisher.
+func onPublisher() bool {
+	stack := string(debug.Stack())
+	return strings.Contains(stack, "(*publisher).run(") || strings.Contains(stack, "(*DiskCache).runAsyncUpdates(")
+}
+
+// Every kind of file and entry directory a cache publishes is published by a worker of the
+// publisher of its cache: range fills, file and memory backed, an entry a read caches, a
+// whole object a read or a prefetch fills, the content of a write, an index object and an
+// index-file cache entry. The control is the count of publications the hooks see.
+func TestEveryPublicationIsThePublishers(t *testing.T) {
+	ctx := context.Background()
+	read := func(fs *S3FS, policy Policy, offset, size int64) {
+		vec := &IOVector{FilePath: "object", Policy: policy | SkipMemoryCache, Entries: []IOEntry{{Offset: offset, Size: size}}}
+		require.NoError(t, fs.Read(ctx, vec))
+		vec.Release()
+	}
+	for _, tc := range []struct {
+		name    string
+		newFS   func(t *testing.T) *S3FS
+		publish func(t *testing.T, fs *S3FS)
+	}{
+		{"file range fill", func(t *testing.T) *S3FS {
+			fs, _, _ := newPrefetchRangeFS(t, 4096, 64<<10)
+			fs.diskCache.memoryPrefetchMax = 1
+			return fs
+		}, func(t *testing.T, fs *S3FS) { read(fs, SkipFullFilePreloads, 100, 10) }},
+		{"memory range fill", func(t *testing.T) *S3FS {
+			fs, _, _ := newPrefetchRangeFS(t, 4096, 64<<10)
+			return fs
+		}, func(t *testing.T, fs *S3FS) { read(fs, SkipFullFilePreloads, 100, 10) }},
+		{"entry", func(t *testing.T) *S3FS {
+			fs, _, _ := newPrefetchRangeFS(t, 0, 64<<10)
+			return fs
+		}, func(t *testing.T, fs *S3FS) { read(fs, SkipFullFilePreloads|ExactRead, 100, 10) }},
+		{"whole object of a read", func(t *testing.T) *S3FS {
+			fs, _, _ := newPrefetchRangeFS(t, 0, 300<<10)
+			return fs
+		}, func(t *testing.T, fs *S3FS) { read(fs, 0, 100, 10) }},
+		{"whole object of a prefetch", func(t *testing.T) *S3FS {
+			fs, _, _ := newPrefetchRangeFS(t, 0, 300<<10)
+			return fs
+		}, func(t *testing.T, fs *S3FS) { require.NoError(t, fs.PrefetchFile(ctx, "object")) }},
+		{"content of a write", func(t *testing.T) *S3FS {
+			fs, _, _ := newPrefetchRangeFS(t, 0, 1)
+			return fs
+		}, func(t *testing.T, fs *S3FS) {
+			require.NoError(t, fs.Write(ctx, IOVector{FilePath: "written", Entries: []IOEntry{{Size: 10, Data: make([]byte, 10)}}}))
+		}},
+		{"index object", func(t *testing.T) *S3FS {
+			fs, _, _ := newIndexObjectFS(t, true)
+			return fs
+		}, func(t *testing.T, fs *S3FS) {
+			require.NoError(t, fs.PrefetchFile(WithFileServicePolicy(ctx, IndexFileObject), "object"))
+		}},
+		{"index-file cache entry", func(t *testing.T) *S3FS {
+			fs, _, _ := newIndexObjectFS(t, true)
+			return fs
+		}, func(t *testing.T, fs *S3FS) {
+			_, err := fs.indexFileCache.Put(ctx, "entry", []IndexCacheFile{{Name: "data",
+				Open: func(context.Context) (io.ReadCloser, error) { return io.NopCloser(strings.NewReader("x")), nil }}})
+			require.NoError(t, err)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := tc.newFS(t)
+			var mu sync.Mutex
+			var publications, inline int
+			hook := func() {
+				mu.Lock()
+				defer mu.Unlock()
+				publications++
+				if !onPublisher() {
+					inline++
+				}
+			}
+			fs.diskCache.hooks.beforeFilePublication = hook
+			if fs.indexFileCache != nil {
+				fs.indexFileCache.disk.hooks.beforeFilePublication = hook
+			}
+			tc.publish(t, fs)
+			waitObjectsEnd(fs.diskCache, "object")
+			fs.diskCache.Flush(ctx)
+			if fs.indexFileCache != nil {
+				fs.indexFileCache.disk.Flush(ctx)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			require.Positive(t, publications, "the control: the kind publishes")
+			require.Zero(t, inline, "publications outside the publisher")
+		})
+	}
+}
+
+// A read during a publication reads the bytes of the object whatever the publication's
+// phase: while the file is made durable, between the claim and the rename, and once it is
+// published. A file at the published path is always whole. The control is the read before
+// any publication.
+func TestReadDuringPublicationSeesOldOrNewState(t *testing.T) {
+	for _, kind := range []string{"range", "whole object"} {
+		t.Run(kind, func(t *testing.T) {
+			ctx := context.Background()
+			unit, diskPath := int64(4096), ""
+			var policy Policy = SkipFullFilePreloads
+			if kind == "whole object" {
+				unit, policy = 0, 0
+			}
+			fs, storage, data := newPrefetchRangeFS(t, unit, 300<<10)
+			d := fs.diskCache
+			d.memoryPrefetchMax = 1
+			if kind == "range" {
+				diskPath = d.pathForIOEntry("object", IOEntry{Offset: 0, Size: unit})
+			} else {
+				diskPath = d.wholePath("object", int64(len(data)))
+			}
+			readAll := func(phase string) {
+				var wg sync.WaitGroup
+				for i := range 8 {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						off := int64(100 + 7*i)
+						vec := &IOVector{FilePath: "object", Policy: policy | SkipMemoryCache | SkipDiskCacheWrites,
+							Entries: []IOEntry{{Offset: off, Size: 10}}}
+						assert.NoError(t, fs.Read(ctx, vec), phase)
+						assert.Equal(t, data[off:off+10], vec.Entries[0].Data, phase)
+						vec.Release()
+					}()
+				}
+				wg.Wait()
+				if info, err := os.Stat(diskPath); err == nil {
+					want := unit
+					if kind == "whole object" {
+						want = int64(len(data))
+					}
+					require.Equal(t, want, info.Size(), "%s: a published file is whole", phase)
+				}
+			}
+			readAll("control")
+			type gate struct{ at, resume chan struct{} }
+			newGate := func() gate { return gate{make(chan struct{}), make(chan struct{})} }
+			durable, claimed := newGate(), newGate()
+			var durableOnce, claimedOnce sync.Once
+			d.hooks.beforeFilePublication = func() {
+				durableOnce.Do(func() { close(durable.at); <-durable.resume })
+			}
+			d.hooks.afterPublicationClaim = func() {
+				claimedOnce.Do(func() { close(claimed.at); <-claimed.resume })
+			}
+			resume := func(g gate) { defer func() { _ = recover() }(); close(g.resume) }
+			t.Cleanup(func() { resume(durable); resume(claimed) })
+			vec := &IOVector{FilePath: "object", Policy: policy | SkipMemoryCache, Entries: []IOEntry{{Offset: 10, Size: 10}}}
+			require.NoError(t, fs.Read(ctx, vec))
+			require.Equal(t, data[10:20], vec.Entries[0].Data)
+			vec.Release()
+			for _, step := range []struct {
+				phase string
+				g     gate
+			}{{"made durable", durable}, {"claimed", claimed}} {
+				select {
+				case <-step.g.at:
+				case <-time.After(diskCacheLifecycleTestTimeout):
+					t.Fatalf("the publication did not reach %s", step.phase)
+				}
+				readAll(step.phase)
+				resume(step.g)
+			}
+			waitObjectsEnd(d, "object")
+			d.Flush(ctx)
+			reads := storage.reads.Load()
+			readAll("published")
+			require.Equal(t, reads, storage.reads.Load(), "the published file serves the reads")
+		})
+	}
+}
+
+// A publisher never waits for a submitter waiting for room in its queue: with the queue
+// full, an index object fill and a Put of the same entry both wait for room, holding
+// nothing the publisher needs, and every publication completes once room frees.
+func TestIndexPublisherDoesNotWaitOnWaitingSubmitters(t *testing.T) {
+	ctx := context.Background()
+	fs, _, data := newIndexObjectFS(t, true)
+	c := fs.indexFileCache
+	shrinkPublisher(c.disk, 1)
+	syncStarted, unblock := installBlockedDiskCacheFileSync(c.disk)
+	t.Cleanup(unblock)
+	put := func(name string) chan error {
+		done := make(chan error, 1)
+		go func() {
+			_, err := c.Put(ctx, name, []IndexCacheFile{{Name: IndexObjectFile,
+				Open: func(context.Context) (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(data)), nil }}})
+			done <- err
+		}()
+		return done
+	}
+	first := put("first")
+	select {
+	case <-syncStarted:
+	case <-time.After(diskCacheLifecycleTestTimeout):
+		t.Fatal("the publisher did not take the first entry")
+	}
+	queued := put("queued")
+	require.Eventually(t, func() bool { return len(c.disk.pub.jobs) == cap(c.disk.pub.jobs) },
+		diskCacheLifecycleTestTimeout, time.Millisecond)
+	fill := make(chan error, 1)
+	go func() { fill <- fs.PrefetchFile(WithFileServicePolicy(ctx, IndexFileObject), "object") }()
+	requireSubmitterWaits(t, c.disk, fill)
+	same := put(IndexObjectEntry("object"))
+	requireSubmitterWaits(t, c.disk, same)
+	require.Zero(t, heldRoom(fs.server), "the waiting fill holds no room")
+	unblock()
+	for name, done := range map[string]chan error{"first": first, "queued": queued, "fill": fill, "same entry": same} {
+		select {
+		case err := <-done:
+			require.NoError(t, err, name)
+		case <-time.After(diskCacheLifecycleTestTimeout):
+			t.Fatalf("%s did not complete", name)
+		}
+	}
+	flushPublishers(fs)
+	diskPath, cached := fs.indexObjectCached("object")
+	require.True(t, cached)
+	got, err := os.ReadFile(filepath.Join(diskPath, IndexObjectFile))
+	require.NoError(t, err)
+	require.Equal(t, data, got)
+	requireNoPublications(t, c.disk)
+	requireNoTempFiles(t, c.disk)
 }
 
 // jpRead is one range read of object storage.
@@ -2700,6 +3016,7 @@ func TestWholeObjectOfUnknownSizePublishedAtFoundSize(t *testing.T) {
 	require.False(t, known)
 
 	require.NoError(t, fs.PrefetchFile(context.Background(), "object"))
+	flushPublishers(fs)
 	require.Equal(t, int64(1), storage.reads.Load())
 	require.Equal(t, []string{d.wholePath("object", int64(len(data)))}, d.objectFiles("object"))
 	size, known := d.prefetched.size(d.objectKey("object"))
@@ -2723,6 +3040,7 @@ func TestPrefetchOfWarmWholeObjectLearnsItsSize(t *testing.T) {
 	}{
 		{name: "whole object cached", stats: 1, cached: func(t *testing.T, fs *S3FS, _ []byte) {
 			require.NoError(t, fs.PrefetchFile(context.Background(), "object"))
+			flushPublishers(fs)
 		}},
 		{name: "start of the object cached", stats: 1, download: true, cached: func(t *testing.T, fs *S3FS, data []byte) {
 			require.NoError(t, fs.diskCache.Update(context.Background(), &IOVector{FilePath: "object",
@@ -2744,6 +3062,7 @@ func TestPrefetchOfWarmWholeObjectLearnsItsSize(t *testing.T) {
 			reads := storage.reads.Load()
 
 			require.NoError(t, fs.PrefetchFile(context.Background(), "object"))
+			flushPublishers(fs)
 			require.Equal(t, tc.stats, stats.stats.Load())
 			if tc.download {
 				require.Equal(t, reads+1, storage.reads.Load())
@@ -2763,6 +3082,7 @@ func TestPrefetchOfWarmObjectWithFailedStatDownloads(t *testing.T) {
 		Entries: []IOEntry{{Offset: 0, Size: 100, Data: data[:100]}}}, false))
 	fs.server.raw = failingStatStorage{storage}
 	require.NoError(t, fs.PrefetchFile(context.Background(), "object"))
+	flushPublishers(fs)
 	require.Equal(t, int64(1), storage.reads.Load())
 	require.True(t, fs.diskCache.cache.Contains(fs.diskCache.wholePath("object", int64(len(data)))))
 }
@@ -3020,11 +3340,10 @@ func (s *probeStallStorage) Read(ctx context.Context, key string, min, max *int6
 }
 
 // A whole-object download its read no longer waits for, whose source stalls, stops
-// And frees its connection, async slot, update slot and the download.
+// And frees its connection, its publication, update slot and the download.
 func TestDiskCacheTransitionAbandonedStalledDownloadFreesResources(t *testing.T) {
 	shortIdle(t, 50*time.Millisecond)
 	fs, _, data := newPrefetchRangeFS(t, 0, 300<<10)
-	fs.SetAsyncUpdate(true)
 	fs.server.raw = &probeStallStorage{ObjectStorage: fs.server.raw, n: 64 << 10}
 	got, err := readFullObjectOf(fs, 10, 10)
 	require.NoError(t, err)
@@ -3032,9 +3351,9 @@ func TestDiskCacheTransitionAbandonedStalledDownloadFreesResources(t *testing.T)
 	d := fs.diskCache
 	diskPath := d.objectKey("object")
 	require.Eventually(t, func() bool {
-		d.async.mu.Lock()
-		pending := len(d.async.mu.pending)
-		d.async.mu.Unlock()
+		d.pub.mu.Lock()
+		pending := d.pub.mu.pending
+		d.pub.mu.Unlock()
 		return heldRoom(fs.server) == 0 && !d.isUpdating(diskPath) && d.download(diskPath) == nil &&
 			pending == 0 && len(backgroundFills) == 0
 	}, 5*time.Second, time.Millisecond)
@@ -3045,7 +3364,6 @@ func TestDiskCacheTransitionAbandonedStalledDownloadFreesResources(t *testing.T)
 // Deleted and rewritten with new content, is not published; a later read gets the new bytes.
 func TestDiskCacheTransitionAsyncEntryPublicationAfterDeleteRewrite(t *testing.T) {
 	fs, _, data := newPrefetchRangeFS(t, 0, 64<<10)
-	fs.SetAsyncUpdate(true)
 	d := fs.diskCache
 	ctx := context.Background()
 	hold, held := make(chan struct{}), make(chan struct{})

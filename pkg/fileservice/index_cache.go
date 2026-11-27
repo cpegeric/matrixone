@@ -501,14 +501,7 @@ func (c *IndexFileCache) put(ctx context.Context, name string, mark uint64, file
 	if c.disk.trashHoldsPublications() {
 		return false, nil
 	}
-	written, err := c.disk.putDir(ctx, diskPath, mark, files)
-	if err != nil {
-		return false, c.disk.observeWriteResult(diskPath, err)
-	}
-	if !written {
-		return false, nil
-	}
-	return true, c.disk.observeWriteResult(diskPath, nil)
+	return c.disk.putDir(ctx, diskPath, mark, files)
 }
 
 // Open opens files of entry name. A missing entry or file returns a file-not-found
@@ -961,49 +954,36 @@ func checkCacheDirFiles(files []IndexCacheFile) error {
 	return nil
 }
 
+// putDir writes files into a temporary directory and has the publisher publish it as the
+// entry directory diskPath, unless its entry was deleted after mark; it waits for the
+// publication.
 func (d *DiskCache) putDir(ctx context.Context, diskPath string, mark uint64, files []IndexCacheFile) (written bool, err error) {
-	defer func() {
-		d.evictForDiskFull(ctx, err)
-	}()
-	owner, err := d.paths.acquire(ctx, diskPath, func() error {
-		return d.removeUnindexedFile(diskPath)
-	})
-	if err != nil {
-		return false, err
+	if d.cache.Contains(diskPath) && cacheDirHasFiles(diskPath, files) {
+		return false, nil
 	}
+	pub := &d.pub
+	if !pub.begin() {
+		return false, nil
+	}
+	submitted := false
+	var tmp string
 	defer func() {
-		d.mergeWriteCleanupError(diskPath, &err, owner.release())
+		if submitted {
+			return
+		}
+		if tmp != "" {
+			d.mergeWriteCleanupError(diskPath, &err, os.RemoveAll(tmp))
+		}
+		pub.end()
+		d.evictForDiskFull(ctx, err)
+		err = d.observeWriteResult(diskPath, err)
 	}()
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
-
-	if size, err := cacheDirSize(diskPath); err == nil {
-		if cacheDirHasFiles(diskPath, files) {
-			if _, ok := d.cache.Get(ctx, diskPath); !ok {
-				d.cache.Set(ctx, diskPath, struct{}{}, size)
-			}
-			return false, nil
-		}
-		// an incomplete entry is replaced
-		if err := d.removeCacheDir(diskPath); err != nil && !os.IsNotExist(err) {
-			return false, err
-		}
-	} else if !os.IsNotExist(err) {
+	if tmp, err = d.createCacheTempDir(filepath.Dir(diskPath)); err != nil {
 		return false, err
 	}
-
-	tmp, err := d.createCacheTempDir(filepath.Dir(diskPath))
-	if err != nil {
-		return false, err
-	}
-	tmpOwned := true
-	defer func() {
-		if tmpOwned {
-			d.mergeWriteCleanupError(diskPath, &err, os.RemoveAll(tmp))
-		}
-	}()
-
 	var size int64
 	for _, f := range files {
 		var n int64
@@ -1017,14 +997,64 @@ func (d *DiskCache) putDir(ctx context.Context, diskPath string, mark uint64, fi
 		}
 		size += n
 	}
-	d.cache.Evict(ctx, nil, size)
+	dir := tmp
+	job := &publication{
+		diskPath: diskPath,
+		publish: func(ctx context.Context) (bool, error) {
+			return d.publishDir(ctx, diskPath, dir, mark, files, size)
+		},
+		release: func() error { return os.RemoveAll(dir) },
+		done:    make(chan publishResult, 1),
+	}
+	if !pub.submit(ctx, job) {
+		return false, ctx.Err()
+	}
+	submitted = true
+	return pub.wait(ctx, job)
+}
 
-	runHook(d.hooks.beforeFilePublication)
-	if err := ctx.Err(); err != nil {
+// publishDir publishes, on the publisher, the temporary directory tmp holding files, of
+// size bytes, as the entry directory diskPath, unless its entry was deleted after mark. An
+// entry already there with the files is kept.
+func (d *DiskCache) publishDir(ctx context.Context, diskPath, tmp string, mark uint64, files []IndexCacheFile, size int64) (written bool, err error) {
+	owner, err := d.paths.acquire(ctx, diskPath, func() error {
+		return d.removeUnindexedFile(diskPath)
+	})
+	if err != nil {
 		return false, err
+	}
+	defer func() {
+		d.mergeWriteCleanupError(diskPath, &err, owner.release())
+	}()
+
+	if existing, err := cacheDirSize(diskPath); err == nil {
+		if cacheDirHasFiles(diskPath, files) {
+			if _, ok := d.cache.Get(ctx, diskPath); !ok {
+				d.cache.Set(ctx, diskPath, struct{}{}, existing)
+			}
+			return false, nil
+		}
+		// an incomplete entry is replaced
+		if err := d.removeCacheDir(diskPath); err != nil && !os.IsNotExist(err) {
+			return false, err
+		}
+	} else if !os.IsNotExist(err) {
+		return false, err
+	}
+
+	for _, f := range files {
+		if err := d.syncPath(filepath.Join(tmp, f.Name)); err != nil {
+			return false, err
+		}
 	}
 	if err := syncDir(tmp); err != nil {
 		return false, err
+	}
+	d.cache.Evict(ctx, nil, size)
+
+	runHook(d.hooks.beforeFilePublication)
+	if !d.pub.claim() {
+		return false, nil
 	}
 	// The hold and a delete counted since mark are checked under the locks that set them,
 	// so no publication starts once either is set; a delete waits only for this rename.
@@ -1056,7 +1086,6 @@ func (d *DiskCache) putDir(ctx context.Context, diskPath string, mark uint64, fi
 		}
 		return false, err
 	}
-	tmpOwned = false
 
 	// a republished entry is the most recently used before its new size is accounted
 	if _, ok := d.cache.Get(ctx, diskPath); !ok || !d.cache.Replace(ctx, diskPath, struct{}{}, size) {
@@ -1069,6 +1098,20 @@ func (d *DiskCache) putDir(ctx context.Context, diskPath string, mark uint64, fi
 		return false, nil
 	}
 	return true, nil
+}
+
+// syncPath makes the file at path durable.
+func (d *DiskCache) syncPath(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := d.fileSync(f); err != nil {
+		return err
+	}
+	fadviseDontNeed(f, 0, 0)
+	return nil
 }
 
 func (d *DiskCache) createCacheTempDir(dir string) (string, error) {
@@ -1115,10 +1158,6 @@ func (d *DiskCache) writeCacheDirFile(
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if err := d.fileSync(f); err != nil {
-		return 0, err
-	}
-	fadviseDontNeed(f, 0, 0)
 	stat, err := f.Stat()
 	if err != nil {
 		return 0, err
@@ -1138,15 +1177,7 @@ func (d *DiskCache) moveCacheDirFile(ctx context.Context, from, to string) (int6
 			return os.Open(from)
 		})
 	}
-	f, err := os.Open(to)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-	if err := d.fileSync(f); err != nil {
-		return 0, err
-	}
-	stat, err := f.Stat()
+	stat, err := os.Stat(to)
 	if err != nil {
 		return 0, err
 	}

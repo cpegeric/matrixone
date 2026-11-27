@@ -54,7 +54,6 @@ type S3FS struct {
 	indexFileCache *IndexFileCache
 	indexObjects   indexObjects
 	remoteCache    *RemoteCache
-	asyncUpdate    bool
 
 	perfCounterSets []*perfcounter.CounterSet
 
@@ -122,7 +121,6 @@ func NewS3FS(
 	fs := &S3FS{
 		name:            args.Name,
 		keyPrefix:       args.KeyPrefix,
-		asyncUpdate:     true,
 		perfCounterSets: perfCounterSets,
 		ioMerger:        NewIOMerger(),
 		parallelMode:    args.ParallelMode,
@@ -528,7 +526,7 @@ func (s *S3FS) prefetchFile(ctx context.Context, filePath string, splitAt int64)
 		func(ctx context.Context) (io.ReadCloser, error) {
 			return s.newReadCloser(ctx, filePath)
 		},
-		s.asyncUpdate,
+		true,
 		storageFill,
 		layout,
 		target,
@@ -777,9 +775,9 @@ func (s *S3FS) write(ctx context.Context, vector IOVector) (bytesWritten int, er
 			consumed := n.Load()
 			cacheErr = s.diskCache.fillFile(ctx, vector.FilePath, func(context.Context) (io.ReadCloser, error) {
 				return io.NopCloser(&replayDataReader{ctx: context.Background(), entries: vector.Entries, remaining: consumed}), nil
-			}, s.asyncUpdate, contentFill, nil)
+			}, true, contentFill, nil)
 		} else {
-			cacheErr = s.diskCache.setFileContent(ctx, vector.FilePath, diskCacheBuf.Bytes(), s.asyncUpdate)
+			cacheErr = s.diskCache.setFileContent(ctx, vector.FilePath, diskCacheBuf.Bytes(), true)
 		}
 		if cacheErr != nil {
 			return 0, cacheErr
@@ -986,7 +984,7 @@ read_memory_cache:
 		cacheUpdates = append(cacheUpdates, func() {
 			t0 := time.Now()
 			LogEvent(ctx, str_update_memory_cache_begin)
-			_ = s.memCache.Update(ctx, vector, s.asyncUpdate)
+			_ = s.memCache.Update(ctx, vector, true)
 			LogEvent(ctx, str_update_memory_cache_end)
 			metric.FSReadDurationUpdateMemoryCache.Observe(time.Since(t0).Seconds())
 		})
@@ -1068,7 +1066,7 @@ read_disk_cache:
 			cacheUpdates = append(cacheUpdates, func() {
 				t0 := time.Now()
 				LogEvent(ctx, str_update_disk_cache_Caches_begin)
-				_ = s.diskCache.Update(ctx, vector, s.asyncUpdate)
+				_ = s.diskCache.Update(ctx, vector, true)
 				LogEvent(ctx, str_update_disk_cache_Caches_end)
 				metric.FSReadDurationUpdateDiskCache.Observe(time.Since(t0).Seconds())
 			})
@@ -1663,7 +1661,7 @@ func (s *S3FS) read(ctx context.Context, vector *IOVector, forceMinimalRangeRead
 		s.tierOf(vector.Policy) == diskTier {
 		t0 := time.Now()
 		LogEvent(ctx, str_disk_cache_setfile_begin)
-		err := s.diskCache.setFileContent(ctx, vector.FilePath, contentBytes, s.asyncUpdate)
+		err := s.diskCache.setFileContent(ctx, vector.FilePath, contentBytes, true)
 		LogEvent(ctx, str_disk_cache_setfile_end)
 		metric.FSReadDurationSetCachedData.Observe(time.Since(t0).Seconds())
 		if err != nil {
@@ -1793,7 +1791,7 @@ func (s *S3FS) readFullObjectToDiskCacheStreaming(
 	defer LogEvent(ctx, str_disk_cache_setfile_end)
 	defer func() { metric.FSReadDurationSetCachedData.Observe(time.Since(t0).Seconds()) }()
 
-	// The download outlives ctx once the reader returned in async mode; until then ctx
+	// The download outlives ctx once the reader returned; until then ctx
 	// cancels it. It keeps ctx's deadline and ends when the disk cache closes.
 	fillCtx, cancelFill := context.WithCancel(context.WithoutCancel(ctx))
 	if deadline, ok := ctx.Deadline(); ok {
@@ -1806,7 +1804,7 @@ func (s *S3FS) readFullObjectToDiskCacheStreaming(
 	stopCancelFill := context.AfterFunc(ctx, cancelFill)
 	defer stopCancelFill()
 	stopOnClose := func() bool { return false }
-	if closing := s.diskCache.async.ctx; closing != nil {
+	if closing := s.diskCache.pub.ctx; closing != nil {
 		stopOnClose = context.AfterFunc(closing, cancelFill)
 	}
 	type admittedDownload struct {
@@ -1833,7 +1831,7 @@ func (s *S3FS) readFullObjectToDiskCacheStreaming(
 			}
 			started <- admitted
 			return &src, nil
-		}, s.asyncUpdate, storageFill, s.prefetchedSize(file, firstNeeded(vector)), s.fillTarget(vector.Policy, vector.FilePath))
+		}, true, storageFill, s.prefetchedSize(file, firstNeeded(vector)), s.fillTarget(vector.Policy, vector.FilePath))
 		setDone <- err
 	}()
 	var setErr error
@@ -1892,7 +1890,7 @@ func (s *S3FS) readFullObjectToDiskCacheStreaming(
 		_ = waitSet()
 		return false, nil
 	}
-	if captured && s.asyncUpdate {
+	if captured {
 		select {
 		case backgroundFills <- struct{}{}:
 			stopCancelFill()
@@ -1904,11 +1902,8 @@ func (s *S3FS) readFullObjectToDiskCacheStreaming(
 		default:
 		}
 	}
-	if err := waitSet(); err != nil && !(captured && s.asyncUpdate) {
+	if err := waitSet(); err != nil && !captured {
 		if stopped(err) {
-			if captured {
-				return true, read.fillVector(ctx, s, file)
-			}
 			return false, nil
 		}
 		return true, err
@@ -2139,10 +2134,9 @@ func (s *S3FS) FlushCache(ctx context.Context) {
 	if s.diskCache != nil {
 		s.diskCache.Flush(ctx)
 	}
-}
-
-func (s *S3FS) SetAsyncUpdate(b bool) {
-	s.asyncUpdate = b
+	if s.indexFileCache != nil {
+		s.indexFileCache.disk.Flush(ctx)
+	}
 }
 
 func (s *S3FS) Cost() *CostAttr {

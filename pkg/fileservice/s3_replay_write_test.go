@@ -42,13 +42,13 @@ func newReplayWriteTestFS(t *testing.T) *S3FS {
 		CacheConfig{DiskPath: ptrTo(t.TempDir()), DiskCapacity: ptrTo[toml.ByteSize](64 << 20)}, nil, false, false)
 	require.NoError(t, err)
 	require.NotNil(t, fs.diskCache)
-	fs.asyncUpdate = false
 	t.Cleanup(func() { fs.Close(ctx) })
 	return fs
 }
 
 func readReplayCache(t *testing.T, fs *S3FS, path string) []byte {
 	t.Helper()
+	fs.diskCache.Flush(context.Background())
 	files := fs.diskCache.objectFiles(path)
 	require.Len(t, files, 1)
 	got, err := os.ReadFile(files[0])
@@ -207,6 +207,7 @@ func TestReplayWriteConcurrentIndependentInputs(t *testing.T) {
 				return
 			}
 			clear(source)
+			fs.diskCache.Flush(ctx)
 			files := fs.diskCache.objectFiles(path)
 			if len(files) != 1 {
 				errs <- fmt.Errorf("cache files of %s: %v", path, files)
@@ -314,7 +315,6 @@ func TestReplayDataReaderCanceled(t *testing.T) {
 func TestReplayWriteAsyncFinalizeDoesNotRetainInput(t *testing.T) {
 	ctx := context.Background()
 	fs := newReplayWriteTestFS(t)
-	fs.asyncUpdate = true
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	var enteredOnce, releaseOnce sync.Once

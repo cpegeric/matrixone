@@ -19,6 +19,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	pathpkg "path"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,53 +32,56 @@ import (
 )
 
 const (
-	// diskCacheAsyncQueueSize is the most asynchronous updates pending at once, each
-	// holding an open file.
-	diskCacheAsyncQueueSize = 512
-	// diskCacheAsyncWorkers is the number of asynchronous updates published at once.
-	diskCacheAsyncWorkers        = 4
+	// publisherQueueSize is the most publications queued at once.
+	publisherQueueSize = 512
+	// publisherWorkers is the number of publications a publisher publishes at once.
+	publisherWorkers = 4
+	// publisherLongWait is the wait for room in the queue that is logged.
+	publisherLongWait            = time.Second
+	publisherLongWaitLogKey      = "disk-cache-publisher-wait"
 	diskCacheWriteErrorLogKey    = "disk-cache-write-error"
 	diskCacheWriteRecoveryLogKey = "disk-cache-write-recovery"
 	diskCacheWriteErrorLogPeriod = time.Minute
 )
 
-type diskCacheAsyncUpdate struct {
-	diskPath    string
-	finalize    *diskCacheAsyncFileFinalize
+// publication is a file or entry directory written under a temporary name, published by
+// the publisher of its cache.
+type publication struct {
+	diskPath string
+	// publish makes it durable, renames it into place and indexes it, and reports whether
+	// it did.
+	publish func(ctx context.Context) (bool, error)
+	// release frees what it holds once it is published or dropped.
+	release func() error
+	// done, when set, receives the result once it is released.
+	done chan publishResult
+
+	attempted bool
+	published bool
+	err       error
+	// releasing is set once its release starts, which may end the context of its submitter.
+	releasing   atomic.Bool
 	releaseOnce sync.Once
 }
 
-// pendingKey returns the key of the async publication of the file at diskPath into
-// target: the publications of an object into the disk cache and into the index-file cache
-// are pending apart.
-func pendingKey(target fillTarget, diskPath string) string {
-	if t, ok := target.(indexFillTarget); ok {
-		return "index-file\x00" + t.name
-	}
-	return diskPath
-}
-
-// pendingKey returns the key its publication is pending under.
-func (j *diskCacheAsyncUpdate) pendingKey() string {
-	return pendingKey(j.finalize.target, j.diskPath)
-}
-
-type diskCacheAsyncFileFinalize struct {
-	file   *os.File
-	target fillTarget
-	owner  *pathOwner
-	// deletes, when set, is the delete count a whole-object download started at.
-	deletes   *uint64
-	attempted bool
+// publishResult is what a publication did: whether it was published, and its error as the
+// cache observed it.
+type publishResult struct {
+	published bool
 	err       error
 }
 
-type diskCacheAsyncState struct {
+// publisher publishes the publications of one cache, from a bounded queue: a submission
+// waits for room until its context ends.
+type publisher struct {
+	d      *DiskCache
 	ctx    context.Context
 	cancel context.CancelFunc
-	jobs   chan *diskCacheAsyncUpdate
-	slots  chan struct{}
+	jobs   chan *publication
 	done   chan struct{}
+	// workers is the number of publications published at once.
+	workers int
+	logger  *logutil.RateLimitedLogger
 
 	startOnce  sync.Once
 	closeOnce  sync.Once
@@ -84,12 +89,10 @@ type diskCacheAsyncState struct {
 
 	mu struct {
 		sync.Mutex
-		closed  bool
-		pending map[string]struct{}
-		dropped int64
+		closed bool
+		// pending counts the publications begun and not yet released.
+		pending int
 		idle    chan struct{}
-		// freed, when set, is closed once a slot is released.
-		freed freedSignal
 	}
 }
 
@@ -119,14 +122,18 @@ func (r *diskCacheSourceReader) Read(buf []byte) (int, error) {
 	return n, err
 }
 
-func (d *DiskCache) initAsyncUpdates() {
-	d.async.ctx, d.async.cancel = context.WithCancel(context.Background())
-	d.async.jobs = make(chan *diskCacheAsyncUpdate, diskCacheAsyncQueueSize)
-	d.async.slots = make(chan struct{}, diskCacheAsyncQueueSize)
-	d.async.done = make(chan struct{})
-	d.async.mu.pending = make(map[string]struct{})
-	d.async.mu.idle = make(chan struct{})
-	close(d.async.mu.idle)
+func (p *publisher) init(d *DiskCache) {
+	p.d = d
+	p.ctx, p.cancel = context.WithCancel(context.Background())
+	p.jobs = make(chan *publication, publisherQueueSize)
+	p.done = make(chan struct{})
+	p.workers = publisherWorkers
+	p.logger = logutil.NewRateLimitedLoggerWithConfig(
+		logutil.GetGlobalLogger(),
+		logutil.RateLimitedLoggerConfig{MaxKeys: 1},
+	)
+	p.mu.idle = make(chan struct{})
+	close(p.mu.idle)
 }
 
 func (d *DiskCache) initWriteFailureState() {
@@ -216,251 +223,420 @@ func cleanupDiskCacheTempFile(file *os.File) error {
 	return errors.Join(closeErr, removeErr)
 }
 
-// reserveAsyncFileFinalize reserves a slot for the async publication pending under key,
-// waiting for one to be free. It reports false when the cache is closed, when the
-// publication is already pending, when ctx ends first, or once deleted, when set,
-// reports true; a delete of an object wakes the reservations waiting.
-func (d *DiskCache) reserveAsyncFileFinalize(ctx context.Context, key string, deleted func() bool) bool {
-	a := &d.async
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	for {
-		if a.mu.closed {
-			a.dropAsyncUpdateLocked()
-			return false
-		}
-		if deleted != nil && deleted() {
-			return false
-		}
-		if _, ok := a.mu.pending[key]; ok {
-			return false
-		}
-		if len(a.slots) < cap(a.slots) {
-			a.slots <- struct{}{}
-			break
-		}
-		freed := a.mu.freed.waitLocked()
-		a.mu.Unlock()
-		select {
-		case <-freed:
-		case <-ctx.Done():
-		case <-a.ctx.Done():
-		}
-		a.mu.Lock()
-		if ctx.Err() != nil {
-			a.dropAsyncUpdateLocked()
-			return false
-		}
+// begin counts a publication to come, which ends with its release or with end. It
+// reports false when the publisher is closed.
+func (p *publisher) begin() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.mu.closed {
+		return false
 	}
-	if len(a.mu.pending) == 0 {
-		a.mu.idle = make(chan struct{})
+	if p.mu.pending == 0 {
+		p.mu.idle = make(chan struct{})
 	}
-	a.mu.pending[key] = struct{}{}
-	// The reservation spans the foreground source copy. Close seals admission
-	// under the same mutex before waiting for submitters, so it cannot miss a
-	// finalizer that was admitted but has not reached the jobs channel yet.
-	a.submitters.Add(1)
+	p.mu.pending++
+	// Close seals admission under the same mutex before waiting for submitters, so it
+	// cannot miss a publication begun that has not reached the queue yet.
+	p.submitters.Add(1)
 	return true
 }
 
-func (d *DiskCache) releaseAsyncFileFinalizeReservation(key string) {
-	a := &d.async
-	a.mu.Lock()
-	delete(a.mu.pending, key)
-	<-a.slots
-	a.wakeFreedLocked()
-	if len(a.mu.pending) == 0 {
-		close(a.mu.idle)
-	}
-	a.mu.Unlock()
-	a.submitters.Done()
+// end ends a publication begun that was not submitted.
+func (p *publisher) end() {
+	p.settle()
+	p.submitters.Done()
 }
 
-func (d *DiskCache) scheduleReservedAsyncFileFinalize(
-	diskPath string,
-	file *os.File,
-	owner *pathOwner,
-	target fillTarget,
-	deletes *uint64,
-) {
-	a := &d.async
-	a.startOnce.Do(func() {
-		d.startAsyncWorkers()
-	})
-
-	job := &diskCacheAsyncUpdate{
-		diskPath: diskPath,
-		finalize: &diskCacheAsyncFileFinalize{
-			file:    file,
-			target:  target,
-			owner:   owner,
-			deletes: deletes,
-		},
+// settle ends the count of a publication begun.
+func (p *publisher) settle() {
+	p.mu.Lock()
+	p.mu.pending--
+	if p.mu.pending == 0 {
+		close(p.mu.idle)
 	}
+	p.mu.Unlock()
+}
+
+// submit queues pub, begun, waiting for room until ctx ends or the publisher closes. It
+// reports false when pub is not queued; its caller then frees what pub holds and calls
+// end. A submitter holds nothing the publisher waits for.
+func (p *publisher) submit(ctx context.Context, pub *publication) bool {
+	p.startOnce.Do(p.start)
 	select {
-	case a.jobs <- job:
-	case <-a.ctx.Done():
-		// The foreground source copy is complete and ownership has transferred.
-		// File close/remove may block, so terminal cleanup must not run in the
-		// submitting S3/LocalFS goroutine.
-		go d.releaseAsyncUpdate(job)
+	case p.jobs <- pub:
+		metric.FSDiskCachePublisherQueued.Inc()
+		metric.FSDiskCachePublisherWaitDuration.Observe(0)
+		p.submitters.Done()
+		return true
+	default:
 	}
-	a.submitters.Done()
-}
-
-func (d *DiskCache) claimAsyncPublication() bool {
-	a := &d.async
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	// This mutex is the publication/Close linearization boundary. If Close
-	// sealed first, the temp file stays private and is cleaned up. If this claim
-	// wins first, publication belongs to the admitted generation; a Close whose
-	// context expires may return before that already-claimed operation drains.
-	return !a.mu.closed
-}
-
-// finalizeQueuedFile publishes a file the async workers finalize. The file of an entry is
-// not published when the entry's object was deleted after the entry was read, nor the
-// file of a whole-object download when its object was deleted after the download started.
-func (d *DiskCache) finalizeQueuedFile(diskPath string, finalize *diskCacheAsyncFileFinalize) error {
-	f, target := finalize.file, finalize.target
-	var err error
-	write := func(claim func() bool) (bool, error) {
-		err = d.finalizeFileTo(d.async.ctx, diskPath, f, claim, target)
-		return err == nil, err
+	start := time.Now()
+	metric.FSDiskCachePublisherWaiting.Inc()
+	queued := false
+	select {
+	case p.jobs <- pub:
+		queued = true
+		metric.FSDiskCachePublisherQueued.Inc()
+	case <-ctx.Done():
+	case <-p.ctx.Done():
 	}
-	var published bool
-	if t, ok := target.(entryFillTarget); ok {
-		published, _ = d.publishUnlessDeleted(t.filePath, IOEntry{readDeletes: t.readDeletes}, d.claimAsyncPublication, write)
-	} else if finalize.deletes != nil {
-		published, _ = d.publishUnlessDeletedSince(diskPath, *finalize.deletes, d.claimAsyncPublication, write)
-	} else {
-		return d.finalizeFileTo(d.async.ctx, diskPath, f, d.claimAsyncPublication, target)
+	metric.FSDiskCachePublisherWaiting.Dec()
+	waited := time.Since(start)
+	metric.FSDiskCachePublisherWaitDuration.Observe(waited.Seconds())
+	if waited >= publisherLongWait {
+		p.logger.WarnWithConfig(
+			publisherLongWaitLogKey,
+			"disk cache publisher queue full",
+			logutil.RateLimitConfig{Interval: diskCacheWriteErrorLogPeriod, BurstCount: 1},
+			zap.Duration("wait", waited),
+			zap.Bool("queued", queued),
+			zap.String("path", pub.diskPath),
+			zap.String("cache-path", p.d.path),
+		)
 	}
-	if !published && errors.Is(err, context.Canceled) && d.async.ctx.Err() == nil {
-		// The object was deleted.
-		return nil
+	if queued {
+		p.submitters.Done()
 	}
-	return err
+	return queued
 }
 
-// wakeFreedLocked wakes the updates waiting for a slot.
-func (a *diskCacheAsyncState) wakeFreedLocked() {
-	a.mu.freed.notifyLocked()
+// wait waits for the result of pub, queued with done set, until ctx ends before its
+// release starts.
+func (p *publisher) wait(ctx context.Context, pub *publication) (bool, error) {
+	select {
+	case r := <-pub.done:
+		return r.published, r.err
+	case <-ctx.Done():
+		if !pub.releasing.Load() {
+			return false, ctx.Err()
+		}
+		r := <-pub.done
+		return r.published, r.err
+	}
 }
 
-func (a *diskCacheAsyncState) dropAsyncUpdateLocked() {
-	a.mu.dropped++
-	metric.FSDiskCacheAsyncUpdateDroppedCounter.Inc()
+// claim reports whether a publication may still be published: the publisher is not
+// closed. Its mutex orders publications and Close.
+func (p *publisher) claim() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return !p.mu.closed
 }
 
-// startAsyncWorkers starts the workers that write asynchronous updates; done is closed
-// once all of them exit.
-func (d *DiskCache) startAsyncWorkers() {
+// start starts the workers; done is closed once all of them exit.
+func (p *publisher) start() {
 	var workers sync.WaitGroup
-	for range diskCacheAsyncWorkers {
+	for range p.workers {
 		workers.Add(1)
 		go func() {
 			defer workers.Done()
-			d.runAsyncUpdates()
+			p.run()
 		}()
 	}
 	go func() {
 		workers.Wait()
-		close(d.async.done)
+		close(p.done)
 	}()
 }
 
-func (d *DiskCache) runAsyncUpdates() {
+func (p *publisher) run() {
 	for {
 		select {
-		case <-d.async.ctx.Done():
+		case <-p.ctx.Done():
 			return
-		case job := <-d.async.jobs:
-			if d.async.ctx.Err() == nil {
-				job.finalize.attempted = true
-				job.finalize.err = d.finalizeQueuedFile(job.diskPath, job.finalize)
-				full := d
-				if t := job.finalize.target; t != nil {
-					full = t.cache()
-				}
-				full.evictForDiskFull(d.async.ctx, job.finalize.err)
+		case pub := <-p.jobs:
+			metric.FSDiskCachePublisherQueued.Dec()
+			if p.ctx.Err() == nil {
+				pub.attempted = true
+				pub.published, pub.err = pub.publish(p.ctx)
+				p.d.evictForDiskFull(p.ctx, pub.err)
 			}
-			d.releaseAsyncUpdate(job)
+			p.release(pub)
 		}
 	}
 }
 
-func (d *DiskCache) releaseAsyncUpdate(job *diskCacheAsyncUpdate) {
-	job.releaseOnce.Do(func() {
-		cleanupErr := errors.Join(
-			cleanupDiskCacheTempFile(job.finalize.file),
-			job.finalize.owner.release(),
-		)
-		if job.finalize.attempted {
-			resultErr := job.finalize.err
-			d.mergeWriteCleanupError(job.diskPath, &resultErr, cleanupErr)
-			_ = d.observeWriteResult(
-				job.diskPath,
-				resultErr,
-			)
+// release frees what pub holds and reports its result.
+func (p *publisher) release(pub *publication) {
+	pub.releaseOnce.Do(func() {
+		pub.releasing.Store(true)
+		cleanupErr := pub.release()
+		var resultErr error
+		if pub.attempted {
+			resultErr = pub.err
+			p.d.mergeWriteCleanupError(pub.diskPath, &resultErr, cleanupErr)
+			resultErr = p.d.observeWriteResult(pub.diskPath, resultErr)
 		} else if cleanupErr != nil {
-			// A finalizer canceled before its first write attempt has not
-			// demonstrated recovery. Only surface an actual cleanup failure.
-			_ = d.observeWriteResult(job.diskPath, cleanupErr)
+			// One dropped before it was published has not shown a recovery: only a
+			// failed cleanup is observed.
+			_ = p.d.observeWriteResult(pub.diskPath, cleanupErr)
 		}
-		a := &d.async
-		a.mu.Lock()
-		delete(a.mu.pending, job.pendingKey())
-		<-a.slots
-		a.wakeFreedLocked()
-		if len(a.mu.pending) == 0 {
-			close(a.mu.idle)
+		if pub.done != nil {
+			pub.done <- publishResult{published: pub.attempted && pub.published && resultErr == nil, err: resultErr}
 		}
-		a.mu.Unlock()
+		p.settle()
 	})
 }
 
-func (d *DiskCache) flushAsyncUpdates(ctx context.Context) {
-	d.async.mu.Lock()
-	idle := d.async.mu.idle
-	d.async.mu.Unlock()
+// flush waits until every publication begun is released, or ctx ends.
+func (p *publisher) flush(ctx context.Context) {
+	p.mu.Lock()
+	idle := p.mu.idle
+	p.mu.Unlock()
 	select {
 	case <-idle:
 	case <-ctx.Done():
 	}
 }
 
-func (d *DiskCache) closeAsyncUpdates(ctx context.Context) {
-	a := &d.async
-	a.closeOnce.Do(func() {
-		a.mu.Lock()
-		a.mu.closed = true
-		a.mu.Unlock()
-		a.cancel()
+// seal stops the publisher: nothing is published from then, the publications queued are
+// dropped, and submissions end.
+func (p *publisher) seal() {
+	p.closeOnce.Do(func() {
+		p.mu.Lock()
+		p.mu.closed = true
+		p.mu.Unlock()
+		p.cancel()
 
-		// Waiting for submitters and releasing canceled jobs can execute file
-		// close/remove cleanup. Keep that work off the Close caller so its
-		// context remains a real upper bound even when a filesystem call stalls.
+		// Waiting for submitters and dropping queued publications runs file cleanup,
+		// kept off the Close caller so its context bounds Close.
 		go func() {
-			a.submitters.Wait()
+			p.submitters.Wait()
 			for {
 				select {
-				case job := <-a.jobs:
-					d.releaseAsyncUpdate(job)
+				case pub := <-p.jobs:
+					metric.FSDiskCachePublisherQueued.Dec()
+					p.release(pub)
 				default:
-					a.startOnce.Do(func() {
-						close(a.done)
+					p.startOnce.Do(func() {
+						close(p.done)
 					})
 					return
 				}
 			}
 		}()
 	})
+}
 
-	d.flushAsyncUpdates(ctx)
+// close seals the publisher and waits until its publications are released and its
+// workers exit, or ctx ends.
+func (p *publisher) close(ctx context.Context) {
+	p.seal()
+	p.flush(ctx)
 	select {
-	case <-a.done:
+	case <-p.done:
 	case <-ctx.Done():
 	}
+}
+
+// fillTarget is the cache a fill of the disk cache publishes the file it writes into: the
+// disk cache itself, or the index-file cache for the objects it keeps. The download, the
+// path lock, the file written and the reads of it while it is written are the disk
+// cache's either way.
+type fillTarget interface {
+	// heldBeforeLock reports whether the target already holds the file, before the fill
+	// holds the path.
+	heldBeforeLock(ctx context.Context) bool
+	// held reports whether the target holds the file, while the fill holds the path.
+	held(ctx context.Context) (bool, error)
+	// reserve makes room for a file of size bytes about to be written.
+	reserve(ctx context.Context, size int64)
+	// noteWritten tells the target the size of a whole object written.
+	noteWritten(size int64)
+	// createTemp creates the file the fill writes, on the file system publish renames it
+	// within.
+	createTemp() (*os.File, error)
+	// publish makes the file written at tempPath, of size bytes, the target's file.
+	publish(ctx context.Context, tempPath string, size int64) error
+	// cache returns the cache whose files the target holds, which frees room when a write
+	// of its files finds the disk full.
+	cache() *DiskCache
+}
+
+func (t diskFillTarget) cache() *DiskCache { return t.d }
+
+// diskFillTarget publishes into the disk cache, at diskPath.
+type diskFillTarget struct {
+	d        *DiskCache
+	diskPath string
+}
+
+func (t diskFillTarget) heldBeforeLock(ctx context.Context) bool {
+	if _, ok := t.d.cache.Get(ctx, t.diskPath); ok {
+		if _, err := os.Stat(t.diskPath); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (t diskFillTarget) held(ctx context.Context) (bool, error) {
+	if _, ok := t.d.cache.Get(ctx, t.diskPath); ok {
+		if _, err := os.Stat(t.diskPath); err == nil {
+			return true, nil
+		} else if !os.IsNotExist(err) {
+			return false, err
+		}
+		// Repair the missing physical file and replace the existing index after the
+		// rewrite so FIFO accounting uses the repaired file size.
+	}
+	if stat, err := os.Stat(t.diskPath); err == nil {
+		if t.d.indexFoundFile(ctx, t.diskPath, stat) {
+			return true, nil
+		}
+		// A file of an object deleted since the cache was created may be stale.
+		if err := os.Remove(t.diskPath); err != nil && !os.IsNotExist(err) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func (t diskFillTarget) reserve(ctx context.Context, size int64) {
+	t.d.cache.Evict(ctx, nil, size)
+}
+
+func (t diskFillTarget) noteWritten(size int64) {
+	t.d.noteWholeFile(size)
+}
+
+func (t diskFillTarget) createTemp() (*os.File, error) {
+	return t.d.createCacheTempFile(filepath.Dir(t.diskPath))
+}
+
+func (t diskFillTarget) publish(ctx context.Context, tempPath string, size int64) error {
+	if err := os.Rename(tempPath, t.diskPath); err != nil {
+		return err
+	}
+	return t.index(ctx, size)
+}
+
+// index indexes the file published at diskPath, of size bytes.
+func (t diskFillTarget) index(ctx context.Context, size int64) error {
+	logutil.Debug("disk cache file written",
+		zap.Any("path", t.diskPath),
+	)
+	if !t.d.cache.Replace(ctx, t.diskPath, struct{}{}, size) {
+		t.d.cache.Set(ctx, t.diskPath, struct{}{}, size)
+	}
+	if !t.d.cache.Contains(t.diskPath) {
+		if err := os.Remove(t.diskPath); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// wholeFillTarget publishes a whole object into the disk cache as the range [0, size) of
+// filePath, at the size its fill finds.
+type wholeFillTarget struct {
+	d        *DiskCache
+	filePath string
+	key      string
+	// mark is the delete count the size of the object is stored at.
+	mark uint64
+	// size is the object's size, once known; path is the range file of [0, size), once
+	// the fill holds it.
+	size     int64
+	sized    bool
+	path     string
+	download *objectDownload
+}
+
+// wholePublication is a whole-object fill publishing its range file.
+type wholePublication struct {
+	key      string
+	download *objectDownload
+}
+
+func (d *DiskCache) newWholeFillTarget(ctx context.Context, filePath string) *wholeFillTarget {
+	mark, ok := ctx.Value(deletesMarkKey{}).(uint64)
+	if !ok {
+		mark = d.deletes.now()
+	}
+	t := &wholeFillTarget{d: d, filePath: filePath, key: d.objectKey(filePath), mark: mark}
+	t.size, t.sized = d.prefetched.size(t.key)
+	return t
+}
+
+// sizeAt sets the object's size.
+func (t *wholeFillTarget) sizeAt(size int64) {
+	t.size, t.sized = size, true
+}
+
+func (t *wholeFillTarget) cached(ctx context.Context) bool {
+	if !t.sized {
+		return false
+	}
+	path := t.d.pathForIOEntry(t.filePath, IOEntry{Size: t.size})
+	if !(diskFillTarget{d: t.d, diskPath: path}).heldBeforeLock(ctx) {
+		return false
+	}
+	t.d.storePrefetchedSize(t.key, t.size, t.mark)
+	return true
+}
+
+func (t *wholeFillTarget) heldBeforeLock(ctx context.Context) bool { return t.cached(ctx) }
+
+func (t *wholeFillTarget) held(ctx context.Context) (bool, error) { return t.cached(ctx), nil }
+
+func (t *wholeFillTarget) reserve(ctx context.Context, size int64) {
+	t.d.cache.Evict(ctx, nil, size)
+}
+
+func (t *wholeFillTarget) noteWritten(size int64) {
+	t.d.noteWholeFile(size)
+}
+
+func (t *wholeFillTarget) createTemp() (*os.File, error) {
+	return t.d.createCacheTempFile(filepath.Join(t.d.path, diskCacheShard(pathpkg.Clean(t.filePath))))
+}
+
+func (t *wholeFillTarget) cache() *DiskCache { return t.d }
+
+// place makes the file of the fill holding w the range [0, n): it owns the range file,
+// released with w's owner, waiting for it unless try is set. It reports false when the
+// range file is not free under try, or is cached.
+func (t *wholeFillTarget) place(ctx context.Context, n int64, w *fileWrite, try bool) (bool, error) {
+	t.sizeAt(n)
+	t.path = t.d.pathForIOEntry(t.filePath, IOEntry{Size: n})
+	t.d.storePrefetchedSize(t.key, n, t.mark)
+	cleanup := func() error { return t.d.removeUnindexedFile(t.path) }
+	var owner *pathOwner
+	if try {
+		var ok bool
+		if owner, ok = t.d.paths.tryAcquire(t.path, cleanup); !ok {
+			return false, nil
+		}
+	} else {
+		var err error
+		if owner, err = t.d.paths.acquire(ctx, t.path, cleanup); err != nil {
+			return false, err
+		}
+	}
+	w.owner.releasesFirst(owner)
+	held, err := diskFillTarget{d: t.d, diskPath: t.path}.held(ctx)
+	return err == nil && !held, err
+}
+
+func (t *wholeFillTarget) publish(ctx context.Context, tempPath string, size int64) error {
+	if t.download != nil {
+		t.d.wholePublications.Store(t.path, wholePublication{key: t.key, download: t.download})
+		defer t.d.wholePublications.Delete(t.path)
+	}
+	if err := t.rename(tempPath); err != nil {
+		return err
+	}
+	return diskFillTarget{d: t.d, diskPath: t.path}.index(ctx, size)
+}
+
+// rename moves the file at tempPath to the range file, in its directory, which stays
+// while the file is moved into it.
+func (t *wholeFillTarget) rename(tempPath string) error {
+	t.d.directoryMu.RLock()
+	defer t.d.directoryMu.RUnlock()
+	if err := os.MkdirAll(filepath.Dir(t.path), 0755); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, t.path)
 }

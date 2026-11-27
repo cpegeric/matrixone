@@ -371,7 +371,6 @@ func newVectorRangeTopNBenchmarkFixture(b *testing.B) *vectorRangeTopNBenchmarkF
 	if err != nil {
 		b.Fatal(err)
 	}
-	fs.SetAsyncUpdate(false)
 
 	mp := mpool.MustNewZero()
 	vectorType := types.New(types.T_array_float32, vectorRangeTopNBenchmarkDimensions, 0)

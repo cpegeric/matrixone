@@ -39,7 +39,6 @@ func TestCheckpointMetaZoneMapReads(t *testing.T) {
 		fileservice.ObjectStorageArguments{Name: "checkpoint", Endpoint: "disk", Bucket: t.TempDir()},
 		fileservice.CacheConfig{MemoryCapacity: &capacity}, nil, false, false)
 	require.NoError(t, err)
-	fs.SetAsyncUpdate(false)
 	t.Cleanup(func() { fs.Close(ctx) })
 	mp := mpool.MustNewZero()
 	t.Cleanup(func() {

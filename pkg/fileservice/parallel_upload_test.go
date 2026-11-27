@@ -150,7 +150,7 @@ func newPartFS(t *testing.T, storage ObjectStorage, mode ParallelMode, room int)
 	prev := writePartSize
 	writePartSize = minMultipartPartSize
 	t.Cleanup(func() { writePartSize = prev })
-	fs := &S3FS{name: "s3", server: newObjectStorageServer(storage, minRequestRoom), rawStorage: storage, ioMerger: NewIOMerger(), asyncUpdate: true, parallelMode: mode}
+	fs := &S3FS{name: "s3", server: newObjectStorageServer(storage, minRequestRoom), rawStorage: storage, ioMerger: NewIOMerger(), parallelMode: mode}
 	limitRoom(t, fs.server, room, max(room/2, 1))
 	return fs
 }

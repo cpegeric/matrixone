@@ -1451,6 +1451,7 @@ func TestIndexPrefetchWarmsIndexTierWithWarmDiskCache(t *testing.T) {
 			ctx := context.Background()
 			fs, _, data := newIndexObjectFS(t, true)
 			require.NoError(t, fs.PrefetchFile(ctx, "object"))
+			flushPublishers(fs)
 			require.True(t, fs.diskCache.cache.Contains(fs.diskCache.wholePath("object", int64(len(data)))))
 			_, cached := fs.indexObjectCached("object")
 			require.False(t, cached)
@@ -1459,8 +1460,10 @@ func TestIndexPrefetchWarmsIndexTierWithWarmDiskCache(t *testing.T) {
 			if queued {
 				require.NoError(t, fs.PrefetchObject(ctx, ObjectPrefetch{FilePath: "object", Size: int64(len(data))}))
 				waitFillsIdle(t, fs.diskCache)
+				flushPublishers(fs)
 			} else {
 				require.NoError(t, fs.PrefetchFile(ctx, "object"))
+				flushPublishers(fs)
 			}
 			_, cached = fs.indexObjectCached("object")
 			require.True(t, cached, "an index prefetch should populate its own cache tier")

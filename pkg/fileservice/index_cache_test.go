@@ -195,18 +195,51 @@ type indexCacheErrReader struct{ err error }
 
 func (r indexCacheErrReader) Read([]byte) (int, error) { return 0, r.err }
 
+// A Put whose publication waits for room in the full queue of the publisher returns once
+// its context ends, publishing nothing and leaving nothing behind; the Put that found room
+// is published.
 func TestIndexFileCacheCanceledPutLeavesNothing(t *testing.T) {
 	dir := t.TempDir()
 	c := newTestIndexFileCache(t, dir, 1<<30)
+	shrinkPublisher(c.disk, 1)
+	syncStarted, unblock := installBlockedDiskCacheFileSync(c.disk)
+	t.Cleanup(unblock)
+	put := func(ctx context.Context, name string) chan error {
+		done := make(chan error, 1)
+		go func() {
+			_, err := c.Put(ctx, name, indexCacheEntry([]byte("x")))
+			done <- err
+		}()
+		return done
+	}
+	first := put(context.Background(), "first")
+	select {
+	case <-syncStarted:
+	case <-time.After(diskCacheLifecycleTestTimeout):
+		t.Fatal("the publisher did not take the first entry")
+	}
+	queued := put(context.Background(), "queued")
+	require.Eventually(t, func() bool { return len(c.disk.pub.jobs) == cap(c.disk.pub.jobs) },
+		diskCacheLifecycleTestTimeout, time.Millisecond)
 	ctx, cancel := context.WithCancel(context.Background())
-	c.disk.hooks.beforeFilePublication = cancel
-	written, err := c.Put(ctx, "e", indexCacheEntry([]byte("x")))
-	require.ErrorIs(t, err, context.Canceled)
-	require.False(t, written)
-	c.disk.hooks.beforeFilePublication = nil
+	canceled := put(ctx, "e")
+	requireSubmitterWaits(t, c.disk, canceled)
+	cancel()
+	select {
+	case err := <-canceled:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(diskCacheLifecycleTestTimeout):
+		t.Fatal("the waiting Put did not end with its context")
+	}
+	unblock()
+	require.NoError(t, <-first)
+	require.NoError(t, <-queued)
 	requireIndexCacheMiss(t, c, "e")
+	files, err := c.Open(context.Background(), "queued", "data")
+	require.NoError(t, err)
+	require.NoError(t, files[0].Close())
 	entries, temps, _ := listCacheDirs(t, dir)
-	require.Empty(t, entries)
+	require.Len(t, entries, 2)
 	require.Empty(t, temps)
 }
 
@@ -1311,7 +1344,6 @@ func newIndexObjectFS(t *testing.T, indexCache bool) (*S3FS, *readCountingStorag
 	config.IndexFileCacheEnabled = indexCache
 	fs, err := NewS3FS(ctx, ObjectStorageArguments{Name: defines.SharedFileServiceName, Endpoint: "disk", Bucket: t.TempDir()}, config, nil, false, false)
 	require.NoError(t, err)
-	fs.SetAsyncUpdate(false)
 	<-fs.diskCache.load.done
 	if fs.indexFileCache != nil {
 		<-fs.indexFileCache.disk.load.done
@@ -1343,6 +1375,7 @@ func readIndexObjectRange(t *testing.T, fs *S3FS, policy Policy, offset, size in
 	vec := &IOVector{FilePath: "object", Policy: policy | SkipMemoryCache, Entries: []IOEntry{{Offset: offset, Size: size}}}
 	require.NoError(t, fs.Read(context.Background(), vec))
 	defer vec.Release()
+	flushPublishers(fs)
 	return slices.Clone(vec.Entries[0].Data)
 }
 
@@ -1462,6 +1495,7 @@ func TestReadKeepsIndexObject(t *testing.T) {
 func TestIndexObjectReadFillsIndexFileCache(t *testing.T) {
 	fs, storage, data := newIndexObjectFS(t, true)
 	require.NoError(t, fs.PrefetchFile(WithFileServicePolicy(context.Background(), IndexFileObject), "object"))
+	flushPublishers(fs)
 	diskPath, cached := fs.indexObjectCached("object")
 	require.True(t, cached)
 	got, err := os.ReadFile(filepath.Join(diskPath, IndexObjectFile))
@@ -1478,6 +1512,7 @@ func TestIndexObjectReadFillsIndexFileCache(t *testing.T) {
 func TestNonIndexObjectFillUsesDiskCache(t *testing.T) {
 	fs, _, data := newIndexObjectFS(t, true)
 	require.NoError(t, fs.PrefetchFile(context.Background(), "object"))
+	flushPublishers(fs)
 	_, cached := fs.indexObjectCached("object")
 	require.False(t, cached)
 	require.True(t, fs.diskCache.cache.Contains(fs.diskCache.wholePath("object", int64(len(data)))))
@@ -1518,7 +1553,7 @@ func TestIndexObjectFillOfDeletedObjectIsNotPublished(t *testing.T) {
 	_, cached := fs.indexObjectCached("object")
 	require.False(t, cached)
 	_, err := os.Stat(tempPath)
-	require.True(t, os.IsNotExist(err))
+	require.NoError(t, err, "the file stays its fill's to remove")
 }
 
 // A miss read under IndexFileObject that reads the object whole streams it into the
@@ -1555,7 +1590,6 @@ func TestIndexObjectPublishRemovesWrittenFile(t *testing.T) {
 // cache's updates are flushed.
 func TestIndexObjectAsyncFillPublishes(t *testing.T) {
 	fs, _, _ := newIndexObjectFS(t, true)
-	fs.SetAsyncUpdate(true)
 	require.NoError(t, fs.PrefetchFile(WithFileServicePolicy(context.Background(), IndexFileObject), "object"))
 	fs.FlushCache(context.Background())
 	_, cached := fs.indexObjectCached("object")
@@ -1584,6 +1618,7 @@ func TestIndexObjectFillWritesInIndexFileCache(t *testing.T) {
 		}
 	}
 	require.NoError(t, fs.PrefetchFile(WithFileServicePolicy(context.Background(), IndexFileObject), "object"))
+	flushPublishers(fs)
 	require.NotEmpty(t, published)
 	for _, p := range published {
 		require.Equal(t, fs.indexFileCache.Path(), filepath.Dir(p))
@@ -2305,6 +2340,7 @@ func TestIndexObjectFillWithDiskPolicy(t *testing.T) {
 				Entries: []IOEntry{{Offset: 100, Size: 64}}}
 			defer vec.Release()
 			require.NoError(t, fs.Read(context.Background(), vec))
+			flushPublishers(fs)
 			require.Equal(t, data[100:164], vec.Entries[0].Data)
 			_, cached := fs.indexObjectCached("object")
 			require.True(t, cached, "the read should cache the whole object in the index-file tier")
@@ -2352,6 +2388,7 @@ func TestIndexPrefetchRefillsMissingDataFile(t *testing.T) {
 			}
 			ctx := WithFileServicePolicy(context.Background(), IndexFileObject)
 			require.NoError(t, fs.PrefetchFile(ctx, "object"))
+			flushPublishers(fs)
 			require.FileExists(t, file, "prefetch should leave a readable data file in the index-file cache")
 		})
 	}
@@ -2529,6 +2566,7 @@ func TestIndexQuotaErrorDoesNotEvictTableCache(t *testing.T) {
 			}
 			indexCtx := WithFileServicePolicy(ctx, IndexFileObject)
 			require.NoError(t, fs.PrefetchFile(indexCtx, "object"), "an index-cache write failure is best effort")
+			flushPublishers(fs)
 			_, cached := fs.indexObjectCached("object")
 			require.Equal(t, !quotaExceeded, cached)
 			require.FileExists(t, warmFile, "an index-only disk quota failure must not evict table-data files")
@@ -2616,6 +2654,7 @@ func TestIndexReadSeesConcurrentPublication(t *testing.T) {
 				resumeStorage()
 				<-fillDone
 				require.NoError(t, fillErr)
+				flushPublishers(fs)
 				_, cached := fs.indexObjectCached("object")
 				require.True(t, cached)
 				require.Nil(t, fs.diskCache.download(fs.diskCache.objectKey("object")))

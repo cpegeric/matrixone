@@ -36,7 +36,6 @@ func TestReadCachedInt32RowsRequiresAllColumnsAndReleases(t *testing.T) {
 	fs, err := fileservice.NewLocalFS2(ctx, "test", t.TempDir(), fileservice.CacheConfig{MemoryCapacity: &capacity}, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { fs.Close(ctx) })
-	fs.SetAsyncUpdate(false)
 
 	vec := vector.NewVec(types.T_int32.ToType(), mp)
 	defer vec.Free(mp)

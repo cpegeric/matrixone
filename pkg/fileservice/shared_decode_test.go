@@ -680,7 +680,6 @@ func newSelectedDecodeFS(t *testing.T, disk bool) *S3FS {
 	}
 	fs, err := NewS3FS(t.Context(), ObjectStorageArguments{Name: "selected-decode", Endpoint: "disk", Bucket: t.TempDir()}, config, nil, false, false)
 	require.NoError(t, err)
-	fs.SetAsyncUpdate(false)
 	t.Cleanup(func() { fs.Close(context.Background()) })
 	require.NoError(t, fs.Write(t.Context(), IOVector{FilePath: "columns", Policy: SkipAllCache,
 		Entries: []IOEntry{{Size: 9, Data: []byte("abcdefghi")}}}))
@@ -698,7 +697,6 @@ func newSharedDecodeDiskFillFS(t *testing.T, callbacks CacheCallbacks, prefetch 
 	}
 	fs, err := NewS3FS(t.Context(), ObjectStorageArguments{Name: "shared-decode-fill", Endpoint: "disk", Bucket: t.TempDir()}, config, []*perfcounter.CounterSet{counters}, false, false)
 	require.NoError(t, err)
-	fs.SetAsyncUpdate(false)
 	t.Cleanup(func() { fs.Close(context.Background()) })
 	require.NoError(t, fs.Write(t.Context(), IOVector{FilePath: "columns", Policy: SkipAllCache,
 		Entries: []IOEntry{{Size: 9, Data: []byte("abcdefghi")}}}))

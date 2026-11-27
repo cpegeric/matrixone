@@ -563,7 +563,6 @@ func TestLoadColumnsDataIntoSelectedRowsUsesHotSealedCache(t *testing.T) {
 		nil,
 	)
 	require.NoError(t, err)
-	fs.SetAsyncUpdate(false)
 	t.Cleanup(func() {
 		fs.Close(ctx)
 	})

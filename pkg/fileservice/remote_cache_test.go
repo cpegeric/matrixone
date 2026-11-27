@@ -437,7 +437,6 @@ func TestRemoteCacheReadUsesMemoryCacheReservation(t *testing.T) {
 			}, nil)
 			require.NoError(t, err)
 			t.Cleanup(func() { fs.Close(ctx) })
-			fs.SetAsyncUpdate(false)
 			cache := fs.memCache
 			require.NoError(t, fs.Write(ctx, IOVector{
 				FilePath: "foo", Entries: []IOEntry{{Size: request, Data: []byte{1, 2}}},

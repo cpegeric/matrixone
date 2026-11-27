@@ -566,7 +566,6 @@ func makeCheckpointMetaFixture(
 	fs, err := fileservice.NewLocalFS2(ctx, defines.SharedFileServiceName, t.TempDir(),
 		fileservice.CacheConfig{MemoryCapacity: &capacity}, nil)
 	require.NoError(t, err)
-	fs.SetAsyncUpdate(false)
 	mp := mpool.MustNewZero()
 	t.Cleanup(func() {
 		defer mpool.DeleteMPool(mp)

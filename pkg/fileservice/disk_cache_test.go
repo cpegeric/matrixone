@@ -1004,13 +1004,14 @@ func TestDiskCacheBadWrite(t *testing.T) {
 	assert.Nil(t, err)
 	defer cache.Close(ctx)
 
-	written, err := cache.writeFile(
+	written, err := cache.writeFileTo(
 		ctx,
 		filepath.Join(dir, "foo"),
 		func(ctx context.Context) (io.ReadCloser, error) {
 			// bad reader
 			return nil, io.ErrUnexpectedEOF
 		},
+		false, notWholeFill, nil, nil, readMark{},
 	)
 	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
 	if written {
@@ -1080,12 +1081,13 @@ func TestDiskCacheSetFromFile(t *testing.T) {
 	)
 	require.Nil(t, err)
 
-	written, err := cache.writeFile(
+	written, err := cache.writeFileTo(
 		ctx,
 		cache.wholePath("foo", 3),
 		func(ctx context.Context) (io.ReadCloser, error) {
 			return os.Open(path)
 		},
+		false, notWholeFill, nil, nil, readMark{},
 	)
 	require.Nil(t, err)
 	require.True(t, written)
@@ -1147,12 +1149,13 @@ func TestDiskCacheQuotaExceeded(t *testing.T) {
 	require.Nil(t, err)
 	defer cache.Close(ctx)
 
-	cache.writeFile(
+	cache.writeFileTo(
 		ctx,
 		cache.wholePath("bar", 3),
 		func(ctx context.Context) (io.ReadCloser, error) {
 			return io.NopCloser(bytes.NewReader([]byte("foo"))), errorStr("disk quota exceeded")
 		},
+		false, notWholeFill, nil, nil, readMark{},
 	)
 
 }
@@ -1563,9 +1566,8 @@ func (h *heldStorage) Read(ctx context.Context, key string, min, max *int64) (io
 // not cache the old bytes after the delete, which cancels it: a later read returns the
 // new object.
 func TestColumnRangeReadBeforeDeleteIsNotCached(t *testing.T) {
-	for _, async := range []bool{false, true} {
+	{
 		fs, _, data := newPrefetchRangeFS(t, 64<<10, 300<<10)
-		fs.SetAsyncUpdate(async)
 		ctx := context.Background()
 		held := &heldStorage{ObjectStorage: fs.server.raw, read: make(chan struct{}), released: make(chan struct{})}
 		fs.server.raw = held
@@ -1582,11 +1584,11 @@ func TestColumnRangeReadBeforeDeleteIsNotCached(t *testing.T) {
 		require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(recreated)), Data: recreated}}, Policy: SkipAllCache}))
 		close(held.released)
 		<-done
-		fs.diskCache.flushAsyncUpdates(ctx)
+		fs.diskCache.Flush(ctx)
 
-		require.Equal(t, recreated[102:107], readRangeOf(t, fs, ColumnPrefetch, 102, 5), "async %v", async)
+		require.Equal(t, recreated[102:107], readRangeOf(t, fs, ColumnPrefetch, 102, 5))
 		_, cached := fs.diskCache.ranges.covering(fs.diskCache.objectKey("object"), 100, 10)
-		require.False(t, cached, "the old range is not cached, async %v", async)
+		require.False(t, cached, "the old range is not cached")
 	}
 }
 
@@ -1621,6 +1623,7 @@ func TestExactColumnsReadNeverDownloadsTheObject(t *testing.T) {
 		vec := &IOVector{FilePath: "object", Policy: policy | SkipMemoryCache,
 			Entries: []IOEntry{{Offset: 100, Size: 10}, {Offset: 200 << 10, Size: 10}}}
 		require.NoError(t, fs.Read(context.Background(), vec))
+		flushPublishers(fs)
 		require.Equal(t, data[100:110], vec.Entries[0].Data)
 		require.Equal(t, data[200<<10:200<<10+10], vec.Entries[1].Data)
 		vec.Release()
@@ -1721,7 +1724,7 @@ func TestDeleteWaitsForPublicationOfEarlierRead(t *testing.T) {
 				d.hooks.afterFilePublication = func() { published.Store(true) }
 			}
 			require.NoError(t, d.Update(ctx, &IOVector{FilePath: "object", Entries: []IOEntry{entry}}, async))
-			d.flushAsyncUpdates(ctx)
+			d.Flush(ctx)
 			<-deleted
 			require.NoError(t, deleteErr)
 

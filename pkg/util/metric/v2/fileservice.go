@@ -475,14 +475,26 @@ var (
 			Buckets:   getDurationBuckets(),
 		})
 
-	// FSDiskCacheAsyncUpdateDroppedCounter tracks optional cache fills that are
-	// dropped when the bounded asynchronous queue cannot admit more work.
-	FSDiskCacheAsyncUpdateDroppedCounter = prometheus.NewCounter(
-		prometheus.CounterOpts{
+	// FSDiskCachePublisherGauge is the publications of the cache publishers, by state:
+	// queued, or waiting for room in the queue.
+	FSDiskCachePublisherGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
 			Namespace: "mo",
 			Subsystem: "fs",
-			Name:      "disk_cache_async_update_dropped_total",
-			Help:      "Total number of disk cache async updates dropped by admission control",
-		},
-	)
+			Name:      "disk_cache_publisher_publications",
+			Help:      "Publications of the cache publishers, queued or waiting for room in the queue",
+		}, []string{"state"})
+	FSDiskCachePublisherQueued  = FSDiskCachePublisherGauge.WithLabelValues("queued")
+	FSDiskCachePublisherWaiting = FSDiskCachePublisherGauge.WithLabelValues("waiting")
+
+	// FSDiskCachePublisherWaitDuration is how long each submission waited for room in the
+	// queue of its cache's publisher, however the wait ended.
+	FSDiskCachePublisherWaitDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "mo",
+			Subsystem: "fs",
+			Name:      "disk_cache_publisher_wait_duration_seconds",
+			Help:      "Time submissions waited for room in the queue of a cache publisher",
+			Buckets:   getDurationBuckets(),
+		})
 )

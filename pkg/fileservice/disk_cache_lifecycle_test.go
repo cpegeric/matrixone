@@ -33,6 +33,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	metric "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/stretchr/testify/require"
 )
 
@@ -641,17 +642,17 @@ func TestDiskCacheAsyncUpdatesWriteConcurrently(t *testing.T) {
 		return nil
 	}
 	ctx := context.Background()
-	for i := 0; i < diskCacheAsyncWorkers; i++ {
+	for i := 0; i < publisherWorkers; i++ {
 		require.NoError(t, cache.Update(ctx, &IOVector{
 			FilePath: fmt.Sprintf("file-%02d", i),
 			Entries:  []IOEntry{{Offset: 0, Size: 1, Data: []byte("x")}},
 		}, true))
 	}
-	require.Eventually(t, func() bool { return inSync.Load() == diskCacheAsyncWorkers },
+	require.Eventually(t, func() bool { return inSync.Load() == publisherWorkers },
 		diskCacheLifecycleTestTimeout, time.Millisecond)
 	unblock()
 	cache.Flush(ctx)
-	for i := 0; i < diskCacheAsyncWorkers; i++ {
+	for i := 0; i < publisherWorkers; i++ {
 		vec := &IOVector{FilePath: fmt.Sprintf("file-%02d", i), Entries: []IOEntry{{Offset: 0, Size: 1}}}
 		require.NoError(t, cache.Read(ctx, vec))
 		require.True(t, vec.Entries[0].done)
@@ -710,53 +711,6 @@ func TestDiskCacheAsyncSetFileReturnsBeforeFinalize(t *testing.T) {
 	require.False(t, cache.writeFailures.failed.Load())
 }
 
-// With no async slot free, an async fill waits for one before it opens its source or
-// holds its path, and writes nothing when its caller stops waiting.
-func TestDiskCacheAsyncSetFileWaitsForFinalizeCapacity(t *testing.T) {
-	cache := newLifecycleTestDiskCache(t)
-	for i := 0; i < cap(cache.async.slots); i++ {
-		cache.async.slots <- struct{}{}
-	}
-	t.Cleanup(func() {
-		for i := 0; i < cap(cache.async.slots); i++ {
-			<-cache.async.slots
-		}
-	})
-
-	var readerOpened atomic.Bool
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- cache.setFile(
-			ctx,
-			"foo",
-			func(context.Context) (io.ReadCloser, error) {
-				readerOpened.Store(true)
-				return io.NopCloser(strings.NewReader("payload")), nil
-			},
-			true,
-		)
-	}()
-	require.Eventually(t, func() bool {
-		cache.async.mu.Lock()
-		defer cache.async.mu.Unlock()
-		return cache.async.mu.freed.ch != nil
-	}, diskCacheLifecycleTestTimeout, time.Millisecond)
-	require.False(t, readerOpened.Load())
-	require.False(t, cache.isUpdating(cache.objectKey("foo")))
-	cancel()
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(diskCacheLifecycleTestTimeout):
-		t.Fatal("the waiting fill did not stop with its caller")
-	}
-	require.False(t, readerOpened.Load())
-	cache.async.mu.Lock()
-	defer cache.async.mu.Unlock()
-	require.Equal(t, int64(1), cache.async.mu.dropped)
-}
-
 func TestDiskCacheAsyncSetFileSourceErrorReleasesOwnership(t *testing.T) {
 	cache := newLifecycleTestDiskCache(t)
 	expectedErr := io.ErrUnexpectedEOF
@@ -770,10 +724,7 @@ func TestDiskCacheAsyncSetFileSourceErrorReleasesOwnership(t *testing.T) {
 	)
 	require.ErrorIs(t, err, expectedErr)
 	require.False(t, cache.isUpdating(cache.objectKey("foo")))
-	require.Empty(t, cache.async.slots)
-	cache.async.mu.Lock()
-	require.Empty(t, cache.async.mu.pending)
-	cache.async.mu.Unlock()
+	requireNoPublications(t, cache)
 	require.False(t, cache.writeFailures.failed.Load())
 }
 
@@ -801,7 +752,7 @@ func TestDiskCacheAsyncSetFileFinalizeErrorIsFailOpenAndObservable(t *testing.T)
 	require.Equal(t, 1, logs.FilterMessage("write disk cache error").Len())
 	require.True(t, cache.writeFailures.failed.Load())
 	require.False(t, cache.isUpdating(cache.objectKey("foo")))
-	require.Empty(t, cache.async.slots)
+	requireNoPublications(t, cache)
 	require.Empty(t, cache.objectFiles("foo"))
 }
 
@@ -824,12 +775,12 @@ func TestDiskCacheCloseDrainsQueuedFileFinalize(t *testing.T) {
 	}
 	// Every worker is blocked finalizing a file, so the next finalizer stays queued.
 	var firstPaths []string
-	for i := 0; i < diskCacheAsyncWorkers; i++ {
+	for i := 0; i < publisherWorkers; i++ {
 		name := fmt.Sprintf("first-%d", i)
 		require.NoError(t, cache.setFile(context.Background(), name, open(name), true))
 		firstPaths = append(firstPaths, cache.wholePath(name, int64(len(name))))
 	}
-	require.Eventually(t, func() bool { return inSync.Load() == diskCacheAsyncWorkers },
+	require.Eventually(t, func() bool { return inSync.Load() == publisherWorkers },
 		diskCacheLifecycleTestTimeout, time.Millisecond, "the first full-file finalizers did not start")
 	require.NoError(t, cache.setFile(context.Background(), "queued", open("queued"), true))
 	queuedPath := cache.wholePath("queued", int64(len("queued")))
@@ -874,12 +825,9 @@ func TestDiskCacheCloseDrainsQueuedFileFinalize(t *testing.T) {
 		require.False(t, cache.isUpdating(firstPath))
 	}
 	require.False(t, cache.isUpdating(queuedPath))
-	cache.async.mu.Lock()
-	require.Empty(t, cache.async.mu.pending)
-	cache.async.mu.Unlock()
-	require.Empty(t, cache.async.slots)
+	requireNoPublications(t, cache)
 	select {
-	case <-cache.async.done:
+	case <-cache.pub.done:
 	default:
 		t.Fatal("successful Close did not join the async finalizer generation")
 	}
@@ -1134,11 +1082,11 @@ func TestDiskCachePublicationClaimWinsBeforeClose(t *testing.T) {
 	// file.Sync path is covered by the dedicated error and finalize tests.
 	cache.fileSync = func(*os.File) error { return nil }
 	diskPath := cache.objectKey("claimed")
-	require.True(t, cache.reserveAsyncFileFinalize(context.Background(), diskPath, nil))
+	require.True(t, cache.pub.begin())
 	var releaseReservationOnce sync.Once
 	releaseReservation := func() {
 		releaseReservationOnce.Do(func() {
-			cache.releaseAsyncFileFinalizeReservation(diskPath)
+			cache.pub.end()
 		})
 	}
 	// Own the reservation immediately. The worker below takes this ownership
@@ -1178,16 +1126,17 @@ func TestDiskCachePublicationClaimWinsBeforeClose(t *testing.T) {
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
-		finalizeErr := cache.finalizeFile(
-			cache.async.ctx,
+		finalizeErr := cache.finalizeFileTo(
+			cache.pub.ctx,
 			diskPath,
 			tempFile,
 			func() bool {
-				claimed := cache.claimAsyncPublication()
+				claimed := cache.pub.claim()
 				close(claimReached)
 				<-releaseClaim
 				return claimed
 			},
+			diskFillTarget{d: cache, diskPath: diskPath},
 		)
 		cleanupErr := errors.Join(cleanupTemp(), finishUpdate())
 		releaseReservation()
@@ -1333,19 +1282,17 @@ func TestDiskCacheCloseDeadlineDoesNotWaitForQueuedCleanup(t *testing.T) {
 
 	tempFile, err := os.CreateTemp(cache.path, "close-deadline-*")
 	require.NoError(t, err)
-	a := &cache.async
-	a.mu.Lock()
-	a.slots <- struct{}{}
-	a.mu.idle = make(chan struct{})
-	a.mu.pending[diskPath] = struct{}{}
-	a.mu.Unlock()
-	a.jobs <- &diskCacheAsyncUpdate{
+	p := &cache.pub
+	require.True(t, p.begin())
+	p.jobs <- &publication{
 		diskPath: diskPath,
-		finalize: &diskCacheAsyncFileFinalize{
-			file:  tempFile,
-			owner: owner,
+		publish:  func(context.Context) (bool, error) { return false, nil },
+		release: func() error {
+			return errors.Join(cleanupDiskCacheTempFile(tempFile), owner.release())
 		},
 	}
+	metric.FSDiskCachePublisherQueued.Inc()
+	p.submitters.Done()
 
 	closeCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
@@ -1378,72 +1325,110 @@ func TestDiskCacheCloseDeadlineDoesNotWaitForQueuedCleanup(t *testing.T) {
 	cache.Close(finishCtx)
 	require.NoError(t, finishCtx.Err())
 	require.False(t, cache.isUpdating(diskPath))
-	require.Empty(t, cache.async.slots)
-	cache.async.mu.Lock()
-	require.Empty(t, cache.async.mu.pending)
-	cache.async.mu.Unlock()
+	requireNoPublications(t, cache)
 	_, err = os.Stat(tempFile.Name())
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
-// An asynchronous update keeps no bytes for its publication. With no async slot free it
-// waits for one, and writes nothing when its caller stops waiting.
-func TestDiskCacheAsyncUpdateKeepsNoBytes(t *testing.T) {
-	cache := newLifecycleTestDiskCache(t)
-	cache.fileSync = func(*os.File) error { return nil }
-	for len(cache.async.slots) < cap(cache.async.slots) {
-		cache.async.slots <- struct{}{}
+// requireNoPublications requires that cache has no publication begun.
+func requireNoPublications(t *testing.T, cache *DiskCache) {
+	t.Helper()
+	cache.pub.mu.Lock()
+	defer cache.pub.mu.Unlock()
+	require.Zero(t, cache.pub.mu.pending)
+}
+
+// shrinkPublisher makes the publisher of cache publish one publication at a time from a
+// queue of size, before its first submission.
+func shrinkPublisher(cache *DiskCache, size int) {
+	cache.pub.workers = 1
+	cache.pub.jobs = make(chan *publication, size)
+}
+
+// requireSubmitterWaits requires that the submission done reports has not returned while
+// the publisher queue of cache is full.
+func requireSubmitterWaits(t *testing.T, cache *DiskCache, done <-chan error) {
+	t.Helper()
+	require.Equal(t, cap(cache.pub.jobs), len(cache.pub.jobs), "the queue is full")
+	select {
+	case err := <-done:
+		t.Fatalf("a submission returned while the publisher queue is full: %v", err)
+	case <-time.After(50 * time.Millisecond):
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() {
-		done <- cache.Update(ctx, &IOVector{
-			FilePath: "foo",
+}
+
+// requireNoTempFiles requires that no temporary file is left in the directory of cache.
+func requireNoTempFiles(t *testing.T, cache *DiskCache) {
+	t.Helper()
+	var temps []string
+	require.NoError(t, filepath.WalkDir(cache.path, func(path string, _ os.DirEntry, err error) error {
+		if strings.HasSuffix(path, cacheFileTempSuffix) || strings.HasSuffix(path, cacheDirTempSuffix) {
+			temps = append(temps, path)
+		}
+		return err
+	}))
+	require.Empty(t, temps)
+}
+
+// A submission to a full publisher queue waits for room; one whose context ends returns,
+// caching nothing and leaving nothing behind, and one that waits on completes once room
+// frees. The control is a submission with room, which returns at once.
+func TestDiskCacheUpdateWaitsForPublisherRoom(t *testing.T) {
+	cache := newLifecycleTestDiskCache(t)
+	shrinkPublisher(cache, 1)
+	syncStarted, unblock := installBlockedDiskCacheFileSync(cache)
+	t.Cleanup(unblock)
+	update := func(ctx context.Context, name string) error {
+		return cache.Update(ctx, &IOVector{
+			FilePath: name,
 			Entries:  []IOEntry{{Offset: 0, Size: 1, Data: []byte("x")}},
 		}, true)
-	}()
-	require.Eventually(t, func() bool {
-		cache.async.mu.Lock()
-		defer cache.async.mu.Unlock()
-		return cache.async.mu.freed.ch != nil
-	}, diskCacheLifecycleTestTimeout, time.Millisecond)
+	}
+	ctx := context.Background()
+	require.NoError(t, update(ctx, "published"))
+	select {
+	case <-syncStarted:
+	case <-time.After(diskCacheLifecycleTestTimeout):
+		t.Fatal("the publisher did not take the first publication")
+	}
+	// The control: with room in the queue, a submission returns at once.
+	require.NoError(t, update(ctx, "queued"))
+
+	waitCtx, cancel := context.WithCancel(ctx)
+	canceled := make(chan error, 1)
+	go func() { canceled <- update(waitCtx, "canceled") }()
+	requireSubmitterWaits(t, cache, canceled)
 	cancel()
 	select {
-	case <-done:
+	case err := <-canceled:
+		require.NoError(t, err)
 	case <-time.After(diskCacheLifecycleTestTimeout):
-		t.Fatal("the waiting update did not stop with its caller")
+		t.Fatal("the waiting submission did not end with its context")
 	}
-	cache.async.mu.Lock()
-	require.Equal(t, int64(1), cache.async.mu.dropped)
-	cache.async.mu.Unlock()
+	require.False(t, cache.isUpdating(cache.pathForIOEntry("canceled", IOEntry{Offset: 0, Size: 1})))
 
-	// A waiting update goes on once a slot is freed.
-	go func() {
-		done <- cache.Update(context.Background(), &IOVector{
-			FilePath: "foo",
-			Entries:  []IOEntry{{Offset: 0, Size: 1, Data: []byte("x")}},
-		}, true)
-	}()
-	require.Eventually(t, func() bool {
-		cache.async.mu.Lock()
-		defer cache.async.mu.Unlock()
-		return cache.async.mu.freed.ch != nil
-	}, diskCacheLifecycleTestTimeout, time.Millisecond)
-	cache.async.mu.Lock()
-	for len(cache.async.slots) > 0 {
-		<-cache.async.slots
+	waiting := make(chan error, 1)
+	go func() { waiting <- update(ctx, "waiting") }()
+	requireSubmitterWaits(t, cache, waiting)
+	unblock()
+	select {
+	case err := <-waiting:
+		require.NoError(t, err)
+	case <-time.After(diskCacheLifecycleTestTimeout):
+		t.Fatal("the waiting submission did not complete once room freed")
 	}
-	cache.async.wakeFreedLocked()
-	cache.async.mu.Unlock()
-	require.NoError(t, <-done)
-	flushCtx, cancelFlush := context.WithTimeout(context.Background(), diskCacheLifecycleTestTimeout)
+	flushCtx, cancelFlush := context.WithTimeout(ctx, diskCacheLifecycleTestTimeout)
 	defer cancelFlush()
 	cache.Flush(flushCtx)
 	require.NoError(t, flushCtx.Err())
-	vec := &IOVector{FilePath: "foo", Entries: []IOEntry{{Offset: 0, Size: 1}}}
-	require.NoError(t, cache.Read(context.Background(), vec))
-	require.True(t, vec.Entries[0].done)
-	vec.Release()
+	for name, cached := range map[string]bool{"published": true, "queued": true, "waiting": true, "canceled": false} {
+		vec := &IOVector{FilePath: name, Entries: []IOEntry{{Offset: 0, Size: 1}}}
+		require.NoError(t, cache.Read(ctx, vec))
+		require.Equal(t, cached, vec.Entries[0].done, name)
+		vec.Release()
+	}
+	requireNoPublications(t, cache)
+	requireNoTempFiles(t, cache)
 }
 
 func TestDiskCacheAsyncUpdateRejectsCanceledCaller(t *testing.T) {
@@ -1455,9 +1440,7 @@ func TestDiskCacheAsyncUpdateRejectsCanceledCaller(t *testing.T) {
 		Entries:  []IOEntry{{Offset: 0, Size: 1, Data: []byte("x")}},
 	}, true)
 	require.ErrorIs(t, err, context.Canceled)
-	cache.async.mu.Lock()
-	require.Empty(t, cache.async.mu.pending)
-	cache.async.mu.Unlock()
+	requireNoPublications(t, cache)
 }
 
 func TestDiskCacheCloseCancelsQueuedUpdateWaits(t *testing.T) {
@@ -1472,10 +1455,10 @@ func TestDiskCacheCloseCancelsQueuedUpdateWaits(t *testing.T) {
 	defer cancel()
 	cache.Close(closeCtx)
 	require.NoError(t, closeCtx.Err())
-	cache.async.mu.Lock()
-	require.True(t, cache.async.mu.closed)
-	require.Empty(t, cache.async.mu.pending)
-	cache.async.mu.Unlock()
+	cache.pub.mu.Lock()
+	require.True(t, cache.pub.mu.closed)
+	cache.pub.mu.Unlock()
+	requireNoPublications(t, cache)
 	release()
 }
 

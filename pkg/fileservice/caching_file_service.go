@@ -22,7 +22,4 @@ type CachingFileService interface {
 
 	// FlushCache flushes cache
 	FlushCache(ctx context.Context)
-
-	// SetAsyncUpdate sets cache update operation to async mode
-	SetAsyncUpdate(bool)
 }
