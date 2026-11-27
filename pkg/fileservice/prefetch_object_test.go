@@ -1710,7 +1710,8 @@ func assertEventuallyBytes(t *testing.T, fs *S3FS, want int64) bool {
 }
 
 // offsetGateStorage blocks the first read at offset 0 until open0 is closed, and every
-// read at offset gated until openGated is closed, or their contexts end.
+// read at offset gated, or made while held is set, until openGated is closed, or their
+// contexts end.
 type offsetGateStorage struct {
 	ObjectStorage
 	gated     int64
@@ -1718,6 +1719,7 @@ type offsetGateStorage struct {
 	open0     chan struct{}
 	openGated chan struct{}
 	started   chan int64
+	held      atomic.Bool
 }
 
 func (s *offsetGateStorage) Read(ctx context.Context, key string, min, max *int64) (io.ReadCloser, error) {
@@ -1730,6 +1732,10 @@ func (s *offsetGateStorage) Read(ctx context.Context, key string, min, max *int6
 	}
 	if gate != nil {
 		s.started <- *min
+	} else if s.held.Load() {
+		gate = s.openGated
+	}
+	if gate != nil {
 		select {
 		case <-gate:
 		case <-ctx.Done():
@@ -1802,11 +1808,12 @@ func TestReadJoiningPrefetchObjectsAcrossDeleteReturnsOneVersion(t *testing.T) {
 		return len(now) == 2 && now[0] == before[0]+1 && now[1] == before[1]+1
 	}, diskCacheLifecycleTestTimeout, time.Millisecond)
 	// The first half arrives; then the object is deleted and rewritten before the second
-	// half is read again.
+	// half, or any read made meanwhile, is read again.
 	close(storage.open0)
 	r := <-first
 	require.NoError(t, r.err)
 	require.Equal(t, v1[:half], r.data)
+	storage.held.Store(true)
 	require.NoError(t, fs.Delete(ctx, "object"))
 	require.NoError(t, fs.Write(ctx, IOVector{FilePath: "object", Entries: []IOEntry{{Size: int64(len(v2)), Data: v2}},
 		Policy: SkipDiskCache | SkipMemoryCache}))
