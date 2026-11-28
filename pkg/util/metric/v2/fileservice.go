@@ -198,6 +198,15 @@ var (
 	FSObjectStorageRequestsBackgroundRunning = FSObjectStorageRequestsGauge.WithLabelValues("background", "running")
 	FSObjectStorageRequestsBackgroundWaiting = FSObjectStorageRequestsGauge.WithLabelValues("background", "waiting")
 
+	// FSObjectStorageRoom is the room of the object storage server of each file service.
+	FSObjectStorageRoom = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: "mo",
+			Subsystem: "fs",
+			Name:      "object_storage_room",
+			Help:      "Requests the object storage server of a file service runs at once",
+		}, []string{"name"})
+
 	// FSObjectStorageMemoryGauge is the memory the object storage servers hold, by class.
 	FSObjectStorageMemoryGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{

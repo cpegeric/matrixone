@@ -180,6 +180,13 @@ func NewS3FS(
 	fs.rawStorage = storage
 	fs.server = newObjectStorageServer(storage, room)
 	fs.server.memoryLimit = int64(min(uint64(args.ObjectStorageMemory), math.MaxInt64))
+	metric.FSObjectStorageRoom.WithLabelValues(args.Name).Set(float64(fs.server.capacity))
+	logutil.Info("object storage server",
+		zap.String("name", args.Name),
+		zap.Int("room", fs.server.capacity),
+		zap.Int("background-room", fs.server.backgroundMax),
+		zap.Int64("memory", fs.server.memoryLimit),
+	)
 
 	// cache
 	if !noCache {
