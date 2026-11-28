@@ -53,7 +53,6 @@ type S3FS struct {
 	memCache       *MemCache
 	diskCache      *DiskCache
 	indexFileCache *IndexFileCache
-	indexObjects   indexObjects
 	remoteCache    *RemoteCache
 
 	perfCounterSets []*perfcounter.CounterSet

@@ -627,7 +627,12 @@ func (c *IndexFileCache) Hold(name string) (*IndexFileHold, error) {
 		return nil, err
 	}
 	c.disk.holdDir(diskPath)
-	return &IndexFileHold{release: func(used bool) { c.disk.releaseDir(diskPath, used) }}, nil
+	return &IndexFileHold{release: func(used bool) {
+		if used {
+			c.touch(diskPath)
+		}
+		c.disk.releaseDir(diskPath, used)
+	}}, nil
 }
 
 // HoldCached holds entry name, as Hold does, when the cache holds the entry, and returns
@@ -739,6 +744,9 @@ type dirHolds struct {
 	// stuck holds the entry directories an eviction could not remove: eviction skips them
 	// until the collector's next tick.
 	stuck map[string]struct{}
+	// touched holds the entry directories by when they were last marked used, at most
+	// indexObjectsTouchedMax of them.
+	touched map[string]time.Time
 }
 
 // loadedDir is an entry directory found when the cache loads.
@@ -796,15 +804,38 @@ func (d *DiskCache) releaseDir(path string, used bool) {
 		d.held.mu.Unlock()
 		return
 	}
-	if used {
-		now := time.Now()
-		_ = os.Chtimes(path, now, now)
-	}
 	delete(d.held.m, path)
 	d.held.mu.Unlock()
 	if used {
 		_, _ = d.cache.Get(context.Background(), path)
 	}
+}
+
+// touch marks the entry directory at path used, at most once per indexObjectTouch, or per
+// half the idle TTL when that is shorter.
+func (c *IndexFileCache) touch(path string) {
+	every := indexObjectTouch
+	if c.idleTTL > 0 {
+		every = min(every, c.idleTTL/2)
+	}
+	c.disk.touchDir(path, every)
+}
+
+// touchDir marks the entry directory at path used, at most once per every.
+func (d *DiskCache) touchDir(path string, every time.Duration) {
+	now := time.Now()
+	h := &d.held
+	h.mu.Lock()
+	if now.Sub(h.touched[path]) < every {
+		h.mu.Unlock()
+		return
+	}
+	if h.touched == nil || len(h.touched) >= indexObjectsTouchedMax {
+		h.touched = make(map[string]time.Time)
+	}
+	h.touched[path] = now
+	h.mu.Unlock()
+	_ = os.Chtimes(path, now, now)
 }
 
 // removeEvictedDir removes an evicted entry directory, or puts it back in the cache with
@@ -1460,18 +1491,12 @@ const (
 	indexObjectPrefix = "obj"
 	// IndexObjectFile is the file of an index object's entry in the index-file cache.
 	IndexObjectFile = "data"
-	// indexObjectTouch is the longest an index object read here goes without being marked
-	// used, so idle collection keeps it.
+	// indexObjectTouch is the longest an index-file cache entry in use goes without being
+	// marked used, so idle collection keeps it.
 	indexObjectTouch = time.Minute
-	// indexObjectsTouchedMax is the most index objects remembered as marked used.
+	// indexObjectsTouchedMax is the most entries remembered as marked used.
 	indexObjectsTouchedMax = 1 << 14
 )
-
-// indexObjects is the state of the index objects an S3FS reads from its index-file cache.
-type indexObjects struct {
-	mu      sync.Mutex
-	touched map[string]time.Time // entries by when they were last marked used
-}
 
 // IndexObjectEntry returns the index-file cache entry of the object at file: the whole
 // object, as its file IndexObjectFile.
@@ -1679,7 +1704,7 @@ func (s *S3FS) readIndexObject(ctx context.Context, vector *IOVector) error {
 	// The read holds the entry, so it is not evicted while the read uses it, and the
 	// release of its hold is a use of it.
 	d := s.indexFileCache.disk
-	defer s.touchIndexObject(diskPath)
+	defer s.indexFileCache.touch(diskPath)
 	d.holdDir(diskPath)
 	defer d.releaseDir(diskPath, false)
 	file, entry, err := s.indexFileCache.openEntryFile(ctx, name, IndexObjectFile)
@@ -1704,7 +1729,7 @@ func (s *S3FS) readIndexObject(ctx context.Context, vector *IOVector) error {
 		return nil
 	}
 	defer entry.done()
-	s.touchIndexObject(diskPath)
+	s.indexFileCache.touch(diskPath)
 	var read int64
 	for i := range vector.Entries {
 		e := &vector.Entries[i]
@@ -1770,31 +1795,6 @@ func (s *S3FS) readIndexDownload(ctx context.Context, vector *IOVector) error {
 		}
 	}
 	return nil
-}
-
-// touchIndexObject marks the entry at diskPath used, at most once per indexObjectTouch,
-// or per half the idle TTL when that is shorter.
-func (s *S3FS) touchIndexObject(diskPath string) {
-	interval := indexObjectTouch
-	if ttl := s.indexFileCache.idleTTL; ttl > 0 {
-		interval = min(interval, ttl/2)
-	}
-	o := &s.indexObjects
-	now := time.Now()
-	o.mu.Lock()
-	if o.touched == nil {
-		o.touched = make(map[string]time.Time)
-	}
-	if now.Sub(o.touched[diskPath]) < interval {
-		o.mu.Unlock()
-		return
-	}
-	if len(o.touched) >= indexObjectsTouchedMax {
-		clear(o.touched)
-	}
-	o.touched[diskPath] = now
-	o.mu.Unlock()
-	_ = os.Chtimes(diskPath, now, now)
 }
 
 // deleteIndexObjects deletes the index-file cache's entries of the objects of filePaths,

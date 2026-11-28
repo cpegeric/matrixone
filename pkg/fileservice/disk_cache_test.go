@@ -1673,9 +1673,10 @@ func TestIndexObjectReadRefreshesIdleTTL(t *testing.T) {
 			// Age the previous use in both places without waiting for the touch interval.
 			lastRead := time.Now().Add(-tc.sinceUse)
 			require.NoError(t, os.Chtimes(path, lastRead, lastRead))
-			fs.indexObjects.mu.Lock()
-			fs.indexObjects.touched[path] = lastRead
-			fs.indexObjects.mu.Unlock()
+			d := fs.indexFileCache.disk
+			d.held.mu.Lock()
+			d.held.touched = map[string]time.Time{path: lastRead}
+			d.held.mu.Unlock()
 
 			require.Equal(t, data[20:30], readIndexObjectRange(t, fs, IndexFileObject, 20, 10))
 			require.Zero(t, storage.reads.Load())

@@ -589,6 +589,17 @@ func TestIndexFileCacheReleaseSuperseded(t *testing.T) {
 	requireEntryDir(t, c, "superseded", false)
 	requireEntryDir(t, c, "released", true)
 
+	// A use within half the idle TTL of the last one does not mark the entry used again.
+	ageEntry(t, c, "released", 2*time.Hour)
+	again, err := c.Hold("released")
+	require.NoError(t, err)
+	again.Release()
+	path, err := c.disk.pathForDir("released")
+	require.NoError(t, err)
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Greater(t, time.Since(info.ModTime()), time.Hour)
+
 	var none *IndexFileHold
 	none.Release()
 	none.ReleaseSuperseded()
