@@ -207,16 +207,14 @@ var (
 			Help:      "Requests the object storage server of a file service runs at once",
 		}, []string{"name"})
 
-	// FSObjectStorageMemoryGauge is the memory the object storage servers hold, by class.
+	// FSObjectStorageMemoryGauge is the memory each object storage server holds, by class.
 	FSObjectStorageMemoryGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "mo",
 			Subsystem: "fs",
 			Name:      "object_storage_memory_bytes",
-			Help:      "Memory the object storage servers hold, by class",
-		}, []string{"class"})
-	FSObjectStorageMemoryForeground = FSObjectStorageMemoryGauge.WithLabelValues("foreground")
-	FSObjectStorageMemoryBackground = FSObjectStorageMemoryGauge.WithLabelValues("background")
+			Help:      "Memory each object storage server holds, by class",
+		}, []string{"name", "class"})
 )
 
 var (

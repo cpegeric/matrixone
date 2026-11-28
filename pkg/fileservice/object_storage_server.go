@@ -132,8 +132,9 @@ var memoryAvailable = system.MemoryAvailableIncludingCache
 // fills. A running request is never stopped. Memory is taken only when it fits at once: a foreground take within
 // the budget, a background one also within half of it.
 type objectStorageServer struct {
-	raw ObjectStorage
-	ops [opCount]prometheus.Gauge
+	raw    ObjectStorage
+	ops    [opCount]prometheus.Gauge
+	memory [2]prometheus.Gauge
 
 	// memoryLimit, when set, is the memory budget; otherwise it is measured.
 	memoryLimit int64
@@ -202,7 +203,14 @@ func newObjectStorageServer(raw ObjectStorage, capacity int) *objectStorageServe
 	}
 	g.capacity = max(capacity, minRequestRoom)
 	g.backgroundMax = g.capacity / 2
+	g.setName("")
 	return g
+}
+
+// setName labels the memory gauges of g with the name of its file service.
+func (g *objectStorageServer) setName(name string) {
+	g.memory[foregroundRequest] = metric.FSObjectStorageMemoryGauge.WithLabelValues(name, "foreground")
+	g.memory[backgroundRequest] = metric.FSObjectStorageMemoryGauge.WithLabelValues(name, "background")
 }
 
 func (g *objectStorageServer) canRunLocked(c requestClass) bool {
@@ -415,7 +423,7 @@ func (g *objectStorageServer) takeMemory(n int64, c requestClass) bool {
 		return false
 	}
 	g.memoryUsed[c] += n
-	memoryGauge(c).Add(float64(n))
+	g.memory[c].Add(float64(n))
 	return true
 }
 
@@ -443,7 +451,7 @@ func (g *objectStorageServer) freeMemory(n int64, c requestClass) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.memoryUsed[c] -= n
-	memoryGauge(c).Sub(float64(n))
+	g.memory[c].Sub(float64(n))
 }
 
 // promoteMemory moves n bytes of background memory to foreground.
@@ -452,8 +460,8 @@ func (g *objectStorageServer) promoteMemory(n int64) {
 	defer g.mu.Unlock()
 	g.memoryUsed[backgroundRequest] -= n
 	g.memoryUsed[foregroundRequest] += n
-	memoryGauge(backgroundRequest).Sub(float64(n))
-	memoryGauge(foregroundRequest).Add(float64(n))
+	g.memory[backgroundRequest].Sub(float64(n))
+	g.memory[foregroundRequest].Add(float64(n))
 }
 
 // memoryInUse returns the memory taken of each class.
@@ -461,13 +469,6 @@ func (g *objectStorageServer) memoryInUse() [2]int64 {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.memoryUsed
-}
-
-func memoryGauge(c requestClass) prometheus.Gauge {
-	if c == backgroundRequest {
-		return metric.FSObjectStorageMemoryBackground
-	}
-	return metric.FSObjectStorageMemoryForeground
 }
 
 // requestRoom is the room of a request: held while the request runs and while a retry of

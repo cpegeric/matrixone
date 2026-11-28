@@ -35,7 +35,9 @@ import (
 	"github.com/aliyun/aliyun-oss-go-sdk/oss"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
+	metric "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/util/toml"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -1352,11 +1354,15 @@ func TestServerProbeMemoryBudgetConfig(t *testing.T) {
 
 	buf := flightBufSize(64 << 10)
 	probeSetMemory(fs, 4*buf)
+	fs.server.setName("budget-probe")
+	gauge := metric.FSObjectStorageMemoryGauge.WithLabelValues("budget-probe", "foreground")
 	free := holdForegroundBuffer(t, fs, 4*buf)
+	require.Equal(t, float64(4*buf), testutil.ToFloat64(gauge), "the gauge of the server's own name counts its memory")
 	probeSetMemory(fs, buf)
 	require.Equal(t, 4*buf, probeMemoryHeld(fs), "a shrunk budget takes nothing back")
 	require.False(t, probeMemoryFits(fs, buf), "new memory waits for none and is refused")
 	free()
+	require.Zero(t, testutil.ToFloat64(gauge))
 	require.True(t, probeMemoryFits(fs, buf), "memory is taken once it fits")
 }
 
